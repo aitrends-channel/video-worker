@@ -3,6 +3,7 @@ const KIE_BASE_URL = "https://api.kie.ai";
 export async function submitVideoJob(
   prompt: string,
   modelId: string,
+  apiKey: string,
   imageUrl?: string,
   duration?: string | number,
   aspectRatio?: string
@@ -10,7 +11,7 @@ export async function submitVideoJob(
   const res = await fetch(`${KIE_BASE_URL}/video/generate`, {
     method: "POST",
     headers: {
-      "Authorization": `Bearer ${process.env.KIE_API_KEY}`,
+      "Authorization": `Bearer ${apiKey}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
@@ -33,11 +34,12 @@ export async function submitVideoJob(
 
 export async function pollVideoJob(
   jobId: string,
-  modelId: string
+  modelId: string,
+  apiKey: string
 ): Promise<{ status: string; videoUrl?: string; error?: string }> {
   const res = await fetch(`${KIE_BASE_URL}/video/status?request_id=${jobId}&model_id=${modelId}`, {
     headers: {
-      "Authorization": `Bearer ${process.env.KIE_API_KEY}`,
+      "Authorization": `Bearer ${apiKey}`,
     },
   });
 

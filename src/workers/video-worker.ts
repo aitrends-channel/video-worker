@@ -11,7 +11,7 @@ function sleep(ms: number) {
 export const videoWorker = new Worker(
   "video-generation",
   async (job) => {
-    const { projectId, beatNumber, videoPrompt, imageUrl, modelId, duration, aspectRatio } = job.data as {
+    const { projectId, beatNumber, videoPrompt, imageUrl, modelId, duration, aspectRatio, userId } = job.data as {
       projectId: string;
       beatNumber: number;
       videoPrompt: string;
@@ -19,9 +19,20 @@ export const videoWorker = new Worker(
       modelId: string;
       duration?: string | number;
       aspectRatio?: string;
+      userId: string;
     };
 
     console.log(`[worker] Processing beat ${beatNumber} for project ${projectId}`);
+
+    // Look up the user's KIE API key from app_settings
+    const { data: settings } = await supabase
+      .from("app_settings")
+      .select("kie_api_key")
+      .eq("user_id", userId)
+      .single();
+
+    const kieApiKey = settings?.kie_api_key ?? process.env.KIE_API_KEY;
+    if (!kieApiKey) throw new Error(`No KIE API key found for user ${userId}`);
 
     await supabase
       .from("project_beats")
@@ -30,7 +41,7 @@ export const videoWorker = new Worker(
       .eq("beat_number", beatNumber);
 
     // Submit to kie.ai video generation
-    const jobId = await submitVideoJob(videoPrompt, modelId, imageUrl, duration, aspectRatio);
+    const jobId = await submitVideoJob(videoPrompt, modelId, kieApiKey, imageUrl, duration, aspectRatio);
     console.log(`[worker] Submitted video job: ${jobId}`);
 
     // Poll until complete
@@ -42,7 +53,7 @@ export const videoWorker = new Worker(
       await sleep(10000);
       attempts++;
 
-      const status = await pollVideoJob(jobId, modelId);
+      const status = await pollVideoJob(jobId, modelId, kieApiKey);
 
       if (status.status === "done" && status.videoUrl) {
         videoUrl = status.videoUrl;
