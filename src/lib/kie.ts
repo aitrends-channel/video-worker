@@ -24,8 +24,8 @@ export async function submitVideoJob(
   });
 
   if (!res.ok) {
-    const error = await res.json();
-    throw new Error(`KIE API error: ${error.error || res.statusText}`);
+    const error = await res.json().catch(() => ({})) as { error?: string };
+    throw new Error(`KIE API error: ${error.error ?? res.statusText}`);
   }
 
   const data = await res.json() as { request_id: string };
