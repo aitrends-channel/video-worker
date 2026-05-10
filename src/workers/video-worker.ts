@@ -1,8 +1,8 @@
 import { Worker } from "bullmq";
-import { queueConnection } from "../lib/queue";
-import { submitVideoJob, pollVideoJob } from "../lib/kie";
-import { uploadFromUrl } from "../lib/storage";
-import { supabase } from "../lib/supabase";
+import { queueConnection } from "../lib/queue.js";
+import { submitVideoJob, pollVideoJob } from "../lib/kie.js";
+import { uploadFromUrl } from "../lib/storage.js";
+import { supabase } from "../lib/supabase.js";
 
 function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));

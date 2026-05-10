@@ -1,8 +1,8 @@
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
-import { videoWorker } from "./workers/video-worker";
-import { setupHealthRoutes } from "./routes/health";
+import { videoWorker } from "./workers/video-worker.js";
+import { setupHealthRoutes } from "./routes/health.js";
 
 const app = express();
 const PORT = parseInt(process.env.PORT || "3001");

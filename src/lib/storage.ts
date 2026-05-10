@@ -1,4 +1,4 @@
-import { supabase } from "./supabase";
+import { supabase } from "./supabase.js";
 
 export async function uploadBuffer(path: string, buffer: ArrayBuffer, contentType: string): Promise<string> {
   const { error, data } = await supabase.storage
