@@ -218,3 +218,8 @@ Vercel (auth-api + youtube-engine)
 ## License
 
 MIT
+
+
+## TEMPORAL PRODUCTION URLS
+youtube-engine app on vercel:
+ https://aitrends-youtube-engine-git-vercel-rea-81a838-bansolos-projects.vercel.app/

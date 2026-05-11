@@ -25,20 +25,23 @@ export const videoWorker = new Worker(
     console.log(`[worker] Processing beat ${beatNumber} for project ${projectId}`);
 
     // Look up the user's KIE API key from app_settings
-    const { data: settings } = await supabase
+    const { data: settings, error: settingsError } = await supabase
       .from("app_settings")
       .select("kie_api_key")
       .eq("user_id", userId)
       .single();
 
+    if (settingsError) console.warn(`[worker] Could not fetch settings for user ${userId}:`, settingsError.message);
+
     const kieApiKey = settings?.kie_api_key ?? process.env.KIE_API_KEY;
     if (!kieApiKey) throw new Error(`No KIE API key found for user ${userId}`);
 
-    await supabase
+    const { error: renderingError } = await supabase
       .from("project_beats")
       .update({ video_status: "rendering" })
       .eq("project_id", projectId)
       .eq("beat_number", beatNumber);
+    if (renderingError) console.warn(`[worker] Failed to set rendering status for beat ${beatNumber}:`, renderingError.message);
 
     // Submit to kie.ai video generation
     const jobId = await submitVideoJob(videoPrompt, modelId, kieApiKey, imageUrl, duration, aspectRatio);
@@ -75,23 +78,26 @@ export const videoWorker = new Worker(
     console.log(`[worker] Uploaded to storage: ${publicUrl}`);
 
     // Update DB
-    await supabase
+    const { error: doneError } = await supabase
       .from("project_beats")
       .update({ video_url: publicUrl, video_status: "done" })
       .eq("project_id", projectId)
       .eq("beat_number", beatNumber);
+    if (doneError) console.warn(`[worker] Failed to mark beat ${beatNumber} done:`, doneError.message);
 
     // Update project progress
-    const { data: doneBeat } = await supabase
+    const { data: doneBeat, error: progressQueryError } = await supabase
       .from("project_beats")
       .select("beat_number")
       .eq("project_id", projectId)
       .eq("video_status", "done");
+    if (progressQueryError) console.warn(`[worker] Failed to count done beats:`, progressQueryError.message);
 
-    await supabase
+    const { error: progressError } = await supabase
       .from("projects")
       .update({ videos_progress: doneBeat?.length ?? 0 })
       .eq("id", projectId);
+    if (progressError) console.warn(`[worker] Failed to update project progress:`, progressError.message);
 
     console.log(`[worker] Beat ${beatNumber} complete`);
     return { url: publicUrl, beatNumber };
@@ -121,8 +127,3 @@ videoWorker.on("error", (err) => {
   console.error("[worker] Worker error:", err);
 });
 
-process.on("SIGTERM", async () => {
-  console.log("[worker] SIGTERM received, closing worker...");
-  await videoWorker.close();
-  process.exit(0);
-});
