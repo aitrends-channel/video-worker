@@ -371,6 +371,10 @@ export function setupAssembleRoute(app: Express): void {
 
     const send = (event: object) => {
       res.write(`data: ${JSON.stringify(event)}\n\n`);
+      // Flush so the client receives each event immediately, not buffered
+      if (typeof (res as unknown as { flush?: () => void }).flush === "function") {
+        (res as unknown as { flush: () => void }).flush();
+      }
     };
 
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "assemble-"));
