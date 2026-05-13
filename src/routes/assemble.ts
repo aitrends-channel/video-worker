@@ -1,4 +1,6 @@
 import { createRequire } from "module";
+import { Readable } from "stream";
+import { pipeline } from "stream/promises";
 import { type Express, type Request, type Response } from "express";
 import { supabase } from "../lib/supabase.js";
 import { uploadBuffer } from "../lib/storage.js";
@@ -46,7 +48,9 @@ async function getSettings(userId: string): Promise<{ elevenlabs_api_key: string
 async function downloadFile(url: string, dest: string): Promise<void> {
   const res = await fetch(url, { signal: AbortSignal.timeout(60_000) });
   if (!res.ok) throw new Error(`Failed to download ${url}: ${res.status}`);
-  fs.writeFileSync(dest, Buffer.from(await res.arrayBuffer()));
+  if (!res.body) throw new Error(`No response body for ${url}`);
+  const nodeStream = Readable.fromWeb(res.body as import("stream/web").ReadableStream);
+  await pipeline(nodeStream, fs.createWriteStream(dest));
 }
 
 function getMediaDuration(filePath: string): Promise<number> {
@@ -336,11 +340,10 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
     await progress("Processing video clips…");
     const clipPaths: string[] = new Array(beats.length).fill("");
 
-    // Process clips in parallel batches of 3 to cut wall-clock time
-    const BATCH = 3;
-    for (let start = 0; start < beats.length; start += BATCH) {
-      const slice = beats.slice(start, start + BATCH);
-      await progress(`Processing clips ${start + 1}–${Math.min(start + BATCH, beats.length)} of ${beats.length}…`);
+    // Process clips sequentially to stay within Render's 512 MB RAM limit
+    for (let start = 0; start < beats.length; start += 1) {
+      const slice = beats.slice(start, start + 1);
+      await progress(`Processing clip ${start + 1} of ${beats.length}…`);
       await Promise.all(slice.map(async (beat, localIdx) => {
         const i = start + localIdx;
         const clipPath = path.join(tmpDir, `clip_${String(i).padStart(3, "0")}.mp4`);
