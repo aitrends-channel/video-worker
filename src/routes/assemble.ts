@@ -44,7 +44,7 @@ async function getSettings(userId: string): Promise<{ elevenlabs_api_key: string
 // ── ffmpeg helpers ────────────────────────────────────────────────────────────
 
 async function downloadFile(url: string, dest: string): Promise<void> {
-  const res = await fetch(url);
+  const res = await fetch(url, { signal: AbortSignal.timeout(60_000) });
   if (!res.ok) throw new Error(`Failed to download ${url}: ${res.status}`);
   fs.writeFileSync(dest, Buffer.from(await res.arrayBuffer()));
 }
@@ -59,8 +59,19 @@ function getMediaDuration(filePath: string): Promise<number> {
   });
 }
 
+const FFMPEG_TIMEOUT_MS = 3 * 60_000;
+
+function withFfmpegTimeout<T>(promise: Promise<T>, label: string): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) =>
+      setTimeout(() => reject(new Error(`ffmpeg timed out: ${label}`)), FFMPEG_TIMEOUT_MS)
+    ),
+  ]);
+}
+
 function normalizeClip(src: string, isImage: boolean, duration: number, output: string, w: number, h: number): Promise<void> {
-  return new Promise((resolve, reject) => {
+  return withFfmpegTimeout(new Promise((resolve, reject) => {
     const vf = `scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2:black,fps=24`;
     const cmd = ffmpeg();
     if (isImage) cmd.input(src).inputOptions(["-loop", "1"]);
@@ -71,11 +82,11 @@ function normalizeClip(src: string, isImage: boolean, duration: number, output: 
       .on("end", () => resolve())
       .on("error", (err: Error) => reject(new Error(`normalize failed: ${err.message}`)))
       .run();
-  });
+  }), `normalizeClip ${src}`);
 }
 
 function blackClip(duration: number, output: string, w: number, h: number): Promise<void> {
-  return new Promise((resolve, reject) => {
+  return withFfmpegTimeout(new Promise((resolve, reject) => {
     ffmpeg()
       .input(`color=black:size=${w}x${h}:rate=24`)
       .inputOptions(["-f", "lavfi"])
@@ -84,7 +95,7 @@ function blackClip(duration: number, output: string, w: number, h: number): Prom
       .on("end", () => resolve())
       .on("error", (err: Error) => reject(new Error(`black clip failed: ${err.message}`)))
       .run();
-  });
+  }), "blackClip");
 }
 
 function concatClips(listFile: string, output: string): Promise<void> {
