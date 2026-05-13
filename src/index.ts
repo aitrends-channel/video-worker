@@ -34,14 +34,13 @@ app.get("/api/worker/status", (req, res) => {
   });
 });
 
-// On startup clear any stale "processing" assemblies left by a previous crash/restart
-supabase.from("projects")
+// Clear stale "processing" assemblies BEFORE accepting connections to avoid
+// the race where the cleanup fires after a new assembly job has already started
+const { error: cleanupError } = await supabase.from("projects")
   .update({ assembly_status: "failed", assembly_error: "Worker restarted — please try again", assembly_progress: null })
-  .eq("assembly_status", "processing")
-  .then(({ error }) => {
-    if (error) console.error("[server] Failed to clear stale assemblies:", error.message);
-    else console.log("[server] Cleared stale processing assemblies");
-  });
+  .eq("assembly_status", "processing");
+if (cleanupError) console.error("[server] Failed to clear stale assemblies:", cleanupError.message);
+else console.log("[server] Cleared stale processing assemblies");
 
 // Start server
 const server = app.listen(PORT, () => {
