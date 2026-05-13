@@ -83,7 +83,8 @@ function ffmpegWithTimeout(
     }, FFMPEG_TIMEOUT_MS);
     cmd
       .on("end", () => settle(resolve))
-      .on("error", (err: Error) => settle(() => reject(new Error(`${label} failed: ${err.message}`))));
+      .on("error", (err: Error) => settle(() => reject(new Error(`${label} failed: ${err.message}`))))
+      .run();
   });
 }
 
