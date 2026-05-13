@@ -6,7 +6,7 @@ export async function uploadBuffer(path: string, buffer: ArrayBuffer, contentTyp
     .upload(path, new Uint8Array(buffer), { contentType, upsert: true });
 
   if (error) throw new Error(`Storage upload failed: ${error.message}`);
-  const { data: url } = supabase.storage.from("media").getPublicUrl(path);
+  const { data: url } = supabase.storage.from("assets").getPublicUrl(path);
   return url.publicUrl;
 }
 
