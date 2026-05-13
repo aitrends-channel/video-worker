@@ -20,6 +20,7 @@ interface QueuedBeat {
 const CONCURRENCY = 3;
 const POLL_INTERVAL_MS = 5000;
 let activeJobs = 0;
+let creditsExhausted = false;
 
 async function processBeat(beat: QueuedBeat) {
   const { beat_number: beatNumber, project_id: projectId, video_prompt: videoPrompt,
@@ -93,6 +94,11 @@ async function pollLoop() {
   while (true) {
     try {
       const slots = CONCURRENCY - activeJobs;
+      if (creditsExhausted) {
+        await sleep(60000); // check again in 1 min
+        creditsExhausted = false;
+        continue;
+      }
       if (slots > 0) {
         const { data: rows } = await supabase
           .from("project_beats")
@@ -128,6 +134,10 @@ async function pollLoop() {
           processBeat(beat)
             .catch(async (err: Error) => {
               console.error(`[worker] Beat ${beat.beat_number} failed:`, err.message);
+              if (err.message.toLowerCase().includes("insufficient") || err.message.toLowerCase().includes("balance")) {
+                creditsExhausted = true;
+                console.error("[worker] Credits exhausted — pausing until credits are topped up");
+              }
               await supabase.from("project_beats")
                 .update({ video_status: "failed" })
                 .eq("project_id", beat.project_id)
