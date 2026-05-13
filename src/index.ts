@@ -8,12 +8,15 @@ import { setupAssembleRoute } from "./routes/assemble.js";
 const app = express();
 const PORT = parseInt(process.env.PORT || "3001");
 
-// Middleware
-app.use(cors({
+const corsOptions = {
   origin: "*",
   allowedHeaders: ["Content-Type", "Authorization"],
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-}));
+};
+
+// Middleware — explicit OPTIONS handler must come before routes
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions));
 app.use(express.json({ limit: "10mb" }));
 
 // Routes
