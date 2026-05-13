@@ -19,8 +19,9 @@ interface QueuedBeat {
 
 const CONCURRENCY = 3;
 const POLL_INTERVAL_MS = 5000;
+const CREDITS_RETRY_MS = 5 * 60 * 1000; // retry after 5 minutes
 let activeJobs = 0;
-let creditsExhausted = false;
+let creditsExhaustedAt: number | null = null;
 
 async function failAllQueued(errorMessage: string) {
   const { error } = await supabase
@@ -103,18 +104,16 @@ async function pollLoop() {
   while (true) {
     try {
       const slots = CONCURRENCY - activeJobs;
-      if (creditsExhausted) {
-        await sleep(POLL_INTERVAL_MS);
-        // Reset only when the queue is clear (bulk-fail already drained it)
-        const { count } = await supabase
-          .from("project_beats")
-          .select("beat_number", { count: "exact", head: true })
-          .eq("video_status", "queued");
-        if ((count ?? 0) === 0) creditsExhausted = false;
-        continue;
+      if (creditsExhaustedAt !== null) {
+        if (Date.now() - creditsExhaustedAt < CREDITS_RETRY_MS) {
+          await sleep(POLL_INTERVAL_MS);
+          continue;
+        }
+        console.log("[worker] Credits retry window elapsed — resuming");
+        creditsExhaustedAt = null;
       }
       if (slots > 0) {
-        const { data: rows } = await supabase
+        const { data: rows, error: queryError } = await supabase
           .from("project_beats")
           .select(`
             beat_number, project_id, video_prompt, image_url,
@@ -122,6 +121,7 @@ async function pollLoop() {
           `)
           .eq("video_status", "queued")
           .limit(slots);
+        if (queryError) console.error("[worker] Queue query failed:", queryError.message);
 
         for (const row of rows ?? []) {
           const proj = Array.isArray(row.projects) ? row.projects[0] : row.projects as Record<string, unknown>;
@@ -153,8 +153,8 @@ async function pollLoop() {
                 .eq("project_id", beat.project_id)
                 .eq("beat_number", beat.beat_number);
               if (err.message.toLowerCase().includes("insufficient") || err.message.toLowerCase().includes("balance")) {
-                creditsExhausted = true;
-                console.error("[worker] Credits exhausted — failing all remaining queued beats");
+                creditsExhaustedAt = Date.now();
+                console.error("[worker] Credits exhausted — failing all remaining queued beats, will retry in 5 min");
                 await failAllQueued(err.message);
               }
             })
