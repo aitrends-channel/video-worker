@@ -66,7 +66,7 @@ function normalizeClip(src: string, isImage: boolean, duration: number, output: 
     if (isImage) cmd.input(src).inputOptions(["-loop", "1"]);
     else cmd.input(src).inputOptions(["-stream_loop", "-1"]);
     cmd
-      .outputOptions(["-t", String(duration), "-vf", vf, "-c:v", "libx264", "-preset", "fast", "-crf", "23", "-an", "-pix_fmt", "yuv420p"])
+      .outputOptions(["-t", String(duration), "-vf", vf, "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-an", "-pix_fmt", "yuv420p"])
       .output(output)
       .on("end", () => resolve())
       .on("error", (err: Error) => reject(new Error(`normalize failed: ${err.message}`)))
@@ -79,7 +79,7 @@ function blackClip(duration: number, output: string, w: number, h: number): Prom
     ffmpeg()
       .input(`color=black:size=${w}x${h}:rate=24`)
       .inputOptions(["-f", "lavfi"])
-      .outputOptions(["-t", String(duration), "-c:v", "libx264", "-preset", "fast", "-crf", "23", "-an", "-pix_fmt", "yuv420p"])
+      .outputOptions(["-t", String(duration), "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-an", "-pix_fmt", "yuv420p"])
       .output(output)
       .on("end", () => resolve())
       .on("error", (err: Error) => reject(new Error(`black clip failed: ${err.message}`)))
@@ -323,30 +323,36 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
     const durations = alignBeats(beats.map((b) => b.script_segment ?? ""), transcriptionWords, totalDuration);
 
     await progress("Processing video clips…");
-    const clipPaths: string[] = [];
-    for (let i = 0; i < beats.length; i++) {
-      const beat = beats[i];
-      const clipPath = path.join(tmpDir, `clip_${String(i).padStart(3, "0")}.mp4`);
-      await progress(`Processing clip ${i + 1} of ${beats.length}…`);
-      try {
-        if (beat.video_url) {
-          const ext = beat.video_url.includes(".webm") ? "webm" : "mp4";
-          const src = path.join(tmpDir, `src_${i}.${ext}`);
-          await downloadFile(beat.video_url, src);
-          await normalizeClip(src, false, durations[i], clipPath, w, h);
-        } else if (beat.image_url) {
-          const ext = beat.image_url.toLowerCase().includes(".png") ? "png" : "jpg";
-          const src = path.join(tmpDir, `src_${i}.${ext}`);
-          await downloadFile(beat.image_url, src);
-          await normalizeClip(src, true, durations[i], clipPath, w, h);
-        } else {
+    const clipPaths: string[] = new Array(beats.length).fill("");
+
+    // Process clips in parallel batches of 3 to cut wall-clock time
+    const BATCH = 3;
+    for (let start = 0; start < beats.length; start += BATCH) {
+      const slice = beats.slice(start, start + BATCH);
+      await progress(`Processing clips ${start + 1}–${Math.min(start + BATCH, beats.length)} of ${beats.length}…`);
+      await Promise.all(slice.map(async (beat, localIdx) => {
+        const i = start + localIdx;
+        const clipPath = path.join(tmpDir, `clip_${String(i).padStart(3, "0")}.mp4`);
+        try {
+          if (beat.video_url) {
+            const ext = beat.video_url.includes(".webm") ? "webm" : "mp4";
+            const src = path.join(tmpDir, `src_${i}.${ext}`);
+            await downloadFile(beat.video_url, src);
+            await normalizeClip(src, false, durations[i], clipPath, w, h);
+          } else if (beat.image_url) {
+            const ext = beat.image_url.toLowerCase().includes(".png") ? "png" : "jpg";
+            const src = path.join(tmpDir, `src_${i}.${ext}`);
+            await downloadFile(beat.image_url, src);
+            await normalizeClip(src, true, durations[i], clipPath, w, h);
+          } else {
+            await blackClip(durations[i], clipPath, w, h);
+          }
+        } catch (e) {
+          console.error(`[assemble] beat ${beat.beat_number} clip error:`, e);
           await blackClip(durations[i], clipPath, w, h);
         }
-      } catch (e) {
-        console.error(`[assemble] beat ${beat.beat_number} clip error:`, e);
-        await blackClip(durations[i], clipPath, w, h);
-      }
-      clipPaths.push(clipPath);
+        clipPaths[i] = clipPath;
+      }));
     }
 
     await progress("Joining clips…");
