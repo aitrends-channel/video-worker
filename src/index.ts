@@ -3,16 +3,22 @@ import express from "express";
 import cors from "cors";
 import { startVideoWorker } from "./workers/video-worker.js";
 import { setupHealthRoutes } from "./routes/health.js";
+import { setupAssembleRoute } from "./routes/assemble.js";
 
 const app = express();
 const PORT = parseInt(process.env.PORT || "3001");
 
 // Middleware
-app.use(cors());
-app.use(express.json());
+app.use(cors({
+  origin: "*",
+  allowedHeaders: ["Content-Type", "Authorization"],
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+}));
+app.use(express.json({ limit: "10mb" }));
 
 // Routes
 setupHealthRoutes(app);
+setupAssembleRoute(app);
 
 // Video worker info endpoint
 app.get("/api/worker/status", (req, res) => {
