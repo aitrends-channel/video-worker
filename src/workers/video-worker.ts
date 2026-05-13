@@ -22,6 +22,15 @@ const POLL_INTERVAL_MS = 5000;
 let activeJobs = 0;
 let creditsExhausted = false;
 
+async function failAllQueued(errorMessage: string) {
+  const { error } = await supabase
+    .from("project_beats")
+    .update({ video_status: "failed", video_error: errorMessage })
+    .eq("video_status", "queued");
+  if (error) console.error("[worker] Failed to bulk-fail queued beats:", error.message);
+  else console.log("[worker] Bulk-failed all remaining queued beats due to credits exhaustion");
+}
+
 async function processBeat(beat: QueuedBeat) {
   const { beat_number: beatNumber, project_id: projectId, video_prompt: videoPrompt,
     image_url: imageUrl, video_model_id: modelId, video_duration: duration,
@@ -95,8 +104,13 @@ async function pollLoop() {
     try {
       const slots = CONCURRENCY - activeJobs;
       if (creditsExhausted) {
-        await sleep(60000); // check again in 1 min
-        creditsExhausted = false;
+        await sleep(POLL_INTERVAL_MS);
+        // Reset only when the queue is clear (bulk-fail already drained it)
+        const { count } = await supabase
+          .from("project_beats")
+          .select("beat_number", { count: "exact", head: true })
+          .eq("video_status", "queued");
+        if ((count ?? 0) === 0) creditsExhausted = false;
         continue;
       }
       if (slots > 0) {
@@ -134,14 +148,15 @@ async function pollLoop() {
           processBeat(beat)
             .catch(async (err: Error) => {
               console.error(`[worker] Beat ${beat.beat_number} failed:`, err.message);
-              if (err.message.toLowerCase().includes("insufficient") || err.message.toLowerCase().includes("balance")) {
-                creditsExhausted = true;
-                console.error("[worker] Credits exhausted — pausing until credits are topped up");
-              }
               await supabase.from("project_beats")
                 .update({ video_status: "failed", video_error: err.message })
                 .eq("project_id", beat.project_id)
                 .eq("beat_number", beat.beat_number);
+              if (err.message.toLowerCase().includes("insufficient") || err.message.toLowerCase().includes("balance")) {
+                creditsExhausted = true;
+                console.error("[worker] Credits exhausted — failing all remaining queued beats");
+                await failAllQueued(err.message);
+              }
             })
             .finally(() => { activeJobs--; });
         }
