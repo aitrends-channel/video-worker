@@ -314,10 +314,20 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
     if (projectRes.error) throw new Error("Project not found");
 
     const proj = projectRes.data as { tts_url: string | null; tts_cleaned_url: string | null };
-    const beats = (beatsRes.data ?? []) as Beat[];
+    const allBeats = (beatsRes.data ?? []) as Beat[];
     const voiceoverUrl = voiceoverType === "original" ? (proj.tts_url ?? proj.tts_cleaned_url) : (proj.tts_cleaned_url ?? proj.tts_url);
     if (!voiceoverUrl) throw new Error("No voiceover found — generate a voiceover on the Generate page first.");
-    if (!beats.length) throw new Error("No beats found in this project.");
+    if (!allBeats.length) throw new Error("No beats found in this project.");
+
+    // Trim to the last beat that has a generated clip so trailing ungenerated
+    // beats don't produce a long tail of black screens in the final video
+    const lastGeneratedIdx = allBeats.reduce((last, beat, i) =>
+      (beat.video_url || beat.image_url) ? i : last, -1);
+    if (lastGeneratedIdx === -1) throw new Error("No clips have been generated yet — generate images or videos on the Generate page first.");
+    const beats = allBeats.slice(0, lastGeneratedIdx + 1);
+    if (beats.length < allBeats.length) {
+      console.log(`[assemble] ${projectId}: trimmed to ${beats.length}/${allBeats.length} beats (last generated clip at beat ${beats[lastGeneratedIdx]?.beat_number ?? lastGeneratedIdx + 1})`);
+    }
 
     await progress("Downloading voiceover…");
     const voiceoverPath = path.join(tmpDir, "voiceover.mp3");
