@@ -3,7 +3,7 @@ import { Readable } from "stream";
 import { pipeline } from "stream/promises";
 import { type Express, type Request, type Response } from "express";
 import { supabase } from "../lib/supabase.js";
-import { uploadBuffer } from "../lib/storage.js";
+import { uploadFile } from "../lib/storage.js";
 import Anthropic from "@anthropic-ai/sdk";
 import fs from "fs";
 import path from "path";
@@ -353,11 +353,13 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
             const src = path.join(tmpDir, `src_${i}.${ext}`);
             await downloadFile(beat.video_url, src);
             await normalizeClip(src, false, durations[i], clipPath, w, h);
+            try { fs.unlinkSync(src); } catch { /* ignore */ }
           } else if (beat.image_url) {
             const ext = beat.image_url.toLowerCase().includes(".png") ? "png" : "jpg";
             const src = path.join(tmpDir, `src_${i}.${ext}`);
             await downloadFile(beat.image_url, src);
             await normalizeClip(src, true, durations[i], clipPath, w, h);
+            try { fs.unlinkSync(src); } catch { /* ignore */ }
           } else {
             await blackClip(durations[i], clipPath, w, h);
           }
@@ -378,6 +380,7 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
     await progress("Mixing voiceover…");
     const outputPath = path.join(tmpDir, "output.mp4");
     await mixAudio(joinedPath, voiceoverPath, outputPath);
+    try { fs.unlinkSync(joinedPath); } catch { /* ignore */ }
 
     let finalPath = outputPath;
     if (captionsEnabled) {
@@ -395,6 +398,7 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
         await progress("Burning captions…");
         const captionedPath = path.join(tmpDir, "captioned.mp4");
         await burnSubtitles(outputPath, assPath, captionedPath);
+        try { fs.unlinkSync(outputPath); } catch { /* ignore */ }
         finalPath = captionedPath;
       } catch (e) {
         console.warn("[assemble] caption burn failed:", e);
@@ -402,8 +406,7 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
     }
 
     await progress("Uploading…");
-    const buf = fs.readFileSync(finalPath);
-    const publicUrl = await uploadBuffer(`${projectId}/assembled_${Date.now()}.mp4`, buf.buffer as ArrayBuffer, "video/mp4");
+    const publicUrl = await uploadFile(`${projectId}/assembled_${Date.now()}.mp4`, finalPath, "video/mp4");
 
     await supabase.from("projects")
       .update({ assembled_url: publicUrl, assembly_status: "done", assembly_progress: null, assembly_error: null })
