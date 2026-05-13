@@ -81,7 +81,7 @@ function normalizeClip(src: string, isImage: boolean, duration: number, output: 
     if (isImage) cmd.input(src).inputOptions(["-loop", "1"]);
     else cmd.input(src).inputOptions(["-stream_loop", "-1"]);
     cmd
-      .outputOptions(["-t", String(duration), "-vf", vf, "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-an", "-pix_fmt", "yuv420p"])
+      .outputOptions(["-t", String(duration), "-vf", vf, "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-an", "-pix_fmt", "yuv420p", "-threads", "1"])
       .output(output)
       .on("end", () => resolve())
       .on("error", (err: Error) => reject(new Error(`normalize failed: ${err.message}`)))
@@ -94,7 +94,7 @@ function blackClip(duration: number, output: string, w: number, h: number): Prom
     ffmpeg()
       .input(`color=black:size=${w}x${h}:rate=24`)
       .inputOptions(["-f", "lavfi"])
-      .outputOptions(["-t", String(duration), "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-an", "-pix_fmt", "yuv420p"])
+      .outputOptions(["-t", String(duration), "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-an", "-pix_fmt", "yuv420p", "-threads", "1"])
       .output(output)
       .on("end", () => resolve())
       .on("error", (err: Error) => reject(new Error(`black clip failed: ${err.message}`)))
@@ -131,7 +131,7 @@ function burnSubtitles(video: string, assPath: string, output: string): Promise<
     const escaped = assPath.replace(/\\/g, "/").replace(/:/g, "\\:");
     ffmpeg()
       .input(video)
-      .outputOptions(["-vf", `ass='${escaped}'`, "-c:v", "libx264", "-preset", "fast", "-crf", "23", "-c:a", "copy"])
+      .outputOptions(["-vf", `ass='${escaped}'`, "-c:v", "libx264", "-preset", "fast", "-crf", "23", "-c:a", "copy", "-threads", "1"])
       .output(output)
       .on("end", () => resolve())
       .on("error", (err: Error) => reject(new Error(`subtitle burn failed: ${err.message}`)))
@@ -381,6 +381,8 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
     fs.writeFileSync(listPath, clipPaths.map((p) => `file '${p.replace(/\\/g, "/")}'`).join("\n"));
     const joinedPath = path.join(tmpDir, "joined.mp4");
     await concatClips(listPath, joinedPath);
+    // Free disk space — individual clips are no longer needed
+    for (const p of clipPaths) { try { fs.unlinkSync(p); } catch { /* ignore */ } }
 
     await progress("Mixing voiceover…");
     const outputPath = path.join(tmpDir, "output.mp4");
