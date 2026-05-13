@@ -51,4 +51,12 @@ process.on("SIGINT", () => {
   server.close(() => { console.log("[server] HTTP server closed"); process.exit(0); });
 });
 
+process.on("uncaughtException", (err) => {
+  console.error("[worker] uncaughtException:", err);
+});
+
+process.on("unhandledRejection", (err) => {
+  console.error("[worker] unhandledRejection:", err);
+});
+
 export default app;

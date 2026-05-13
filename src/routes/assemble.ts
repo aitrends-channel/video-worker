@@ -367,15 +367,16 @@ export function setupAssembleRoute(app: Express): void {
     res.setHeader("Cache-Control", "no-cache");
     res.setHeader("Connection", "keep-alive");
     res.setHeader("Access-Control-Allow-Origin", "*");
+    // Disable nginx/Render proxy buffering so events reach the client immediately
+    res.setHeader("X-Accel-Buffering", "no");
     res.flushHeaders();
 
     const send = (event: object) => {
       res.write(`data: ${JSON.stringify(event)}\n\n`);
-      // Flush so the client receives each event immediately, not buffered
-      if (typeof (res as unknown as { flush?: () => void }).flush === "function") {
-        (res as unknown as { flush: () => void }).flush();
-      }
     };
+
+    // Heartbeat keeps the connection alive through Render's idle timeout
+    const heartbeat = setInterval(() => { res.write(": heartbeat\n\n"); }, 20000);
 
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "assemble-"));
 
@@ -511,6 +512,7 @@ export function setupAssembleRoute(app: Express): void {
       console.error("[assemble]", message);
       send({ type: "error", message });
     } finally {
+      clearInterval(heartbeat);
       try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
       res.end();
     }
