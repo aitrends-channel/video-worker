@@ -4,6 +4,7 @@ import cors from "cors";
 import { startVideoWorker } from "./workers/video-worker.js";
 import { setupHealthRoutes } from "./routes/health.js";
 import { setupAssembleRoute } from "./routes/assemble.js";
+import { supabase } from "./lib/supabase.js";
 
 const app = express();
 const PORT = parseInt(process.env.PORT || "3001");
@@ -40,16 +41,17 @@ const server = app.listen(PORT, () => {
   startVideoWorker();
 });
 
-// Graceful shutdown
-process.on("SIGTERM", () => {
-  console.log("[server] SIGTERM received, shutting down gracefully...");
+async function gracefulShutdown(signal: string) {
+  console.log(`[server] ${signal} received, shutting down gracefully...`);
+  // Mark any in-progress assemblies as failed so the client shows a clear retry message
+  await supabase.from("projects")
+    .update({ assembly_status: "failed", assembly_error: "Worker restarted mid-assembly — please try again", assembly_progress: null })
+    .eq("assembly_status", "processing");
   server.close(() => { console.log("[server] HTTP server closed"); process.exit(0); });
-});
+}
 
-process.on("SIGINT", () => {
-  console.log("[server] SIGINT received, shutting down gracefully...");
-  server.close(() => { console.log("[server] HTTP server closed"); process.exit(0); });
-});
+process.on("SIGTERM", () => { gracefulShutdown("SIGTERM").catch(console.error); });
+process.on("SIGINT",  () => { gracefulShutdown("SIGINT").catch(console.error); });
 
 process.on("uncaughtException", (err) => {
   console.error("[worker] uncaughtException:", err);
