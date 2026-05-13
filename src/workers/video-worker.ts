@@ -139,7 +139,7 @@ async function pollLoop() {
                 console.error("[worker] Credits exhausted — pausing until credits are topped up");
               }
               await supabase.from("project_beats")
-                .update({ video_status: "failed" })
+                .update({ video_status: "failed", video_error: err.message })
                 .eq("project_id", beat.project_id)
                 .eq("beat_number", beat.beat_number);
             })
