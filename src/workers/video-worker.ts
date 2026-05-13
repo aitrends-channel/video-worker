@@ -57,7 +57,13 @@ async function processBeat(beat: QueuedBeat) {
   for (let attempt = 0; attempt < 60; attempt++) {
     await sleep(10000);
     const status = await pollVideoJob(jobId, modelId, kieApiKey);
-    if (status.status === "done" && status.videoUrl) { videoUrl = status.videoUrl; break; }
+    console.log(`[worker] Poll attempt ${attempt + 1} beat=${beatNumber} status=${status.status} hasUrl=${!!status.videoUrl}`);
+    if (status.status === "done") {
+      if (status.videoUrl) { videoUrl = status.videoUrl; break; }
+      // Done but no URL — log full response and keep polling briefly in case URL appears
+      console.warn(`[worker] Beat ${beatNumber} done but no videoUrl yet, attempt ${attempt + 1}`);
+      if (attempt >= 3) throw new Error("Job completed on KIE but no video URL was returned");
+    }
     if (status.status === "failed") throw new Error(`kie.ai video job failed: ${status.error}`);
   }
 

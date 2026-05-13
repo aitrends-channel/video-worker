@@ -34,6 +34,8 @@ interface KieRecordResponse {
     videoInfo?: { videoUrl?: string };
     successFlag?: number;
     videoUrl?: string;
+    video_url?: string;
+    [key: string]: unknown;
   };
 }
 
@@ -129,9 +131,11 @@ export async function pollVideoJob(
   const d = data.data;
   const raw = (d?.state ?? d?.status ?? "").toLowerCase();
 
+  console.log(`[kie] poll taskId=${taskId} raw_state="${raw}" keys=${Object.keys(d ?? {}).join(",")}`);
+
   const DONE = ["succeed", "success", "completed", "done", "finish", "finished", "complete"];
   const FAIL = ["failed", "error", "fail"];
-  const PROCESSING = ["generating", "running", "processing", "active"];
+  const PROCESSING = ["generating", "running", "processing", "active", "in_progress", "queued", "waiting"];
 
   let jobStatus: "pending" | "processing" | "done" | "failed" = "pending";
   if (DONE.includes(raw)) jobStatus = "done";
@@ -140,16 +144,21 @@ export async function pollVideoJob(
 
   let videoUrl: string | undefined;
   if (jobStatus === "done") {
-    if (typeof d?.resultJson === "string") {
+    // Check top-level videoUrl first
+    if (typeof d?.videoUrl === "string" && d.videoUrl.startsWith("http")) videoUrl = d.videoUrl;
+    // Check resultJson
+    if (!videoUrl && typeof d?.resultJson === "string") {
       try {
-        const parsed = JSON.parse(d.resultJson) as { resultUrls?: string[]; url?: string };
-        videoUrl = parsed.resultUrls?.[0] ?? parsed.url;
+        const parsed = JSON.parse(d.resultJson) as { resultUrls?: string[]; url?: string; videoUrl?: string; video_url?: string };
+        videoUrl = parsed.resultUrls?.[0] ?? parsed.videoUrl ?? parsed.video_url ?? parsed.url;
       } catch {
         if (d.resultJson.startsWith("http")) videoUrl = d.resultJson;
       }
     }
-    if (!videoUrl && Array.isArray(d?.output)) videoUrl = d.output[0];
-    if (!videoUrl && typeof d?.output === "string") videoUrl = d.output;
+    if (!videoUrl && Array.isArray(d?.output)) videoUrl = (d.output as string[]).find((u) => u.startsWith("http"));
+    if (!videoUrl && typeof d?.output === "string" && d.output.startsWith("http")) videoUrl = d.output;
+
+    if (!videoUrl) console.warn(`[kie] Done but no videoUrl found. data=${JSON.stringify(d)}`);
   }
 
   return {
