@@ -65,41 +65,47 @@ function getMediaDuration(filePath: string): Promise<number> {
 
 const FFMPEG_TIMEOUT_MS = 3 * 60_000;
 
-function withFfmpegTimeout<T>(promise: Promise<T>, label: string): Promise<T> {
-  return Promise.race([
-    promise,
-    new Promise<T>((_, reject) =>
-      setTimeout(() => reject(new Error(`ffmpeg timed out: ${label}`)), FFMPEG_TIMEOUT_MS)
-    ),
-  ]);
+function ffmpegWithTimeout(
+  build: (cmd: ReturnType<typeof ffmpeg>) => ReturnType<typeof ffmpeg>,
+  label: string
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const cmd = build(ffmpeg());
+    let settled = false;
+    const settle = (fn: () => void) => {
+      if (!settled) { settled = true; clearTimeout(timer); fn(); }
+    };
+    const timer = setTimeout(() => {
+      settle(() => {
+        try { cmd.kill("SIGKILL"); } catch { /* ignore */ }
+        reject(new Error(`ffmpeg timed out: ${label}`));
+      });
+    }, FFMPEG_TIMEOUT_MS);
+    cmd
+      .on("end", () => settle(resolve))
+      .on("error", (err: Error) => settle(() => reject(new Error(`${label} failed: ${err.message}`))));
+  });
 }
 
 function normalizeClip(src: string, isImage: boolean, duration: number, output: string, w: number, h: number): Promise<void> {
-  return withFfmpegTimeout(new Promise((resolve, reject) => {
-    const vf = `scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2:black,fps=24`;
-    const cmd = ffmpeg();
+  const vf = `scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2:black,fps=24`;
+  return ffmpegWithTimeout((cmd) => {
     if (isImage) cmd.input(src).inputOptions(["-loop", "1"]);
     else cmd.input(src).inputOptions(["-stream_loop", "-1"]);
-    cmd
+    return cmd
       .outputOptions(["-t", String(duration), "-vf", vf, "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-an", "-pix_fmt", "yuv420p", "-threads", "1"])
-      .output(output)
-      .on("end", () => resolve())
-      .on("error", (err: Error) => reject(new Error(`normalize failed: ${err.message}`)))
-      .run();
-  }), `normalizeClip ${src}`);
+      .output(output);
+  }, `normalizeClip`);
 }
 
 function blackClip(duration: number, output: string, w: number, h: number): Promise<void> {
-  return withFfmpegTimeout(new Promise((resolve, reject) => {
-    ffmpeg()
+  return ffmpegWithTimeout((cmd) =>
+    cmd
       .input(`color=black:size=${w}x${h}:rate=24`)
       .inputOptions(["-f", "lavfi"])
       .outputOptions(["-t", String(duration), "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-an", "-pix_fmt", "yuv420p", "-threads", "1"])
-      .output(output)
-      .on("end", () => resolve())
-      .on("error", (err: Error) => reject(new Error(`black clip failed: ${err.message}`)))
-      .run();
-  }), "blackClip");
+      .output(output),
+  "blackClip");
 }
 
 function concatClips(listFile: string, output: string): Promise<void> {
@@ -127,16 +133,13 @@ function mixAudio(video: string, audio: string, output: string): Promise<void> {
 }
 
 function burnSubtitles(video: string, assPath: string, output: string): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const escaped = assPath.replace(/\\/g, "/").replace(/:/g, "\\:");
-    ffmpeg()
+  const escaped = assPath.replace(/\\/g, "/").replace(/:/g, "\\:");
+  return ffmpegWithTimeout((cmd) =>
+    cmd
       .input(video)
       .outputOptions(["-vf", `ass='${escaped}'`, "-c:v", "libx264", "-preset", "fast", "-crf", "23", "-c:a", "copy", "-threads", "1"])
-      .output(output)
-      .on("end", () => resolve())
-      .on("error", (err: Error) => reject(new Error(`subtitle burn failed: ${err.message}`)))
-      .run();
-  });
+      .output(output),
+  "burnSubtitles");
 }
 
 // ── Transcription ─────────────────────────────────────────────────────────────
@@ -356,18 +359,23 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
           if (beat.video_url) {
             const ext = beat.video_url.includes(".webm") ? "webm" : "mp4";
             const src = path.join(tmpDir, `src_${i}.${ext}`);
+            console.log(`[assemble] beat ${beat.beat_number}: downloading video…`);
             await downloadFile(beat.video_url, src);
+            console.log(`[assemble] beat ${beat.beat_number}: encoding clip…`);
             await normalizeClip(src, false, durations[i], clipPath, w, h);
             try { fs.unlinkSync(src); } catch { /* ignore */ }
           } else if (beat.image_url) {
             const ext = beat.image_url.toLowerCase().includes(".png") ? "png" : "jpg";
             const src = path.join(tmpDir, `src_${i}.${ext}`);
+            console.log(`[assemble] beat ${beat.beat_number}: downloading image…`);
             await downloadFile(beat.image_url, src);
+            console.log(`[assemble] beat ${beat.beat_number}: encoding clip…`);
             await normalizeClip(src, true, durations[i], clipPath, w, h);
             try { fs.unlinkSync(src); } catch { /* ignore */ }
           } else {
             await blackClip(durations[i], clipPath, w, h);
           }
+          console.log(`[assemble] beat ${beat.beat_number}: done`);
         } catch (e) {
           console.error(`[assemble] beat ${beat.beat_number} clip error:`, e);
           await blackClip(durations[i], clipPath, w, h);
