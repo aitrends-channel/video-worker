@@ -319,15 +319,13 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
     if (!voiceoverUrl) throw new Error("No voiceover found — generate a voiceover on the Generate page first.");
     if (!allBeats.length) throw new Error("No beats found in this project.");
 
-    // Trim to the last beat that has a generated clip so trailing ungenerated
-    // beats don't produce a long tail of black screens in the final video
-    const lastGeneratedIdx = allBeats.reduce((last, beat, i) =>
-      (beat.video_url || beat.image_url) ? i : last, -1);
-    if (lastGeneratedIdx === -1) throw new Error("No clips have been generated yet — generate images or videos on the Generate page first.");
-    const beats = allBeats.slice(0, lastGeneratedIdx + 1);
-    if (beats.length < allBeats.length) {
-      console.log(`[assemble] ${projectId}: trimmed to ${beats.length}/${allBeats.length} beats (last generated clip at beat ${beats[lastGeneratedIdx]?.beat_number ?? lastGeneratedIdx + 1})`);
-    }
+    // Trim to the last beat that has a generated video clip — anything beyond
+    // that is dropped entirely regardless of whether an image exists
+    const lastVideoIdx = allBeats.reduce((last, beat, i) =>
+      beat.video_url ? i : last, -1);
+    if (lastVideoIdx === -1) throw new Error("No video clips have been generated yet — generate video clips on the Generate page first.");
+    const beats = allBeats.slice(0, lastVideoIdx + 1);
+    console.log(`[assemble] ${projectId}: assembling ${beats.length}/${allBeats.length} beats (last video clip at beat ${beats[lastVideoIdx]?.beat_number ?? lastVideoIdx + 1})`);
 
     await progress("Downloading voiceover…");
     const voiceoverPath = path.join(tmpDir, "voiceover.mp3");
