@@ -1,5 +1,3 @@
-import { Worker } from "bullmq";
-import { queueConnection } from "../lib/queue.js";
 import { submitVideoJob, pollVideoJob } from "../lib/kie.js";
 import { uploadFromUrl } from "../lib/storage.js";
 import { supabase } from "../lib/supabase.js";
@@ -8,122 +6,143 @@ function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-export const videoWorker = new Worker(
-  "video-generation",
-  async (job) => {
-    const { projectId, beatNumber, videoPrompt, imageUrl, modelId, duration, aspectRatio, userId } = job.data as {
-      projectId: string;
-      beatNumber: number;
-      videoPrompt: string;
-      imageUrl?: string;
-      modelId: string;
-      duration?: string | number;
-      aspectRatio?: string;
-      userId: string;
-    };
+interface QueuedBeat {
+  beat_number: number;
+  project_id: string;
+  video_prompt: string;
+  image_url?: string;
+  video_model_id: string;
+  video_duration?: string | number;
+  video_aspect_ratio: string;
+  user_id: string;
+}
 
-    console.log(`[worker] Processing beat ${beatNumber} for project ${projectId}`);
+const CONCURRENCY = 3;
+const POLL_INTERVAL_MS = 5000;
+let activeJobs = 0;
 
-    // Look up the user's KIE API key from app_settings
-    const { data: settings, error: settingsError } = await supabase
-      .from("app_settings")
-      .select("kie_api_key")
-      .eq("user_id", userId)
-      .single();
+async function processBeat(beat: QueuedBeat) {
+  const { beat_number: beatNumber, project_id: projectId, video_prompt: videoPrompt,
+    image_url: imageUrl, video_model_id: modelId, video_duration: duration,
+    video_aspect_ratio: aspectRatio, user_id: userId } = beat;
 
-    if (settingsError) console.warn(`[worker] Could not fetch settings for user ${userId}:`, settingsError.message);
+  console.log(`[worker] Processing beat ${beatNumber} for project ${projectId}`);
 
-    const kieApiKey = settings?.kie_api_key ?? process.env.KIE_API_KEY;
-    if (!kieApiKey) throw new Error(`No KIE API key found for user ${userId}`);
+  const { data: settings, error: settingsError } = await supabase
+    .from("app_settings")
+    .select("kie_api_key")
+    .eq("user_id", userId)
+    .single();
 
-    const { error: renderingError } = await supabase
-      .from("project_beats")
-      .update({ video_status: "rendering" })
-      .eq("project_id", projectId)
-      .eq("beat_number", beatNumber);
-    if (renderingError) console.warn(`[worker] Failed to set rendering status for beat ${beatNumber}:`, renderingError.message);
+  if (settingsError) console.warn(`[worker] Could not fetch settings for ${userId}:`, settingsError.message);
 
-    // Submit to kie.ai video generation
-    const jobId = await submitVideoJob(videoPrompt, modelId, kieApiKey, imageUrl, duration, aspectRatio);
-    console.log(`[worker] Submitted video job: ${jobId}`);
+  const kieApiKey = settings?.kie_api_key ?? process.env.KIE_API_KEY;
+  if (!kieApiKey) throw new Error(`No KIE API key found for user ${userId}`);
 
-    // Poll until complete
-    let videoUrl: string | undefined;
-    let attempts = 0;
-    const maxAttempts = 60; // 10 minutes at 10s intervals
+  const jobId = await submitVideoJob(videoPrompt, modelId, kieApiKey, imageUrl, duration, aspectRatio);
+  console.log(`[worker] Submitted video job: ${jobId}`);
 
-    while (!videoUrl && attempts < maxAttempts) {
-      await sleep(10000);
-      attempts++;
-
-      const status = await pollVideoJob(jobId, modelId, kieApiKey);
-
-      if (status.status === "done" && status.videoUrl) {
-        videoUrl = status.videoUrl;
-        console.log(`[worker] Video ready: ${videoUrl}`);
-      } else if (status.status === "failed") {
-        throw new Error(`kie.ai video job failed: ${status.error}`);
-      }
-
-      await job.updateProgress(Math.min(Math.round((attempts / maxAttempts) * 100), 99));
-    }
-
-    if (!videoUrl) {
-      throw new Error("Video generation timed out after 10 minutes");
-    }
-
-    // Upload to Supabase Storage
-    const storagePath = `${projectId}/videos/beat-${beatNumber}.mp4`;
-    const publicUrl = await uploadFromUrl(storagePath, videoUrl, "video/mp4");
-    console.log(`[worker] Uploaded to storage: ${publicUrl}`);
-
-    // Update DB
-    const { error: doneError } = await supabase
-      .from("project_beats")
-      .update({ video_url: publicUrl, video_status: "done" })
-      .eq("project_id", projectId)
-      .eq("beat_number", beatNumber);
-    if (doneError) console.warn(`[worker] Failed to mark beat ${beatNumber} done:`, doneError.message);
-
-    // Update project progress
-    const { data: doneBeat, error: progressQueryError } = await supabase
-      .from("project_beats")
-      .select("beat_number")
-      .eq("project_id", projectId)
-      .eq("video_status", "done");
-    if (progressQueryError) console.warn(`[worker] Failed to count done beats:`, progressQueryError.message);
-
-    const { error: progressError } = await supabase
-      .from("projects")
-      .update({ videos_progress: doneBeat?.length ?? 0 })
-      .eq("id", projectId);
-    if (progressError) console.warn(`[worker] Failed to update project progress:`, progressError.message);
-
-    console.log(`[worker] Beat ${beatNumber} complete`);
-    return { url: publicUrl, beatNumber };
-  },
-  {
-    connection: queueConnection,
-    concurrency: 3,
+  let videoUrl: string | undefined;
+  for (let attempt = 0; attempt < 60; attempt++) {
+    await sleep(10000);
+    const status = await pollVideoJob(jobId, modelId, kieApiKey);
+    if (status.status === "done" && status.videoUrl) { videoUrl = status.videoUrl; break; }
+    if (status.status === "failed") throw new Error(`kie.ai video job failed: ${status.error}`);
   }
-);
 
-videoWorker.on("failed", async (job, err) => {
-  if (!job) return;
-  const { projectId, beatNumber } = job.data;
-  console.error(`[worker] Job ${job.id} failed:`, err.message);
-  await supabase
-    .from("project_beats")
-    .update({ video_status: "failed" })
+  if (!videoUrl) throw new Error("Video generation timed out after 10 minutes");
+
+  const storagePath = `${projectId}/videos/beat-${beatNumber}.mp4`;
+  const publicUrl = await uploadFromUrl(storagePath, videoUrl, "video/mp4");
+  console.log(`[worker] Uploaded: ${publicUrl}`);
+
+  await supabase.from("project_beats")
+    .update({ video_url: publicUrl, video_status: "done" })
     .eq("project_id", projectId)
     .eq("beat_number", beatNumber);
-});
 
-videoWorker.on("ready", () => {
-  console.log("[worker] Video worker ready — concurrency: 3");
-});
+  const { data: doneBeats } = await supabase
+    .from("project_beats")
+    .select("beat_number")
+    .eq("project_id", projectId)
+    .eq("video_status", "done");
 
-videoWorker.on("error", (err) => {
-  console.error("[worker] Worker error:", err);
-});
+  await supabase.from("projects")
+    .update({ videos_progress: doneBeats?.length ?? 0 })
+    .eq("id", projectId);
 
+  console.log(`[worker] Beat ${beatNumber} complete`);
+}
+
+async function tryClaimBeat(beat: QueuedBeat): Promise<boolean> {
+  // Atomic claim: only succeeds if still 'queued'
+  const { data, error } = await supabase
+    .from("project_beats")
+    .update({ video_status: "rendering" })
+    .eq("project_id", beat.project_id)
+    .eq("beat_number", beat.beat_number)
+    .eq("video_status", "queued")
+    .select("beat_number")
+    .single();
+
+  return !error && !!data;
+}
+
+async function pollLoop() {
+  console.log(`[worker] Supabase-polling worker started (concurrency: ${CONCURRENCY})`);
+  while (true) {
+    try {
+      const slots = CONCURRENCY - activeJobs;
+      if (slots > 0) {
+        const { data: rows } = await supabase
+          .from("project_beats")
+          .select(`
+            beat_number, project_id, video_prompt, image_url,
+            projects!inner(user_id, video_model_id, video_duration, video_aspect_ratio)
+          `)
+          .eq("video_status", "queued")
+          .limit(slots);
+
+        for (const row of rows ?? []) {
+          const proj = Array.isArray(row.projects) ? row.projects[0] : row.projects as Record<string, unknown>;
+          const beat: QueuedBeat = {
+            beat_number: row.beat_number as number,
+            project_id: row.project_id as string,
+            video_prompt: row.video_prompt as string,
+            image_url: row.image_url as string | undefined,
+            video_model_id: proj?.video_model_id as string,
+            video_duration: proj?.video_duration as string | number | undefined,
+            video_aspect_ratio: (proj?.video_aspect_ratio as string) ?? "16:9",
+            user_id: proj?.user_id as string,
+          };
+
+          if (!beat.video_model_id || !beat.user_id) {
+            console.warn(`[worker] Beat ${beat.beat_number} missing model/user, skipping`);
+            continue;
+          }
+
+          const claimed = await tryClaimBeat(beat);
+          if (!claimed) continue;
+
+          activeJobs++;
+          processBeat(beat)
+            .catch(async (err: Error) => {
+              console.error(`[worker] Beat ${beat.beat_number} failed:`, err.message);
+              await supabase.from("project_beats")
+                .update({ video_status: "failed" })
+                .eq("project_id", beat.project_id)
+                .eq("beat_number", beat.beat_number);
+            })
+            .finally(() => { activeJobs--; });
+        }
+      }
+    } catch (err) {
+      console.error("[worker] Poll error:", err);
+    }
+    await sleep(POLL_INTERVAL_MS);
+  }
+}
+
+export function startVideoWorker() {
+  pollLoop().catch(console.error);
+}

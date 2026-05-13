@@ -1,7 +1,7 @@
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
-import { videoWorker } from "./workers/video-worker.js";
+import { startVideoWorker } from "./workers/video-worker.js";
 import { setupHealthRoutes } from "./routes/health.js";
 
 const app = express();
@@ -28,25 +28,18 @@ app.get("/api/worker/status", (req, res) => {
 const server = app.listen(PORT, () => {
   console.log(`[server] Video worker service listening on port ${PORT}`);
   console.log(`[server] Environment: ${process.env.NODE_ENV || "development"}`);
+  startVideoWorker();
 });
 
 // Graceful shutdown
-process.on("SIGTERM", async () => {
+process.on("SIGTERM", () => {
   console.log("[server] SIGTERM received, shutting down gracefully...");
-  server.close(async () => {
-    console.log("[server] HTTP server closed");
-    await videoWorker.close();
-    process.exit(0);
-  });
+  server.close(() => { console.log("[server] HTTP server closed"); process.exit(0); });
 });
 
-process.on("SIGINT", async () => {
+process.on("SIGINT", () => {
   console.log("[server] SIGINT received, shutting down gracefully...");
-  server.close(async () => {
-    console.log("[server] HTTP server closed");
-    await videoWorker.close();
-    process.exit(0);
-  });
+  server.close(() => { console.log("[server] HTTP server closed"); process.exit(0); });
 });
 
 export default app;
