@@ -94,7 +94,7 @@ function normalizeClip(src: string, isImage: boolean, duration: number, output: 
     if (isImage) cmd.input(src).inputOptions(["-loop", "1"]);
     else cmd.input(src).inputOptions(["-stream_loop", "-1"]);
     return cmd
-      .outputOptions(["-t", String(duration), "-vf", vf, "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-an", "-pix_fmt", "yuv420p", "-threads", "2"])
+      .outputOptions(["-t", String(duration), "-vf", vf, "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-an", "-pix_fmt", "yuv420p", "-threads", "1"])
       .output(output);
   }, `normalizeClip`);
 }
@@ -129,7 +129,7 @@ function burnSubtitles(video: string, assPath: string, output: string): Promise<
   return ffmpegWithTimeout((cmd) =>
     cmd
       .input(video)
-      .outputOptions(["-vf", `ass='${escaped}'`, "-c:v", "libx264", "-preset", "fast", "-crf", "23", "-c:a", "copy", "-threads", "2"])
+      .outputOptions(["-vf", `ass='${escaped}'`, "-c:v", "libx264", "-preset", "fast", "-crf", "23", "-c:a", "copy", "-threads", "1"])
       .output(output),
   "burnSubtitles");
 }
