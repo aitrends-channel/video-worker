@@ -290,7 +290,7 @@ interface AssembleOptions {
 
 async function runAssembly(opts: AssembleOptions): Promise<void> {
   const { userId, projectId, aspectRatio, voiceoverType, captionsEnabled, captionsLanguage, captionsStyle, captionsSize, captionsPosition } = opts;
-  const [w, h] = aspectRatio === "9:16" ? [720, 1280] : aspectRatio === "1:1" ? [720, 720] : [1280, 720];
+  const [w, h] = aspectRatio === "9:16" ? [480, 854] : aspectRatio === "1:1" ? [480, 480] : [854, 480];
 
   const progress = (msg: string) => {
     console.log(`[assemble] ${projectId}: ${msg}`);
@@ -433,6 +433,8 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
 
 // ── Route ─────────────────────────────────────────────────────────────────────
 
+const assemblingProjects = new Set<string>();
+
 export function setupAssembleRoute(app: Express): void {
   app.post("/api/assemble", async (req: Request, res: Response): Promise<void> => {
     const { token, projectId, aspectRatio = "16:9", voiceoverType = "cleaned",
@@ -450,15 +452,22 @@ export function setupAssembleRoute(app: Express): void {
     const { data: { user }, error: authError } = await supabase.auth.getUser(token);
     if (authError || !user) { res.status(401).json({ error: "Unauthorized" }); return; }
 
+    if (assemblingProjects.has(projectId)) {
+      res.json({ started: false, reason: "Assembly already in progress for this project" });
+      return;
+    }
+
     // Mark as processing immediately so the client sees state change on next poll
     await supabase.from("projects")
       .update({ assembly_status: "processing", assembly_progress: "Starting…", assembly_error: null })
       .eq("id", projectId).eq("user_id", user.id);
 
+    assemblingProjects.add(projectId);
+
     // Fire and forget — no SSE, no long-lived connection
     runAssembly({ userId: user.id, projectId, aspectRatio, voiceoverType: voiceoverType as "cleaned" | "original",
       captionsEnabled: Boolean(captionsEnabled), captionsLanguage, captionsStyle, captionsSize, captionsPosition,
-    }).catch(console.error);
+    }).catch(console.error).finally(() => assemblingProjects.delete(projectId));
 
     res.json({ started: true });
   });
