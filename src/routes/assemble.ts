@@ -290,7 +290,7 @@ interface AssembleOptions {
 
 async function runAssembly(opts: AssembleOptions): Promise<void> {
   const { userId, projectId, aspectRatio, voiceoverType, captionsEnabled, captionsLanguage, captionsStyle, captionsSize, captionsPosition } = opts;
-  const [w, h] = aspectRatio === "9:16" ? [1080, 1920] : aspectRatio === "1:1" ? [1080, 1080] : [1920, 1080];
+  const [w, h] = aspectRatio === "9:16" ? [720, 1280] : aspectRatio === "1:1" ? [720, 720] : [1280, 720];
 
   const progress = (msg: string) => {
     console.log(`[assemble] ${projectId}: ${msg}`);
