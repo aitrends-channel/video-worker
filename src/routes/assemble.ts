@@ -299,6 +299,13 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
 
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "assemble-"));
 
+  // Ping our own health endpoint every 4 min so Render free tier doesn't
+  // spin the service down during a long background assembly
+  const selfUrl = process.env.SELF_URL;
+  const keepAlive = selfUrl
+    ? setInterval(() => { fetch(`${selfUrl}/health`).catch(() => {}); }, 4 * 60_000)
+    : null;
+
   try {
     await progress("Loading project data…");
 
@@ -427,6 +434,7 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
       .update({ assembly_status: "failed", assembly_error: message, assembly_progress: null })
       .eq("id", projectId);
   } finally {
+    if (keepAlive) clearInterval(keepAlive);
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
   }
 }
