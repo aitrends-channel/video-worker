@@ -99,15 +99,6 @@ function normalizeClip(src: string, isImage: boolean, duration: number, output: 
   }, `normalizeClip`);
 }
 
-function blackClip(duration: number, output: string, w: number, h: number): Promise<void> {
-  return ffmpegWithTimeout((cmd) =>
-    cmd
-      .input(`color=black:size=${w}x${h}:rate=24`)
-      .inputOptions(["-f", "lavfi"])
-      .outputOptions(["-t", String(duration), "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-an", "-pix_fmt", "yuv420p", "-threads", "1"])
-      .output(output),
-  "blackClip");
-}
 
 function concatClips(listFile: string, output: string): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -373,25 +364,25 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
             console.log(`[assemble] beat ${beat.beat_number}: encoding clip…`);
             await normalizeClip(src, true, durations[i], clipPath, w, h);
             try { fs.unlinkSync(src); } catch { /* ignore */ }
-          } else {
-            await blackClip(durations[i], clipPath, w, h);
           }
           console.log(`[assemble] beat ${beat.beat_number}: done`);
+          clipPaths[i] = clipPath;
         } catch (e) {
-          console.error(`[assemble] beat ${beat.beat_number} clip error:`, e);
-          await blackClip(durations[i], clipPath, w, h);
+          console.error(`[assemble] beat ${beat.beat_number} skipped:`, e);
+          // leave clipPaths[i] as "" — filtered out of concat below
         }
-        clipPaths[i] = clipPath;
       }));
     }
 
     await progress("Joining clips…");
+    const validClipPaths = clipPaths.filter((p) => p !== "");
+    if (!validClipPaths.length) throw new Error("All clips failed to encode — nothing to assemble.");
     const listPath = path.join(tmpDir, "concat.txt");
-    fs.writeFileSync(listPath, clipPaths.map((p) => `file '${p.replace(/\\/g, "/")}'`).join("\n"));
+    fs.writeFileSync(listPath, validClipPaths.map((p) => `file '${p.replace(/\\/g, "/")}'`).join("\n"));
     const joinedPath = path.join(tmpDir, "joined.mp4");
     await concatClips(listPath, joinedPath);
     // Free disk space — individual clips are no longer needed
-    for (const p of clipPaths) { try { fs.unlinkSync(p); } catch { /* ignore */ } }
+    for (const p of validClipPaths) { try { fs.unlinkSync(p); } catch { /* ignore */ } }
 
     await progress("Mixing voiceover…");
     const outputPath = path.join(tmpDir, "output.mp4");
