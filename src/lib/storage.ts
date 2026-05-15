@@ -12,10 +12,10 @@ export async function uploadBuffer(path: string, buffer: ArrayBuffer, contentTyp
 }
 
 export async function uploadFile(storagePath: string, filePath: string, contentType: string): Promise<string> {
-  const stream = fs.createReadStream(filePath);
+  const buffer = fs.readFileSync(filePath);
   const { error } = await supabase.storage
     .from("assets")
-    .upload(storagePath, stream, { contentType, upsert: true });
+    .upload(storagePath, buffer, { contentType, upsert: true });
 
   if (error) throw new Error(`Storage upload failed: ${error.message}`);
   const { data: url } = supabase.storage.from("assets").getPublicUrl(storagePath);

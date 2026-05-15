@@ -21,6 +21,11 @@ if (ffprobeStatic?.path) ffmpeg.setFfprobePath(ffprobeStatic.path);
 console.log(`[assemble] ffmpeg: ${ffmpegPath}`);
 console.log(`[assemble] ffprobe: ${ffprobeStatic?.path}`);
 
+// ── Preview storage ───────────────────────────────────────────────────────────
+
+const PREVIEW_DIR = path.join(os.tmpdir(), "aitrends-previews");
+if (!fs.existsSync(PREVIEW_DIR)) fs.mkdirSync(PREVIEW_DIR, { recursive: true });
+
 // ── Progress helper ───────────────────────────────────────────────────────────
 
 async function setProgress(projectId: string, progress: string) {
@@ -94,7 +99,7 @@ function normalizeClip(src: string, isImage: boolean, duration: number, output: 
     if (isImage) cmd.input(src).inputOptions(["-loop", "1"]);
     else cmd.input(src).inputOptions(["-stream_loop", "-1"]);
     return cmd
-      .outputOptions(["-t", String(duration), "-vf", vf, "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-an", "-pix_fmt", "yuv420p", "-threads", "1"])
+      .outputOptions(["-t", String(duration), "-vf", vf, "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-an", "-pix_fmt", "yuv420p"])
       .output(output);
   }, `normalizeClip`);
 }
@@ -129,7 +134,7 @@ function burnSubtitles(video: string, assPath: string, output: string): Promise<
   return ffmpegWithTimeout((cmd) =>
     cmd
       .input(video)
-      .outputOptions(["-vf", `ass='${escaped}'`, "-c:v", "libx264", "-preset", "fast", "-crf", "23", "-c:a", "copy", "-threads", "1"])
+      .outputOptions(["-vf", `ass='${escaped}'`, "-c:v", "libx264", "-preset", "fast", "-crf", "23", "-c:a", "copy"])
       .output(output),
   "burnSubtitles");
 }
@@ -322,7 +327,7 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
     if (!allBeats.length) throw new Error("No beats found in this project.");
 
     // Use only beats that have a generated video clip — skip gaps entirely
-    const beats = allBeats.filter((beat) => beat.video_url).slice(0, 1);
+    const beats = allBeats.filter((beat) => beat.video_url);
     if (!beats.length) throw new Error("No video clips have been generated yet — generate video clips on the Generate page first.");
     console.log(`[assemble] ${projectId}: assembling ${beats.length}/${allBeats.length} beats (video clips only)`);
 
@@ -419,17 +424,22 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
       }
     }
 
-    await progress("Uploading…");
-    const publicUrl = await uploadFile(`${projectId}/assembled_${Date.now()}.mp4`, finalPath, "video/mp4");
+    // Copy final video to a predictable persistent path so it survives worker restarts
+    const persistentPath = path.join(PREVIEW_DIR, `${projectId}.mp4`);
+    fs.copyFileSync(finalPath, persistentPath);
+    previewFiles.set(projectId, persistentPath);
 
+    const workerBaseUrl = process.env.SELF_URL || `http://localhost:${process.env.PORT || 3010}`;
     await supabase.from("projects")
-      .update({ assembled_url: publicUrl, assembly_status: "done", assembly_progress: null, assembly_error: null })
+      .update({ assembly_status: "preview", assembled_url: `${workerBaseUrl}/api/preview/${projectId}`, assembly_progress: null, assembly_error: null })
       .eq("id", projectId);
 
-    console.log(`[assemble] ${projectId}: done → ${publicUrl}`);
+    console.log(`[assemble] ${projectId}: preview ready → ${persistentPath}`);
   } catch (err) {
     const message = err instanceof Error ? err.message : "Assembly failed";
     console.error(`[assemble] ${projectId} failed:`, message);
+    previewFiles.delete(projectId);
+    try { fs.unlinkSync(path.join(PREVIEW_DIR, `${projectId}.mp4`)); } catch { /* ignore */ }
     await supabase.from("projects")
       .update({ assembly_status: "failed", assembly_error: message, assembly_progress: null })
       .eq("id", projectId);
@@ -442,8 +452,99 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
 // ── Route ─────────────────────────────────────────────────────────────────────
 
 const assemblingProjects = new Set<string>();
+const previewFiles = new Map<string, string>(); // projectId → persistent preview path
 
 export function setupAssembleRoute(app: Express): void {
+  // On startup: restore preview files that survived a worker restart
+  (async () => {
+    try {
+      const { data: previews } = await supabase.from("projects").select("id").eq("assembly_status", "preview");
+      for (const p of previews ?? []) {
+        const filePath = path.join(PREVIEW_DIR, `${p.id}.mp4`);
+        if (fs.existsSync(filePath)) {
+          previewFiles.set(p.id, filePath);
+          console.log(`[preview] restored: ${p.id}`);
+        } else {
+          await supabase.from("projects")
+            .update({ assembly_status: "failed", assembly_error: "Preview expired — please reassemble", assembly_progress: null, assembled_url: null })
+            .eq("id", p.id);
+          console.log(`[preview] expired (file missing): ${p.id}`);
+        }
+      }
+    } catch (e) {
+      console.warn("[preview] restore failed:", e);
+    }
+  })();
+
+  app.get("/api/preview/:projectId", (req: Request, res: Response): void => {
+    const filePath = previewFiles.get(req.params.projectId);
+    if (!filePath || !fs.existsSync(filePath)) {
+      res.status(404).json({ error: "Preview not available" });
+      return;
+    }
+    const stat = fs.statSync(filePath);
+    const fileSize = stat.size;
+    const range = req.headers.range;
+
+    res.set("Content-Type", "video/mp4");
+    res.set("Accept-Ranges", "bytes");
+
+    if (range) {
+      const [startStr, endStr] = range.replace(/bytes=/, "").split("-");
+      const start = parseInt(startStr, 10);
+      const end = endStr ? parseInt(endStr, 10) : fileSize - 1;
+      const chunkSize = end - start + 1;
+      res.set("Content-Range", `bytes ${start}-${end}/${fileSize}`);
+      res.set("Content-Length", String(chunkSize));
+      res.status(206);
+      fs.createReadStream(filePath, { start, end }).pipe(res);
+    } else {
+      res.set("Content-Length", String(fileSize));
+      res.status(200);
+      fs.createReadStream(filePath).pipe(res);
+    }
+  });
+
+  app.post("/api/upload/:projectId", async (req: Request, res: Response): Promise<void> => {
+    const { projectId } = req.params;
+    const { token } = req.body as { token: string };
+
+    if (!token) { res.status(401).json({ error: "Unauthorized" }); return; }
+
+    const filePath = previewFiles.get(projectId);
+    if (!filePath || !fs.existsSync(filePath)) {
+      res.status(404).json({ error: "No preview available to upload" });
+      return;
+    }
+
+    const { data: { user }, error: authError } = await supabase.auth.getUser(token);
+    if (authError || !user) { res.status(401).json({ error: "Unauthorized" }); return; }
+
+    await supabase.from("projects")
+      .update({ assembly_status: "uploading", assembly_progress: "Uploading…", assembly_error: null })
+      .eq("id", projectId);
+
+    res.json({ started: true });
+
+    (async () => {
+      try {
+        const publicUrl = await uploadFile(`${projectId}/assembled_${Date.now()}.mp4`, filePath, "video/mp4");
+        previewFiles.delete(projectId);
+        try { fs.unlinkSync(filePath); } catch { /* ignore */ }
+        await supabase.from("projects")
+          .update({ assembled_url: publicUrl, assembly_status: "done", assembly_progress: null, assembly_error: null })
+          .eq("id", projectId);
+        console.log(`[upload] ${projectId}: done → ${publicUrl}`);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : "Upload failed";
+        console.error(`[upload] ${projectId} failed:`, message);
+        await supabase.from("projects")
+          .update({ assembly_status: "preview", assembly_error: message, assembly_progress: null })
+          .eq("id", projectId);
+      }
+    })().catch(console.error);
+  });
+
   app.post("/api/assemble", async (req: Request, res: Response): Promise<void> => {
     const { token, projectId, aspectRatio = "16:9", voiceoverType = "cleaned",
       captionsEnabled = false, captionsLanguage = "source",
