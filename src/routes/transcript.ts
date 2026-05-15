@@ -52,7 +52,7 @@ export function setupTranscriptRoute(app: Express) {
         "--write-auto-sub",
         "--write-sub",
         "--sub-lang", "en",
-        "--sub-format", "vtt/best",
+        "--sub-format", "vtt",
         "--skip-download",
         "--no-playlist",
         "--quiet",
