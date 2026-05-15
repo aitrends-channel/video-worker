@@ -478,8 +478,7 @@ async function assemblyPollLoop() {
 
           if (!claimed) continue;
 
-          const raw = await redis.get(`assembly:${projectId}`) as string | null;
-          const opts = raw ? JSON.parse(raw) as Record<string, unknown> : {};
+          const opts = (await redis.get(`assembly:${projectId}`) as Record<string, unknown> | null) ?? {};
 
           assemblingProjects.add(projectId);
           runAssembly({
