@@ -118,11 +118,11 @@ function concatClips(listFile: string, output: string): Promise<void> {
   });
 }
 
-function mixAudio(video: string, audio: string, output: string): Promise<void> {
+function mixAudio(video: string, audio: string, output: string, videoDuration: number): Promise<void> {
   return new Promise((resolve, reject) => {
     ffmpeg()
       .input(video).input(audio)
-      .outputOptions(["-map", "0:v", "-map", "1:a", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-c:a", "aac", "-shortest", "-movflags", "+faststart"])
+      .outputOptions(["-map", "0:v", "-map", "1:a", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-c:a", "aac", "-t", String(videoDuration), "-movflags", "+faststart"])
       .output(output)
       .on("end", () => resolve())
       .on("error", (err: Error) => reject(new Error(`audio mix failed: ${err.message}`)))
@@ -397,9 +397,13 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
     // Free disk space — individual clips are no longer needed
     for (const p of validClipPaths) { try { fs.unlinkSync(p); } catch { /* ignore */ } }
 
+    const joinedDuration = await getMediaDuration(joinedPath).catch(() => 0);
+    console.log(`[assemble] ${projectId}: joined duration = ${joinedDuration.toFixed(2)}s`);
+    if (joinedDuration <= 0) throw new Error("Joined video has 0 duration — clip encoding produced invalid output");
+
     await progress("Mixing voiceover…");
     const outputPath = path.join(tmpDir, "output.mp4");
-    await mixAudio(joinedPath, voiceoverPath, outputPath);
+    await mixAudio(joinedPath, voiceoverPath, outputPath, joinedDuration);
     try { fs.unlinkSync(joinedPath); } catch { /* ignore */ }
 
     let finalPath = outputPath;
