@@ -122,7 +122,7 @@ function mixAudio(video: string, audio: string, output: string): Promise<void> {
   return new Promise((resolve, reject) => {
     ffmpeg()
       .input(video).input(audio)
-      .outputOptions(["-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-shortest", "-movflags", "+faststart"])
+      .outputOptions(["-map", "0:v", "-map", "1:a", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-c:a", "aac", "-shortest", "-movflags", "+faststart"])
       .output(output)
       .on("end", () => resolve())
       .on("error", (err: Error) => reject(new Error(`audio mix failed: ${err.message}`)))
@@ -135,7 +135,7 @@ function burnSubtitles(video: string, assPath: string, output: string): Promise<
   return ffmpegWithTimeout((cmd) =>
     cmd
       .input(video)
-      .outputOptions(["-vf", `ass='${escaped}'`, "-c:v", "libx264", "-preset", "fast", "-crf", "23", "-c:a", "copy"])
+      .outputOptions(["-vf", `ass='${escaped}'`, "-c:v", "libx264", "-preset", "fast", "-crf", "23", "-c:a", "copy", "-movflags", "+faststart"])
       .output(output),
   "burnSubtitles");
 }
