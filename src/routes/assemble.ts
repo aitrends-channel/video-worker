@@ -448,7 +448,10 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
     await new Promise<void>((resolve, reject) => {
       ffmpeg()
         .input(finalPath)
-        .outputOptions(["-c", "copy"])
+        // +faststart moves the moov atom to the front so browsers can show
+        // duration and start playback without a round-trip range request.
+        // Safe here because the full input file already exists on disk.
+        .outputOptions(["-c", "copy", "-movflags", "+faststart"])
         .output(persistentPath)
         .on("end", () => resolve())
         .on("error", (err: Error) => reject(new Error(`remux failed: ${err.message}`)))
