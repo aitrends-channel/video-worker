@@ -1,8 +1,13 @@
 import { type Express } from "express";
 import { execFile } from "child_process";
 import { promisify } from "util";
+import { fileURLToPath } from "url";
 import fs from "fs";
 import path from "path";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+// Binary is downloaded to dist/yt-dlp at build time; this file compiles to dist/routes/transcript.js
+const YT_DLP = path.resolve(__dirname, "..", "yt-dlp");
 
 const execFileAsync = promisify(execFile);
 
@@ -40,8 +45,7 @@ export function setupTranscriptRoute(app: Express) {
     fs.mkdirSync(tmpDir, { recursive: true });
 
     try {
-      await execFileAsync("python3", [
-        "-m", "yt_dlp",
+      await execFileAsync(YT_DLP, [
         "--write-auto-sub",
         "--write-sub",
         "--sub-lang", "en",

@@ -6,7 +6,7 @@
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/index.ts",
-    "build": "pip3 install -U yt-dlp --break-system-packages && tsc",
+    "build": "tsc && curl -fsSL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o dist/yt-dlp && chmod +x dist/yt-dlp",
     "start": "node --max-old-space-size=150 dist/index.js",
     "lint": "eslint src --ext .ts"
   },
