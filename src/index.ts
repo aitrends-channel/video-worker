@@ -37,6 +37,17 @@ app.get("/api/worker/status", (req, res) => {
   });
 });
 
+// Write YouTube cookies to disk if provided — required for yt-dlp from datacenter IPs
+import fs from "fs";
+export const YT_COOKIES_PATH = "/tmp/yt-cookies.txt";
+const ytCookies = process.env.YOUTUBE_COOKIES;
+if (ytCookies) {
+  fs.writeFileSync(YT_COOKIES_PATH, ytCookies, "utf-8");
+  console.log("[server] YouTube cookies written to", YT_COOKIES_PATH);
+} else {
+  console.warn("[server] YOUTUBE_COOKIES not set — yt-dlp will fail from datacenter IPs");
+}
+
 // Clear stale "processing" assemblies BEFORE accepting connections to avoid
 // the race where the cleanup fires after a new assembly job has already started
 const { error: cleanupError } = await supabase.from("projects")

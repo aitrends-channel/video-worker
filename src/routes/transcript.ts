@@ -4,6 +4,7 @@ import { promisify } from "util";
 import { fileURLToPath } from "url";
 import fs from "fs";
 import path from "path";
+import { YT_COOKIES_PATH } from "../index.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // Binary is downloaded to dist/yt-dlp at build time; this file compiles to dist/routes/transcript.js
@@ -45,7 +46,9 @@ export function setupTranscriptRoute(app: Express) {
     fs.mkdirSync(tmpDir, { recursive: true });
 
     try {
+      const hasCookies = fs.existsSync(YT_COOKIES_PATH);
       await execFileAsync(YT_DLP, [
+        ...(hasCookies ? ["--cookies", YT_COOKIES_PATH] : []),
         "--write-auto-sub",
         "--write-sub",
         "--sub-lang", "en",
