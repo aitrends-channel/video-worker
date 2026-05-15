@@ -121,8 +121,10 @@ function concatClips(listFile: string, output: string): Promise<void> {
 function mixAudio(video: string, audio: string, output: string, videoDuration: number): Promise<void> {
   return new Promise((resolve, reject) => {
     ffmpeg()
-      .input(video).input(audio)
-      .outputOptions(["-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-t", String(videoDuration), "-movflags", "+faststart"])
+      .input(video).inputOptions(["-fflags", "+genpts"])
+      .input(audio)
+      // +faststart skipped: on constrained disk it can corrupt the moov atom; range-request serving handles moov-at-end fine
+      .outputOptions(["-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-t", String(videoDuration)])
       .output(output)
       .on("end", () => resolve())
       .on("error", (err: Error) => reject(new Error(`audio mix failed: ${err.message}`)))
@@ -328,7 +330,7 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
     if (!allBeats.length) throw new Error("No beats found in this project.");
 
     // Use only beats that have a generated video clip — skip gaps entirely
-    const beats = allBeats.filter((beat) => beat.video_url).slice(0, 5);
+    const beats = allBeats.filter((beat) => beat.video_url);
     if (!beats.length) throw new Error("No video clips have been generated yet — generate video clips on the Generate page first.");
     console.log(`[assemble] ${projectId}: assembling ${beats.length}/${allBeats.length} beats (video clips only)`);
 
@@ -434,13 +436,27 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
     console.log(`[assemble] ${projectId}: final file size = ${finalStat.size} bytes`);
     if (finalStat.size < 1024) throw new Error(`Assembly produced an invalid output (${finalStat.size} bytes) — ffmpeg may have failed silently`);
 
-    // Probe the output duration for diagnostics
+    // Probe the output duration — fail fast so the user sees an error instead of a 0:00 preview
     const probedDuration = await getMediaDuration(finalPath).catch(() => 0);
     console.log(`[assemble] ${projectId}: probed duration = ${probedDuration.toFixed(2)}s`);
+    if (probedDuration <= 0) throw new Error("Output video has 0 duration — moov atom may be corrupt; please reassemble");
 
-    // Copy final video to a predictable persistent path so it survives worker restarts
+    // Final remux: ffprobe reads duration from packets but browsers rely on the moov atom
+    // header. Running through ffmpeg with -c copy forces it to compute the moov duration
+    // from actual packet timestamps, producing a browser-playable file.
     const persistentPath = path.join(PREVIEW_DIR, `${projectId}.mp4`);
-    fs.copyFileSync(finalPath, persistentPath);
+    await new Promise<void>((resolve, reject) => {
+      ffmpeg()
+        .input(finalPath)
+        .outputOptions(["-c", "copy"])
+        .output(persistentPath)
+        .on("end", () => resolve())
+        .on("error", (err: Error) => reject(new Error(`remux failed: ${err.message}`)))
+        .run();
+    });
+    const remuxedDuration = await getMediaDuration(persistentPath).catch(() => 0);
+    console.log(`[assemble] ${projectId}: remuxed duration = ${remuxedDuration.toFixed(2)}s`);
+    if (remuxedDuration <= 0) throw new Error("Remuxed video has 0 duration — please reassemble");
     previewFiles.set(projectId, persistentPath);
 
     const workerBaseUrl = process.env.SELF_URL || "https://video-worker-9mob.onrender.com";
