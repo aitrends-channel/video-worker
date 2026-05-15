@@ -37,10 +37,10 @@ app.get("/api/worker/status", (req, res) => {
 // Clear stale "processing" assemblies BEFORE accepting connections to avoid
 // the race where the cleanup fires after a new assembly job has already started
 const { error: cleanupError } = await supabase.from("projects")
-  .update({ assembly_status: "failed", assembly_error: "Worker restarted — please try again", assembly_progress: null })
+  .update({ assembly_status: "queued", assembly_progress: "Queued…", assembly_error: null })
   .eq("assembly_status", "processing");
-if (cleanupError) console.error("[server] Failed to clear stale assemblies:", cleanupError.message);
-else console.log("[server] Cleared stale processing assemblies");
+if (cleanupError) console.error("[server] Failed to re-queue stale assemblies:", cleanupError.message);
+else console.log("[server] Re-queued stale processing assemblies");
 
 // Start server
 const server = app.listen(PORT, () => {
@@ -51,9 +51,9 @@ const server = app.listen(PORT, () => {
 
 async function gracefulShutdown(signal: string) {
   console.log(`[server] ${signal} received, shutting down gracefully...`);
-  // Mark any in-progress assemblies as failed so the client shows a clear retry message
+  // Re-queue any in-progress assemblies so they resume after the worker comes back up
   await supabase.from("projects")
-    .update({ assembly_status: "failed", assembly_error: "Worker restarted mid-assembly — please try again", assembly_progress: null })
+    .update({ assembly_status: "queued", assembly_progress: "Queued…", assembly_error: null })
     .eq("assembly_status", "processing");
   server.close(() => { console.log("[server] HTTP server closed"); process.exit(0); });
 }
