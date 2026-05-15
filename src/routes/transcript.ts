@@ -34,6 +34,19 @@ function parseVtt(content: string): string {
   return deduped.join(" ").replace(/\s+/g, " ").trim();
 }
 
+function parseSrt(content: string): string {
+  return content
+    .split("\n")
+    .filter((line) => {
+      const t = line.trim();
+      return t && !/^\d+$/.test(t) && !/^\d{2}:\d{2}:\d{2},\d{3}/.test(t);
+    })
+    .join(" ")
+    .replace(/<[^>]+>/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 export function setupTranscriptRoute(app: Express) {
   app.get("/api/transcript/:videoId", async (req, res) => {
     const { videoId } = req.params;
@@ -52,7 +65,6 @@ export function setupTranscriptRoute(app: Express) {
         "--write-auto-sub",
         "--write-sub",
         "--sub-lang", "en",
-        "--sub-format", "vtt",
         "--skip-download",
         "--no-playlist",
         "--quiet",
@@ -62,14 +74,14 @@ export function setupTranscriptRoute(app: Express) {
       ], { timeout: 45000 });
 
       const files = fs.readdirSync(tmpDir);
-      const vttFile = files.find((f) => f.endsWith(".vtt"));
+      const subFile = files.find((f) => f.endsWith(".vtt") || f.endsWith(".srt"));
 
-      if (!vttFile) {
+      if (!subFile) {
         return res.status(404).json({ error: "No captions found for this video" });
       }
 
-      const content = fs.readFileSync(path.join(tmpDir, vttFile), "utf-8");
-      const text = parseVtt(content);
+      const content = fs.readFileSync(path.join(tmpDir, subFile), "utf-8");
+      const text = subFile.endsWith(".srt") ? parseSrt(content) : parseVtt(content);
 
       if (!text) {
         return res.status(404).json({ error: "Caption file was empty" });
