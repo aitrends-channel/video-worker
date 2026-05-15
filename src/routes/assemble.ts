@@ -328,7 +328,7 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
     if (!allBeats.length) throw new Error("No beats found in this project.");
 
     // Use only beats that have a generated video clip — skip gaps entirely
-    const beats = allBeats.filter((beat) => beat.video_url);
+    const beats = allBeats.filter((beat) => beat.video_url).slice(0, 5);
     if (!beats.length) throw new Error("No video clips have been generated yet — generate video clips on the Generate page first.");
     console.log(`[assemble] ${projectId}: assembling ${beats.length}/${allBeats.length} beats (video clips only)`);
 
