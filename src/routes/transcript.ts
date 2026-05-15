@@ -40,7 +40,8 @@ export function setupTranscriptRoute(app: Express) {
     fs.mkdirSync(tmpDir, { recursive: true });
 
     try {
-      await execFileAsync("yt-dlp", [
+      await execFileAsync("python3", [
+        "-m", "yt_dlp",
         "--write-auto-sub",
         "--write-sub",
         "--sub-lang", "en",
