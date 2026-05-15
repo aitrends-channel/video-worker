@@ -459,12 +459,13 @@ async function assemblyPollLoop() {
       if (assemblingProjects.size === 0) {
         const { data: rows } = await supabase
           .from("projects")
-          .select("id")
+          .select("id, user_id")
           .eq("assembly_status", "queued")
           .limit(1);
 
         for (const row of rows ?? []) {
           const projectId = row.id as string;
+          const userId = row.user_id as string;
 
           // Atomic claim
           const { data: claimed } = await supabase
@@ -483,8 +484,9 @@ async function assemblyPollLoop() {
           assemblingProjects.add(projectId);
           runAssembly({
             projectId,
+            userId,
             aspectRatio: (opts.aspectRatio as string | undefined) ?? "16:9",
-            voiceoverType: (opts.voiceoverType as string | undefined) ?? "cleaned",
+            voiceoverType: ((opts.voiceoverType as string | undefined) ?? "cleaned") as "cleaned" | "original",
             captionsEnabled: (opts.captionsEnabled as boolean | undefined) ?? false,
             captionsLanguage: (opts.captionsLanguage as string | undefined) ?? "source",
             captionsStyle: (opts.captionsStyle as string | undefined) ?? "default",
