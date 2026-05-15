@@ -429,7 +429,7 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
     fs.copyFileSync(finalPath, persistentPath);
     previewFiles.set(projectId, persistentPath);
 
-    const workerBaseUrl = process.env.SELF_URL || `http://localhost:${process.env.PORT || 3010}`;
+    const workerBaseUrl = process.env.SELF_URL || "https://video-worker-9mob.onrender.com";
     await supabase.from("projects")
       .update({ assembly_status: "preview", assembled_url: `${workerBaseUrl}/api/preview/${projectId}`, assembly_progress: null, assembly_error: null })
       .eq("id", projectId);
