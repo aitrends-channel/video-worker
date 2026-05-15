@@ -425,6 +425,15 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
       }
     }
 
+    // Validate final output before saving
+    const finalStat = fs.statSync(finalPath);
+    console.log(`[assemble] ${projectId}: final file size = ${finalStat.size} bytes`);
+    if (finalStat.size < 1024) throw new Error(`Assembly produced an invalid output (${finalStat.size} bytes) — ffmpeg may have failed silently`);
+
+    // Probe the output duration for diagnostics
+    const probedDuration = await getMediaDuration(finalPath).catch(() => 0);
+    console.log(`[assemble] ${projectId}: probed duration = ${probedDuration.toFixed(2)}s`);
+
     // Copy final video to a predictable persistent path so it survives worker restarts
     const persistentPath = path.join(PREVIEW_DIR, `${projectId}.mp4`);
     fs.copyFileSync(finalPath, persistentPath);
