@@ -43,6 +43,13 @@ const { error: cleanupError } = await supabase.from("projects")
 if (cleanupError) console.error("[server] Failed to re-queue stale assemblies:", cleanupError.message);
 else console.log("[server] Re-queued stale processing assemblies");
 
+// Re-queue any video beats stuck in "rendering" — they were mid-flight when the last instance died
+const { error: renderingError } = await supabase.from("project_beats")
+  .update({ video_status: "queued", video_job_id: null, video_error: null })
+  .eq("video_status", "rendering");
+if (renderingError) console.error("[server] Failed to re-queue stale rendering beats:", renderingError.message);
+else console.log("[server] Re-queued stale rendering beats");
+
 // Start server
 const server = app.listen(PORT, () => {
   console.log(`[server] Video worker service listening on port ${PORT}`);
