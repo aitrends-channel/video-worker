@@ -23,6 +23,8 @@ function parseVtt(content: string): string {
       trimmed === "WEBVTT" ||
       trimmed.startsWith("NOTE") ||
       trimmed.startsWith("STYLE") ||
+      trimmed.startsWith("Kind:") ||
+      trimmed.startsWith("Language:") ||
       /^\d{2}:\d{2}.*-->/.test(trimmed) ||
       /^\d+$/.test(trimmed)
     ) continue;
