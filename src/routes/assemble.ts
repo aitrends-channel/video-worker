@@ -4,6 +4,7 @@ import { pipeline } from "stream/promises";
 import { type Express, type Request, type Response } from "express";
 import { supabase } from "../lib/supabase.js";
 import { uploadFile } from "../lib/storage.js";
+import { redis } from "../lib/queue.js";
 import Anthropic from "@anthropic-ai/sdk";
 import fs from "fs";
 import path from "path";
@@ -449,12 +450,67 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
   }
 }
 
+// ── Assembly queue poll loop ──────────────────────────────────────────────────
+
+async function assemblyPollLoop() {
+  console.log("[assembly-queue] poll loop started");
+  while (true) {
+    try {
+      if (assemblingProjects.size === 0) {
+        const { data: rows } = await supabase
+          .from("projects")
+          .select("id")
+          .eq("assembly_status", "queued")
+          .limit(1);
+
+        for (const row of rows ?? []) {
+          const projectId = row.id as string;
+
+          // Atomic claim
+          const { data: claimed } = await supabase
+            .from("projects")
+            .update({ assembly_status: "processing", assembly_progress: "Starting…" })
+            .eq("id", projectId)
+            .eq("assembly_status", "queued")
+            .select("id")
+            .single();
+
+          if (!claimed) continue;
+
+          const raw = await redis.get(`assembly:${projectId}`) as string | null;
+          const opts = raw ? JSON.parse(raw) as Record<string, unknown> : {};
+
+          assemblingProjects.add(projectId);
+          runAssembly({
+            projectId,
+            aspectRatio: (opts.aspectRatio as string | undefined) ?? "16:9",
+            voiceoverType: (opts.voiceoverType as string | undefined) ?? "cleaned",
+            captionsEnabled: (opts.captionsEnabled as boolean | undefined) ?? false,
+            captionsLanguage: (opts.captionsLanguage as string | undefined) ?? "source",
+            captionsStyle: (opts.captionsStyle as string | undefined) ?? "default",
+            captionsSize: (opts.captionsSize as string | undefined) ?? "medium",
+            captionsPosition: (opts.captionsPosition as string | undefined) ?? "bottom",
+          }).finally(() => {
+            assemblingProjects.delete(projectId);
+            redis.del(`assembly:${projectId}`).catch(() => {});
+          });
+        }
+      }
+    } catch (err) {
+      console.error("[assembly-queue] poll error:", err);
+    }
+    await new Promise((r) => setTimeout(r, 5000));
+  }
+}
+
 // ── Route ─────────────────────────────────────────────────────────────────────
 
 const assemblingProjects = new Set<string>();
 const previewFiles = new Map<string, string>(); // projectId → persistent preview path
 
 export function setupAssembleRoute(app: Express): void {
+  assemblyPollLoop().catch(console.error);
+
   // On startup: restore preview files that survived a worker restart
   (async () => {
     try {
