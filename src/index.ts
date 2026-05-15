@@ -4,6 +4,7 @@ import cors from "cors";
 import { startVideoWorker } from "./workers/video-worker.js";
 import { setupHealthRoutes } from "./routes/health.js";
 import { setupAssembleRoute } from "./routes/assemble.js";
+import { setupTranscriptRoute } from "./routes/transcript.js";
 import { supabase } from "./lib/supabase.js";
 
 const app = express();
@@ -24,6 +25,7 @@ app.use(express.json({ limit: "10mb" }));
 // Routes
 setupHealthRoutes(app);
 setupAssembleRoute(app);
+setupTranscriptRoute(app);
 
 // Video worker info endpoint
 app.get("/api/worker/status", (req, res) => {

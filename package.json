@@ -6,7 +6,7 @@
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/index.ts",
-    "build": "tsc",
+    "build": "pip3 install -U yt-dlp && tsc",
     "start": "node --max-old-space-size=150 dist/index.js",
     "lint": "eslint src --ext .ts"
   },
