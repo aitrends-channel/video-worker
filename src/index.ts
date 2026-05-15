@@ -11,7 +11,8 @@ const PORT = parseInt(process.env.PORT || "3001");
 
 const corsOptions = {
   origin: "*",
-  allowedHeaders: ["Content-Type", "Authorization"],
+  allowedHeaders: ["Content-Type", "Authorization", "Range"],
+  exposedHeaders: ["Content-Range", "Accept-Ranges", "Content-Length"],
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
 };
 

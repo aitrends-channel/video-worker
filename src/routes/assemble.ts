@@ -122,7 +122,7 @@ function mixAudio(video: string, audio: string, output: string): Promise<void> {
   return new Promise((resolve, reject) => {
     ffmpeg()
       .input(video).input(audio)
-      .outputOptions(["-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-shortest"])
+      .outputOptions(["-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-shortest", "-movflags", "+faststart"])
       .output(output)
       .on("end", () => resolve())
       .on("error", (err: Error) => reject(new Error(`audio mix failed: ${err.message}`)))
