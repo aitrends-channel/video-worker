@@ -310,7 +310,10 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
 
   // Ping our own health endpoint every 4 min so Render free tier doesn't
   // spin the service down during a long background assembly
-  const selfUrl = process.env.SELF_URL;
+  const isDev = process.env.NODE_ENV === "development";
+  const selfUrl = isDev
+    ? (process.env.SELF_URL_LOCAL ?? null)
+    : (process.env.SELF_URL_PRODUCTION ?? null);
   const keepAlive = selfUrl
     ? setInterval(() => { fetch(`${selfUrl}/health`).catch(() => {}); }, 4 * 60_000)
     : null;
