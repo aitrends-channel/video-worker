@@ -1,6 +1,7 @@
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
+import fs from "fs";
 import { startVideoWorker } from "./workers/video-worker.js";
 import { setupHealthRoutes } from "./routes/health.js";
 import { setupAssembleRoute } from "./routes/assemble.js";
@@ -27,18 +28,11 @@ setupHealthRoutes(app);
 setupAssembleRoute(app);
 setupTranscriptRoute(app);
 
-// Video worker info endpoint
 app.get("/api/worker/status", (req, res) => {
-  res.json({
-    worker: "video-generation",
-    running: true,
-    concurrency: 3,
-    timestamp: new Date().toISOString(),
-  });
+  res.json({ worker: "video-generation", running: true, timestamp: new Date().toISOString() });
 });
 
 // Write YouTube cookies to disk if provided — required for yt-dlp from datacenter IPs
-import fs from "fs";
 export const YT_COOKIES_PATH = "/tmp/yt-cookies.txt";
 const ytCookies = process.env.YOUTUBE_COOKIES;
 if (ytCookies) {
