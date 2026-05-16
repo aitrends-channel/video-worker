@@ -133,11 +133,12 @@ function mixAudio(video: string, audio: string, output: string, videoDuration: n
 }
 
 function burnSubtitles(video: string, assPath: string, output: string): Promise<void> {
+  // Escape backslashes and colons for ffmpeg filtergraph syntax (no shell quoting needed)
   const escaped = assPath.replace(/\\/g, "/").replace(/:/g, "\\:");
   return ffmpegWithTimeout((cmd) =>
     cmd
       .input(video)
-      .outputOptions(["-vf", `ass='${escaped}'`, "-c:v", "libx264", "-preset", "fast", "-crf", "23", "-c:a", "copy", "-movflags", "+faststart"])
+      .outputOptions(["-vf", `ass=${escaped}`, "-c:v", "libx264", "-preset", "fast", "-crf", "23", "-c:a", "copy", "-movflags", "+faststart"])
       .output(output),
   "burnSubtitles");
 }
@@ -411,25 +412,25 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
 
     let finalPath = outputPath;
     if (captionsEnabled) {
-      try {
-        await progress("Generating captions…");
-        let segs = transcriptionWords.length > 0 ? buildSrtSegments(transcriptionWords) : buildSrtSegmentsFromBeats(beats, durations);
-        if (captionsLanguage !== "source") {
-          await progress(`Translating captions to ${captionsLanguage}…`);
-          const { anthropic_api_key } = await getSettings(userId);
-          if (!anthropic_api_key) throw new Error("Anthropic API key not configured.");
-          segs = await translateSegments(segs, captionsLanguage, anthropic_api_key);
-        }
-        const assPath = path.join(tmpDir, "captions.ass");
-        writeAss(segs, buildAssStyle(captionsStyle, captionsSize, captionsPosition, h), w, h, assPath);
-        await progress("Burning captions…");
-        const captionedPath = path.join(tmpDir, "captioned.mp4");
-        await burnSubtitles(outputPath, assPath, captionedPath);
-        try { fs.unlinkSync(outputPath); } catch { /* ignore */ }
-        finalPath = captionedPath;
-      } catch (e) {
-        console.warn("[assemble] caption burn failed:", e);
+      await progress("Generating captions…");
+      let segs = transcriptionWords.length > 0 ? buildSrtSegments(transcriptionWords) : buildSrtSegmentsFromBeats(beats, durations);
+      console.log(`[assemble] ${projectId}: ${segs.length} caption segments`);
+      if (!segs.length) throw new Error("No caption segments could be generated — check that beats have script text");
+      if (captionsLanguage !== "source") {
+        await progress(`Translating captions to ${captionsLanguage}…`);
+        const { anthropic_api_key } = await getSettings(userId);
+        if (!anthropic_api_key) throw new Error("Anthropic API key not configured.");
+        segs = await translateSegments(segs, captionsLanguage, anthropic_api_key);
       }
+      const assPath = path.join(tmpDir, "captions.ass");
+      writeAss(segs, buildAssStyle(captionsStyle, captionsSize, captionsPosition, h), w, h, assPath);
+      console.log(`[assemble] ${projectId}: ASS file written → ${assPath}`);
+      await progress("Burning captions…");
+      const captionedPath = path.join(tmpDir, "captioned.mp4");
+      await burnSubtitles(outputPath, assPath, captionedPath);
+      try { fs.unlinkSync(outputPath); } catch { /* ignore */ }
+      finalPath = captionedPath;
+      console.log(`[assemble] ${projectId}: captions burned`);
     }
 
     // Validate final output before saving
