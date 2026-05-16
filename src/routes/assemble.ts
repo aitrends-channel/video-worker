@@ -461,14 +461,19 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
     const remuxedDuration = await getMediaDuration(persistentPath).catch(() => 0);
     console.log(`[assemble] ${projectId}: remuxed duration = ${remuxedDuration.toFixed(2)}s`);
     if (remuxedDuration <= 0) throw new Error("Remuxed video has 0 duration — please reassemble");
-    previewFiles.set(projectId, persistentPath);
 
-    const workerBaseUrl = process.env.SELF_URL || "https://video-worker-9mob.onrender.com";
+    // Upload directly to Supabase so the URL is permanent (no ephemeral /tmp dependency)
+    await progress("Uploading to cloud…");
+    previewFiles.set(projectId, persistentPath);
+    const publicUrl = await uploadFile(`${projectId}/assembled_${Date.now()}.mp4`, persistentPath, "video/mp4");
+    previewFiles.delete(projectId);
+    try { fs.unlinkSync(persistentPath); } catch { /* ignore */ }
+
     await supabase.from("projects")
-      .update({ assembly_status: "preview", assembled_url: `${workerBaseUrl}/api/preview/${projectId}`, assembly_progress: null, assembly_error: null })
+      .update({ assembly_status: "done", assembled_url: publicUrl, assembly_progress: null, assembly_error: null })
       .eq("id", projectId);
 
-    console.log(`[assemble] ${projectId}: preview ready → ${persistentPath}`);
+    console.log(`[assemble] ${projectId}: done → ${publicUrl}`);
   } catch (err) {
     const message = err instanceof Error ? err.message : "Assembly failed";
     console.error(`[assemble] ${projectId} failed:`, message);
