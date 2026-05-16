@@ -474,7 +474,7 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
     try { fs.unlinkSync(persistentPath); } catch { /* ignore */ }
 
     await supabase.from("projects")
-      .update({ assembly_status: "done", assembled_url: publicUrl, assembly_progress: null, assembly_error: null })
+      .update({ assembly_status: "done", assembled_url: publicUrl, assembly_progress: null, assembly_error: null, current_state: 15 })
       .eq("id", projectId);
 
     console.log(`[assemble] ${projectId}: done → ${publicUrl}`);
