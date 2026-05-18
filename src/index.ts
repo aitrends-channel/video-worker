@@ -11,8 +11,15 @@ import { supabase } from "./lib/supabase.js";
 const app = express();
 const PORT = parseInt(process.env.PORT || "3001");
 
+const allowedOrigins = (process.env.ALLOWED_ORIGIN ?? "http://localhost:3000")
+  .split(",")
+  .map((o) => o.trim());
+
 const corsOptions = {
-  origin: "*",
+  origin: (origin: string | undefined, cb: (err: Error | null, allow?: boolean) => void) => {
+    if (!origin || allowedOrigins.includes(origin)) return cb(null, true);
+    cb(new Error(`CORS: origin ${origin} not allowed`));
+  },
   allowedHeaders: ["Content-Type", "Authorization", "Range"],
   exposedHeaders: ["Content-Range", "Accept-Ranges", "Content-Length"],
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],

@@ -6,6 +6,7 @@ import { fileURLToPath } from "url";
 import fs from "fs";
 import path from "path";
 import { YT_COOKIES_PATH } from "../index.js";
+import { supabase } from "../lib/supabase.js";
 
 const _require = createRequire(import.meta.url);
 const ffmpegPath = _require("ffmpeg-static") as string | null;
@@ -89,6 +90,12 @@ async function transcribeWithGroq(audioPath: string, groqKey: string): Promise<s
 
 export function setupTranscriptRoute(app: Express) {
   app.get("/api/transcript/:videoId", async (req, res) => {
+    const token = req.headers.authorization?.replace(/^Bearer\s+/i, "");
+    if (!token) return res.status(401).json({ error: "Unauthorized" });
+
+    const { data: { user }, error: authError } = await supabase.auth.getUser(token);
+    if (authError || !user) return res.status(401).json({ error: "Unauthorized" });
+
     const { videoId } = req.params;
 
     if (!/^[a-zA-Z0-9_-]{11}$/.test(videoId)) {
