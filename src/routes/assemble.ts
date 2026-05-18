@@ -279,7 +279,7 @@ async function translateSegments(segs: SrtSegment[], lang: string, key: string):
   const anthropic = new Anthropic({ apiKey: key });
   const numbered = segs.map((s) => `${s.index}. ${s.text}`).join("\n");
   const msg = await anthropic.messages.create({
-    model: "claude-sonnet-4-6", max_tokens: 4096,
+    model: process.env.CLAUDE_MODEL ?? "claude-sonnet-4-6", max_tokens: 4096,
     messages: [{ role: "user", content: `Translate these numbered caption lines to ${lang}. Return only the translated lines in exactly the same "N. text" format, one per line:\n\n${numbered}` }],
   });
   const raw = msg.content[0].type === "text" ? msg.content[0].text.trim() : "";
@@ -659,6 +659,15 @@ export function setupAssembleRoute(app: Express): void {
 
     const { data: { user }, error: authError } = await supabase.auth.getUser(token);
     if (authError || !user) { res.status(401).json({ error: "Unauthorized" }); return; }
+
+    // Verify project belongs to this user before any state mutation
+    const { data: project, error: projectError } = await supabase
+      .from("projects")
+      .select("id")
+      .eq("id", projectId)
+      .eq("user_id", user.id)
+      .single();
+    if (projectError || !project) { res.status(403).json({ error: "Project not found" }); return; }
 
     if (assemblingProjects.has(projectId)) {
       res.json({ started: false, reason: "Assembly already in progress for this project" });
