@@ -3,7 +3,7 @@ import { Readable } from "stream";
 import { pipeline } from "stream/promises";
 import { type Express, type Request, type Response } from "express";
 import { supabase } from "../lib/supabase.js";
-import { uploadFile } from "../lib/storage.js";
+import { uploadFile, userFolderForId } from "../lib/storage.js";
 import { redis } from "../lib/queue.js";
 import Anthropic from "@anthropic-ai/sdk";
 import fs from "fs";
@@ -471,7 +471,8 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
     previewFiles.set(projectId, persistentPath);
     let publicUrl: string;
     try {
-      publicUrl = await uploadFile(`${projectId}/assembled_${Date.now()}.mp4`, persistentPath, "video/mp4");
+      const userFolder = await userFolderForId(userId);
+      publicUrl = await uploadFile(`${userFolder}/${projectId}/assembled_${Date.now()}.mp4`, persistentPath, "video/mp4");
     } catch (uploadErr) {
       // The assembled video is fine — only the upload step failed. Preserve
       // the file and flip the project to `preview` so the user can retry
@@ -642,7 +643,8 @@ export function setupAssembleRoute(app: Express): void {
 
     (async () => {
       try {
-        const publicUrl = await uploadFile(`${projectId}/assembled_${Date.now()}.mp4`, filePath, "video/mp4");
+        const userFolder = await userFolderForId(user.id);
+        const publicUrl = await uploadFile(`${userFolder}/${projectId}/assembled_${Date.now()}.mp4`, filePath, "video/mp4");
         previewFiles.delete(projectId);
         try { fs.unlinkSync(filePath); } catch { /* ignore */ }
         await supabase.from("projects")

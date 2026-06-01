@@ -1,5 +1,5 @@
 import { submitVideoJob, pollVideoJob } from "../lib/kie.js";
-import { uploadFromUrl } from "../lib/storage.js";
+import { uploadFromUrl, userFolderForId } from "../lib/storage.js";
 import { supabase } from "../lib/supabase.js";
 
 function sleep(ms: number) {
@@ -69,7 +69,8 @@ async function processBeat(beat: QueuedBeat) {
 
   if (!videoUrl) throw new Error("Video generation timed out after 10 minutes");
 
-  const storagePath = `${projectId}/videos/beat-${beatNumber}.mp4`;
+  const userFolder = await userFolderForId(userId);
+  const storagePath = `${userFolder}/${projectId}/videos/beat-${beatNumber}.mp4`;
   const publicUrl = await uploadFromUrl(storagePath, videoUrl, "video/mp4");
   console.log(`[worker] Uploaded: ${publicUrl}`);
 
