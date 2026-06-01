@@ -469,7 +469,22 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
     // Upload directly to Supabase so the URL is permanent (no ephemeral /tmp dependency)
     await progress("Uploading to cloud…");
     previewFiles.set(projectId, persistentPath);
-    const publicUrl = await uploadFile(`${projectId}/assembled_${Date.now()}.mp4`, persistentPath, "video/mp4");
+    let publicUrl: string;
+    try {
+      publicUrl = await uploadFile(`${projectId}/assembled_${Date.now()}.mp4`, persistentPath, "video/mp4");
+    } catch (uploadErr) {
+      // The assembled video is fine — only the upload step failed. Preserve
+      // the file and flip the project to `preview` so the user can retry
+      // *just* the upload (POST /api/upload/:projectId) instead of redoing
+      // the entire ffmpeg pipeline. Skip the outer catch's cleanup by
+      // returning early; the finally block still clears tmpDir.
+      const message = uploadErr instanceof Error ? uploadErr.message : "Upload failed";
+      console.error(`[assemble] ${projectId} upload failed (preview preserved for retry):`, message);
+      await supabase.from("projects")
+        .update({ assembly_status: "preview", assembly_error: `Upload failed: ${message}`, assembly_progress: null })
+        .eq("id", projectId);
+      return;
+    }
     previewFiles.delete(projectId);
     try { fs.unlinkSync(persistentPath); } catch { /* ignore */ }
 
