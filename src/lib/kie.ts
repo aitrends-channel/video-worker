@@ -91,6 +91,8 @@ export async function submitVideoJob(
     else if (modelId === "wan/2-7-image-to-video") input.first_frame_url = imageUrl;
     else if (modelId === "wan/2-6-flash-image-to-video") input.image_urls = [imageUrl];
     else if (modelId === "sora-2-image-to-video") input.image_urls = [imageUrl];
+    else if (modelId === "bytedance/seedance-2-fast") input.first_frame_url = imageUrl;
+    else if (modelId === "bytedance/seedance-1.5-pro") input.input_urls = [imageUrl];
     else input.image_url = imageUrl;
   }
 
