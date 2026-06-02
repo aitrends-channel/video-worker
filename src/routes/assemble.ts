@@ -217,15 +217,33 @@ function alignBeats(beatTexts: string[], words: TranscriptionWord[], totalDurati
   // loops its source video to fill the gap (the "last 3 minutes repeats one
   // clip" bug). Cap at lastWordEnd + small natural-decay buffer.
   const lastWordEnd = getEnd(words[words.length - 1]);
-  const SPEECH_TAIL_PAD_SEC = 0.5;
+  // 2s pad gives natural speech-tail decay AND covers transcription-missed
+  // trailing words (ElevenLabs occasionally drops the very last 1-2 words
+  // when they end on a soft consonant). Still drops genuine multi-minute
+  // silence-only tails which is the original bug we're guarding against.
+  const SPEECH_TAIL_PAD_SEC = 2;
   const speechEnd = Math.min(totalDuration, lastWordEnd + SPEECH_TAIL_PAD_SEC);
+
+  // Proportional cap: word-count share of total speech, with 1.5x slack to
+  // absorb pacing variance. If alignBeats' word-window matcher fails to find
+  // a beat's anchor in the transcription (common on the last beat when the
+  // script's tail words are short or unusual), the timestamp-based duration
+  // could be hugely inflated — last beat absorbing 3+ minutes of unmatched
+  // tail audio is the "last clip keeps looping" bug. Capping forces the
+  // joined video to end roughly where its visual content should.
+  const beatWordCounts = beatTexts.map((t) => Math.max(1, t.trim().split(/\s+/).filter(Boolean).length));
+  const totalScriptWords = beatWordCounts.reduce((s, n) => s + n, 0);
+  const speechSpan = Math.max(1, speechEnd - getStart(words[Math.min(startIdxs[0], words.length - 1)]));
+  const proportionalCap = (i: number) => (beatWordCounts[i] / totalScriptWords) * speechSpan * 1.5;
+
   const durations: number[] = [];
   for (let i = 0; i < beatTexts.length; i++) {
     const si = startIdxs[i];
     const ni = i < beatTexts.length - 1 ? startIdxs[i + 1] : words.length;
     const start = getStart(words[Math.min(si, words.length - 1)]);
     const end = ni < words.length ? getStart(words[ni]) : speechEnd;
-    durations.push(Math.max(0.5, end - start));
+    const rawDuration = Math.max(0.5, end - start);
+    durations.push(Math.min(rawDuration, proportionalCap(i)));
   }
   return durations;
 }
@@ -360,6 +378,7 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
     await downloadFile(voiceoverUrl, voiceoverPath);
     const totalDuration = await getMediaDuration(voiceoverPath);
     if (totalDuration <= 0) throw new Error("Could not determine voiceover duration");
+    console.log(`[assemble] ${projectId}: voiceover duration = ${totalDuration.toFixed(2)}s`);
 
     await progress("Transcribing voiceover…");
     let transcriptionWords: TranscriptionWord[] = [];
@@ -369,6 +388,11 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
       transcriptionWords = await transcribeAudio(voiceoverPath, elevenlabs_api_key);
     } catch (e) {
       console.warn("[assemble] transcription failed, using proportional fallback:", e);
+    }
+    if (transcriptionWords.length) {
+      const lastWord = transcriptionWords[transcriptionWords.length - 1];
+      const lastEnd = lastWord.end ?? lastWord.end_time ?? lastWord.start ?? lastWord.start_time ?? 0;
+      console.log(`[assemble] ${projectId}: transcribed ${transcriptionWords.length} words, lastWordEnd = ${lastEnd.toFixed(2)}s (audio is ${totalDuration.toFixed(2)}s; trailing silence ≈ ${(totalDuration - lastEnd).toFixed(2)}s)`);
     }
 
     const durations = alignBeats(beats.map((b) => b.script_segment ?? ""), transcriptionWords, totalDuration);
