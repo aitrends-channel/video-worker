@@ -189,6 +189,7 @@ function normalizeWord(s: string): string { return s.toLowerCase().replace(/[^a-
 
 function alignBeats(beatTexts: string[], words: TranscriptionWord[], totalDuration: number): number[] {
   const getStart = (w: TranscriptionWord) => w.start ?? w.start_time ?? 0;
+  const getEnd = (w: TranscriptionWord) => w.end ?? w.end_time ?? getStart(w);
   if (!words.length) {
     const counts = beatTexts.map((t) => Math.max(1, t.trim().split(/\s+/).filter(Boolean).length));
     const total = counts.reduce((s, n) => s + n, 0);
@@ -210,12 +211,20 @@ function alignBeats(beatTexts: string[], words: TranscriptionWord[], totalDurati
     startIdxs.push(best);
     from = best + 1;
   }
+  // The true end of speech is the last transcribed word's end time, not the
+  // full audio file length. If the voiceover has trailing silence, using
+  // totalDuration here makes the final beat absurdly long and normalizeClip
+  // loops its source video to fill the gap (the "last 3 minutes repeats one
+  // clip" bug). Cap at lastWordEnd + small natural-decay buffer.
+  const lastWordEnd = getEnd(words[words.length - 1]);
+  const SPEECH_TAIL_PAD_SEC = 0.5;
+  const speechEnd = Math.min(totalDuration, lastWordEnd + SPEECH_TAIL_PAD_SEC);
   const durations: number[] = [];
   for (let i = 0; i < beatTexts.length; i++) {
     const si = startIdxs[i];
     const ni = i < beatTexts.length - 1 ? startIdxs[i + 1] : words.length;
     const start = getStart(words[Math.min(si, words.length - 1)]);
-    const end = ni < words.length ? getStart(words[ni]) : totalDuration;
+    const end = ni < words.length ? getStart(words[ni]) : speechEnd;
     durations.push(Math.max(0.5, end - start));
   }
   return durations;
