@@ -54,7 +54,10 @@ async function processBeat(beat: QueuedBeat) {
   console.log(`[worker] Submitted video job: ${jobId}`);
 
   let videoUrl: string | undefined;
-  for (let attempt = 0; attempt < 60; attempt++) {
+  // Kling 3.0, Veo, and longer clips can legitimately run 12-18 min on KIE.
+  // 120 attempts × 10s = 20 min ceiling catches almost all stragglers.
+  const MAX_POLL_ATTEMPTS = 120;
+  for (let attempt = 0; attempt < MAX_POLL_ATTEMPTS; attempt++) {
     await sleep(10000);
     const status = await pollVideoJob(jobId, modelId, kieApiKey);
     console.log(`[worker] Poll attempt ${attempt + 1} beat=${beatNumber} status=${status.status} hasUrl=${!!status.videoUrl}`);
@@ -67,7 +70,7 @@ async function processBeat(beat: QueuedBeat) {
     if (status.status === "failed") throw new Error(`kie.ai video job failed: ${status.error}`);
   }
 
-  if (!videoUrl) throw new Error("Video generation timed out after 10 minutes");
+  if (!videoUrl) throw new Error("Video generation timed out after 20 minutes");
 
   const userFolder = await userFolderForId(userId);
   const storagePath = `${userFolder}/${projectId}/videos/beat-${beatNumber}.mp4`;
