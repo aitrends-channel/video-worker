@@ -89,6 +89,7 @@ export async function submitVideoJob(
   if (imageUrl) {
     if (modelId === "grok-imagine/image-to-video") input.image_urls = [imageUrl];
     else if (modelId === "wan/2-7-image-to-video") input.first_frame_url = imageUrl;
+    else if (modelId === "wan/2-6-flash-image-to-video") input.image_urls = [imageUrl];
     else if (modelId === "sora-2-image-to-video") input.image_urls = [imageUrl];
     else input.image_url = imageUrl;
   }
