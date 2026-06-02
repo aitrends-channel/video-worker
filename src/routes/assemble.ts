@@ -69,7 +69,11 @@ function getMediaDuration(filePath: string): Promise<number> {
   });
 }
 
-const FFMPEG_TIMEOUT_MS = 10 * 60_000;
+// 30 min cap. Burning subtitles re-encodes the full assembled video, which
+// on Render's shared CPU can run 15-20+ min for longer scripts. Other
+// ffmpeg steps (normalizeClip, concat, mixAudio) finish in seconds-minutes
+// so a higher ceiling here doesn't add real latency on the fast path.
+const FFMPEG_TIMEOUT_MS = 30 * 60_000;
 
 function ffmpegWithTimeout(
   build: (cmd: ReturnType<typeof ffmpeg>) => ReturnType<typeof ffmpeg>,
@@ -138,7 +142,10 @@ function burnSubtitles(video: string, assPath: string, output: string): Promise<
   return ffmpegWithTimeout((cmd) =>
     cmd
       .input(video)
-      .outputOptions(["-vf", `ass=${escaped}`, "-c:v", "libx264", "-preset", "fast", "-crf", "23", "-c:a", "copy", "-movflags", "+faststart"])
+      // "veryfast" cuts burn time ~2x vs "fast" on Render's shared CPU,
+      // at the cost of ~15-20% larger output. Captions are a re-encode
+      // pass so we trade size for staying under the timeout ceiling.
+      .outputOptions(["-vf", `ass=${escaped}`, "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "copy", "-movflags", "+faststart"])
       .output(output),
   "burnSubtitles");
 }
