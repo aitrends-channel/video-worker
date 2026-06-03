@@ -6,6 +6,7 @@ import { supabase } from "../lib/supabase.js";
 import { uploadFile, userFolderForId } from "../lib/storage.js";
 import { redis } from "../lib/queue.js";
 import Anthropic from "@anthropic-ai/sdk";
+import { getAnthropicClient } from "../lib/anthropic.js";
 import fs from "fs";
 import path from "path";
 import os from "os";
@@ -37,15 +38,14 @@ async function setProgress(projectId: string, progress: string) {
 
 // ── Settings ──────────────────────────────────────────────────────────────────
 
-async function getSettings(userId: string): Promise<{ elevenlabs_api_key: string; anthropic_api_key: string }> {
+async function getSettings(userId: string): Promise<{ elevenlabs_api_key: string }> {
   const { data } = await supabase
     .from("app_settings")
-    .select("elevenlabs_api_key, anthropic_api_key")
+    .select("elevenlabs_api_key")
     .eq("user_id", userId)
     .single();
   return {
     elevenlabs_api_key: data?.elevenlabs_api_key?.trim() || process.env.ELEVENLABS_API_KEY || "",
-    anthropic_api_key: data?.anthropic_api_key?.trim() || process.env.ANTHROPIC_API_KEY || "",
   };
 }
 
@@ -308,9 +308,8 @@ function writeAss(segs: SrtSegment[], s: AssStyle, w: number, h: number, file: s
     `[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n${dlg}`, "utf-8");
 }
 
-async function translateSegments(segs: SrtSegment[], lang: string, key: string): Promise<SrtSegment[]> {
+async function translateSegments(segs: SrtSegment[], lang: string, anthropic: Anthropic): Promise<SrtSegment[]> {
   if (!segs.length) return segs;
-  const anthropic = new Anthropic({ apiKey: key });
   const numbered = segs.map((s) => `${s.index}. ${s.text}`).join("\n");
   const msg = await anthropic.messages.create({
     model: process.env.CLAUDE_MODEL ?? "claude-sonnet-4-6", max_tokens: 4096,
@@ -461,9 +460,11 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
       if (!segs.length) throw new Error("No caption segments could be generated — check that beats have script text");
       if (captionsLanguage !== "source") {
         await progress(`Translating captions to ${captionsLanguage}…`);
-        const { anthropic_api_key } = await getSettings(userId);
-        if (!anthropic_api_key) throw new Error("Anthropic API key not configured.");
-        segs = await translateSegments(segs, captionsLanguage, anthropic_api_key);
+        // Honors the global Config → Anthropic routing setting. Surfaces
+        // a clear "key not configured" error for whichever path the admin
+        // picked, instead of failing cryptically inside the SDK.
+        const anthropic = await getAnthropicClient(userId);
+        segs = await translateSegments(segs, captionsLanguage, anthropic);
       }
       const assPath = path.join(tmpDir, "captions.ass");
       writeAss(segs, buildAssStyle(captionsStyle, captionsSize, captionsPosition, h), w, h, assPath);
