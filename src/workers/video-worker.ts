@@ -57,14 +57,15 @@ async function processBeat(beat: QueuedBeat) {
   // Kling 3.0, Veo, and longer clips can legitimately run 12-18 min on KIE.
   // 120 attempts × 10s = 20 min ceiling catches almost all stragglers.
   const MAX_POLL_ATTEMPTS = 120;
-  // KIE intermittently returns state=failed with no specific reason
+  // KIE intermittently returns state=failed with no extractable reason
   // mid-generation, then completes successfully on the next poll. Track
-  // unexplained failures separately and only give up after a few in a
-  // row — a "failed" with a real error reason still trips the hard fail
-  // immediately, so legit failures don't waste the full 20-min budget.
+  // unexplained failures (empty error string from pollVideoJob — the
+  // signal that no failMsg / failReason / error / errorMessage / failCode
+  // / errorCode field was set) and only give up after a few in a row.
+  // A failed response with a real reason still trips the hard fail
+  // immediately so legit failures don't waste the full 20-min budget.
   const SOFT_FAIL_LIMIT = 3;
   let softFailures = 0;
-  const GENERIC_FAIL_REASONS = new Set(["Video generation failed", "Veo generation failed", ""]);
 
   for (let attempt = 0; attempt < MAX_POLL_ATTEMPTS; attempt++) {
     await sleep(10000);
@@ -78,8 +79,7 @@ async function processBeat(beat: QueuedBeat) {
     }
     if (status.status === "failed") {
       const reason = (status.error ?? "").trim();
-      const isUnexplained = GENERIC_FAIL_REASONS.has(reason);
-      if (isUnexplained && softFailures + 1 < SOFT_FAIL_LIMIT) {
+      if (!reason && softFailures + 1 < SOFT_FAIL_LIMIT) {
         softFailures++;
         console.warn(`[worker] Beat ${beatNumber} soft-fail ${softFailures}/${SOFT_FAIL_LIMIT - 1} (no reason from KIE) — retrying`);
         continue;

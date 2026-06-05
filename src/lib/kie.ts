@@ -29,14 +29,37 @@ interface KieRecordResponse {
     status?: string;
     resultJson?: string;
     output?: string | string[];
+    // KIE puts the failure reason in different fields depending on the
+    // model family / endpoint. The image-side polling already checks
+    // all of these; the worker had only been reading two.
     failReason?: string;
+    failMsg?: string;
+    failCode?: string | number;
     error?: string;
+    errorMessage?: string | null;
+    errorCode?: string | number | null;
     videoInfo?: { videoUrl?: string };
     successFlag?: number;
     videoUrl?: string;
     video_url?: string;
     [key: string]: unknown;
   };
+}
+
+// Pulls the most specific human-readable reason KIE included in a
+// failed-job response. Returns null when KIE gave nothing — that's the
+// signal the worker uses to treat the failure as transient and retry.
+function extractFailureReason(d: KieRecordResponse["data"] | undefined): string | null {
+  if (!d) return null;
+  const candidates = [d.failMsg, d.failReason, d.error, d.errorMessage];
+  for (const c of candidates) {
+    if (typeof c === "string" && c.trim()) return c.trim();
+  }
+  const code = d.failCode ?? d.errorCode;
+  if (code !== null && code !== undefined && String(code).trim()) {
+    return `fail code ${String(code).trim()}`;
+  }
+  return null;
 }
 
 const MODEL_DURATION_KEYS: Record<string, string> = {
@@ -115,7 +138,11 @@ export async function pollVideoJob(
     const data = await kieRequest<KieRecordResponse>(`/api/v1/veo/record-info?taskId=${taskId}`, {}, apiKey);
     const flag = data.data?.successFlag;
     if (flag === 1) return { status: "done", videoUrl: data.data?.videoUrl ?? (typeof data.data?.resultJson === "string" ? data.data.resultJson : undefined) };
-    if (flag === 2 || flag === 3) return { status: "failed", error: "Veo generation failed" };
+    if (flag === 2 || flag === 3) {
+      const reason = extractFailureReason(data.data);
+      console.log(`[kie] Veo failed taskId=${taskId} flag=${flag} reason=${reason ?? "(none)"} keys=${Object.keys(data.data ?? {}).join(",")}`);
+      return { status: "failed", error: reason ?? "" };
+    }
     return { status: "processing" };
   }
 
@@ -125,7 +152,11 @@ export async function pollVideoJob(
     const d = data.data;
     const raw = (d?.state ?? "").toLowerCase();
     if (raw === "success") return { status: "done", videoUrl: d?.videoInfo?.videoUrl };
-    if (raw === "fail") return { status: "failed", error: d?.failReason ?? "Runway job failed" };
+    if (raw === "fail") {
+      const reason = extractFailureReason(d);
+      console.log(`[kie] Runway failed taskId=${taskId} state=${raw} reason=${reason ?? "(none)"} keys=${Object.keys(d ?? {}).join(",")}`);
+      return { status: "failed", error: reason ?? "" };
+    }
     return { status: raw === "generating" ? "processing" : "pending" };
   }
 
@@ -164,9 +195,16 @@ export async function pollVideoJob(
     if (!videoUrl) console.warn(`[kie] Done but no videoUrl found. data=${JSON.stringify(d)}`);
   }
 
-  return {
-    status: jobStatus,
-    videoUrl,
-    error: jobStatus === "failed" ? (d?.failReason ?? d?.error ?? "Video generation failed") : undefined,
-  };
+  if (jobStatus === "failed") {
+    const reason = extractFailureReason(d);
+    if (!reason) {
+      // Log the entire data block so we can see what KIE actually sent
+      // when none of the known fields had a reason. Helps add new
+      // candidates to extractFailureReason if KIE introduces a field.
+      console.log(`[kie] Generic failed taskId=${taskId} state=${raw} keys=${Object.keys(d ?? {}).join(",")} data=${JSON.stringify(d).slice(0, 600)}`);
+    }
+    return { status: jobStatus, videoUrl, error: reason ?? "" };
+  }
+
+  return { status: jobStatus, videoUrl };
 }
