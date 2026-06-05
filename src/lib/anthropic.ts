@@ -104,7 +104,7 @@ const fetchViaKie: typeof fetch = async (input, init) => {
 
 async function getUserKieKey(userId: string): Promise<string | null> {
   const { data } = await supabase
-    .from("app_settings")
+    .from("account_settings")
     .select("kie_api_key")
     .eq("user_id", userId)
     .single();

@@ -40,7 +40,7 @@ async function processBeat(beat: QueuedBeat) {
   console.log(`[worker] Processing beat ${beatNumber} for project ${projectId}`);
 
   const { data: settings, error: settingsError } = await supabase
-    .from("app_settings")
+    .from("account_settings")
     .select("kie_api_key")
     .eq("user_id", userId)
     .single();

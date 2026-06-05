@@ -40,7 +40,7 @@ async function setProgress(projectId: string, progress: string) {
 
 async function getSettings(userId: string): Promise<{ elevenlabs_api_key: string }> {
   const { data } = await supabase
-    .from("app_settings")
+    .from("account_settings")
     .select("elevenlabs_api_key")
     .eq("user_id", userId)
     .single();
