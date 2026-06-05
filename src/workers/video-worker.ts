@@ -57,17 +57,39 @@ async function processBeat(beat: QueuedBeat) {
   // Kling 3.0, Veo, and longer clips can legitimately run 12-18 min on KIE.
   // 120 attempts × 10s = 20 min ceiling catches almost all stragglers.
   const MAX_POLL_ATTEMPTS = 120;
+  // KIE intermittently returns state=failed with no specific reason
+  // mid-generation, then completes successfully on the next poll. Track
+  // unexplained failures separately and only give up after a few in a
+  // row — a "failed" with a real error reason still trips the hard fail
+  // immediately, so legit failures don't waste the full 20-min budget.
+  const SOFT_FAIL_LIMIT = 3;
+  let softFailures = 0;
+  const GENERIC_FAIL_REASONS = new Set(["Video generation failed", "Veo generation failed", ""]);
+
   for (let attempt = 0; attempt < MAX_POLL_ATTEMPTS; attempt++) {
     await sleep(10000);
     const status = await pollVideoJob(jobId, modelId, kieApiKey);
-    console.log(`[worker] Poll attempt ${attempt + 1} beat=${beatNumber} status=${status.status} hasUrl=${!!status.videoUrl}`);
+    console.log(`[worker] Poll attempt ${attempt + 1} beat=${beatNumber} status=${status.status} hasUrl=${!!status.videoUrl}${status.error ? ` err="${status.error}"` : ""}`);
     if (status.status === "done") {
       if (status.videoUrl) { videoUrl = status.videoUrl; break; }
       // Done but no URL — log full response and keep polling briefly in case URL appears
       console.warn(`[worker] Beat ${beatNumber} done but no videoUrl yet, attempt ${attempt + 1}`);
       if (attempt >= 3) throw new Error("Job completed on KIE but no video URL was returned");
     }
-    if (status.status === "failed") throw new Error(`kie.ai video job failed: ${status.error}`);
+    if (status.status === "failed") {
+      const reason = (status.error ?? "").trim();
+      const isUnexplained = GENERIC_FAIL_REASONS.has(reason);
+      if (isUnexplained && softFailures + 1 < SOFT_FAIL_LIMIT) {
+        softFailures++;
+        console.warn(`[worker] Beat ${beatNumber} soft-fail ${softFailures}/${SOFT_FAIL_LIMIT - 1} (no reason from KIE) — retrying`);
+        continue;
+      }
+      throw new Error(`kie.ai video job failed: ${reason || "no reason returned by KIE"}`);
+    } else {
+      // Any non-failed response resets the soft-fail counter — KIE is
+      // making progress again.
+      softFailures = 0;
+    }
   }
 
   if (!videoUrl) throw new Error("Video generation timed out after 20 minutes");
