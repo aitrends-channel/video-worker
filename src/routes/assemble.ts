@@ -556,7 +556,15 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
       supabase.from("projects").select("tts_url, tts_cleaned_url, beat_timings_voiceover_hash").eq("id", projectId).single(),
       supabase.from("project_beats").select("beat_number, script_segment, video_url, image_url, duration_ms").eq("project_id", projectId).order("beat_number"),
     ]);
-    if (projectRes.error) throw new Error("Project not found");
+    if (projectRes.error) {
+      // PostgREST returns specific codes/messages — surfacing them
+      // makes "Project not found" actionable instead of mysterious.
+      // The most common culprit is a missing column from an
+      // unapplied migration (e.g., 044 added beat_timings_voiceover_hash).
+      const msg = projectRes.error.message || "unknown";
+      const code = projectRes.error.code ? ` [${projectRes.error.code}]` : "";
+      throw new Error(`Project lookup failed${code}: ${msg}`);
+    }
 
     const proj = projectRes.data as { tts_url: string | null; tts_cleaned_url: string | null; beat_timings_voiceover_hash: string | null };
     const allBeats = (beatsRes.data ?? []) as Beat[];
