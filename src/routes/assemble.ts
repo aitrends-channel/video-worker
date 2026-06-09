@@ -75,15 +75,31 @@ function getMediaDuration(filePath: string): Promise<number> {
 // so a higher ceiling here doesn't add real latency on the fast path.
 const FFMPEG_TIMEOUT_MS = 30 * 60_000;
 
+// Unique marker so the catch path in runAssembly can distinguish a
+// user-requested stop from a real error and persist the checkpoint
+// instead of clearing it.
+const STOPPED_MARKER = "ASSEMBLY_STOPPED_BY_USER";
+
 function ffmpegWithTimeout(
   build: (cmd: ReturnType<typeof ffmpeg>) => ReturnType<typeof ffmpeg>,
-  label: string
+  label: string,
+  signal?: AbortSignal,
 ): Promise<void> {
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new Error(STOPPED_MARKER));
+      return;
+    }
     const cmd = build(ffmpeg());
     let settled = false;
     const settle = (fn: () => void) => {
-      if (!settled) { settled = true; clearTimeout(timer); fn(); }
+      if (!settled) { settled = true; clearTimeout(timer); signal?.removeEventListener("abort", onAbort); fn(); }
+    };
+    const onAbort = () => {
+      settle(() => {
+        try { cmd.kill("SIGKILL"); } catch { /* ignore */ }
+        reject(new Error(STOPPED_MARKER));
+      });
     };
     const timer = setTimeout(() => {
       settle(() => {
@@ -91,6 +107,7 @@ function ffmpegWithTimeout(
         reject(new Error(`ffmpeg timed out: ${label}`));
       });
     }, FFMPEG_TIMEOUT_MS);
+    signal?.addEventListener("abort", onAbort, { once: true });
     cmd
       .on("end", () => settle(resolve))
       .on("error", (err: Error) => settle(() => reject(new Error(`${label} failed: ${err.message}`))))
@@ -98,7 +115,7 @@ function ffmpegWithTimeout(
   });
 }
 
-function normalizeClip(src: string, isImage: boolean, duration: number, output: string, w: number, h: number): Promise<void> {
+function normalizeClip(src: string, isImage: boolean, duration: number, output: string, w: number, h: number, signal?: AbortSignal): Promise<void> {
   const vf = `scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2:black,fps=24`;
   return ffmpegWithTimeout((cmd) => {
     if (isImage) cmd.input(src).inputOptions(["-loop", "1"]);
@@ -106,37 +123,35 @@ function normalizeClip(src: string, isImage: boolean, duration: number, output: 
     return cmd
       .outputOptions(["-t", String(duration), "-vf", vf, "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-an", "-pix_fmt", "yuv420p"])
       .output(output);
-  }, `normalizeClip`);
+  }, `normalizeClip`, signal);
 }
 
 
-function concatClips(listFile: string, output: string): Promise<void> {
-  return new Promise((resolve, reject) => {
-    ffmpeg()
+function concatClips(listFile: string, output: string, signal?: AbortSignal): Promise<void> {
+  return ffmpegWithTimeout((cmd) =>
+    cmd
       .input(listFile).inputOptions(["-f", "concat", "-safe", "0"])
       .outputOptions(["-c", "copy"])
-      .output(output)
-      .on("end", () => resolve())
-      .on("error", (err: Error) => reject(new Error(`concat failed: ${err.message}`)))
-      .run();
-  });
+      .output(output),
+    "concat",
+    signal,
+  );
 }
 
-function mixAudio(video: string, audio: string, output: string, videoDuration: number): Promise<void> {
-  return new Promise((resolve, reject) => {
-    ffmpeg()
+function mixAudio(video: string, audio: string, output: string, videoDuration: number, signal?: AbortSignal): Promise<void> {
+  return ffmpegWithTimeout((cmd) =>
+    cmd
       .input(video).inputOptions(["-fflags", "+genpts"])
       .input(audio)
       // +faststart skipped: on constrained disk it can corrupt the moov atom; range-request serving handles moov-at-end fine
       .outputOptions(["-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-t", String(videoDuration)])
-      .output(output)
-      .on("end", () => resolve())
-      .on("error", (err: Error) => reject(new Error(`audio mix failed: ${err.message}`)))
-      .run();
-  });
+      .output(output),
+    "audio mix",
+    signal,
+  );
 }
 
-function burnSubtitles(video: string, assPath: string, output: string): Promise<void> {
+function burnSubtitles(video: string, assPath: string, output: string, signal?: AbortSignal): Promise<void> {
   // Escape backslashes and colons for ffmpeg filtergraph syntax (no shell quoting needed)
   const escaped = assPath.replace(/\\/g, "/").replace(/:/g, "\\:");
   return ffmpegWithTimeout((cmd) =>
@@ -147,7 +162,7 @@ function burnSubtitles(video: string, assPath: string, output: string): Promise<
       // pass so we trade size for staying under the timeout ceiling.
       .outputOptions(["-vf", `ass=${escaped}`, "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "copy", "-movflags", "+faststart"])
       .output(output),
-  "burnSubtitles");
+  "burnSubtitles", signal);
 }
 
 // ── Transcription ─────────────────────────────────────────────────────────────
@@ -195,21 +210,80 @@ function alignBeats(beatTexts: string[], words: TranscriptionWord[], totalDurati
     const total = counts.reduce((s, n) => s + n, 0);
     return counts.map((n) => Math.max(0.5, (n / total) * totalDuration));
   }
+  // Per-beat start-of-narration anchors.
+  //
+  // Old behavior (the source of the "visuals ahead of narration" drift):
+  // greedy forward scan that picked the FIRST position where 2 of the
+  // first 3 beat-words matched the transcription. Common starter words
+  // ("And", "The", "But", "Then") match many places, and the first hit
+  // is almost always earlier than the actual start — which clips the
+  // previous beat short and makes the next beat's visual show before
+  // its narration. Drift compounds across the video.
+  //
+  // New strategy:
+  //  1. Predict each beat's expected start index in the transcription
+  //     by proportional word-count scaling. If the script has 500
+  //     words and the transcription has 520 (TTS expanded a few
+  //     numbers / contractions), the scale factor is 520/500 = 1.04;
+  //     beat i's expected start is cumulative-script-words[i] * 1.04.
+  //  2. Search only within a small ± window around the expected
+  //     position (capped also by the previous beat's match so anchors
+  //     stay monotonically increasing).
+  //  3. Pick the BEST-scoring position in that window, where score is
+  //     the number of first-WINDOW_LEN beat-words that match the
+  //     transcription at that offset. Ties broken by closeness to the
+  //     expected position.
+  //  4. Falls through to the expected position if nothing matches —
+  //     bounded by the proportional anchor so a no-match beat can't
+  //     warp the timeline.
   const norm = words.map((w) => normalizeWord(w.text ?? w.word ?? ""));
-  let from = 0;
-  const startIdxs: number[] = [];
-  for (const text of beatTexts) {
-    const beatWords = text.trim().split(/\s+/).filter(Boolean).map(normalizeWord).filter(Boolean);
-    if (!beatWords.length || from >= words.length) { startIdxs.push(Math.min(from, words.length - 1)); continue; }
-    const win = beatWords.slice(0, 3);
-    let best = from;
-    for (let i = from; i < words.length; i++) {
-      let m = 0;
-      for (let j = 0; j < win.length && i + j < words.length; j++) if (norm[i + j] === win[j]) m++;
-      if (m >= Math.min(2, win.length)) { best = i; break; }
+  const beatWordCounts = beatTexts.map((t) => Math.max(1, t.trim().split(/\s+/).filter(Boolean).length));
+  const totalScriptWords = beatWordCounts.reduce((s, n) => s + n, 0);
+  const scale = words.length / totalScriptWords;
+  const expectedStarts: number[] = [];
+  {
+    let cum = 0;
+    for (const c of beatWordCounts) {
+      expectedStarts.push(Math.min(words.length - 1, Math.max(0, Math.floor(cum * scale))));
+      cum += c;
     }
-    startIdxs.push(best);
-    from = best + 1;
+  }
+  // Window size scales with the expected per-beat length so a 50-word
+  // beat searches ~10 words around its anchor while a 10-word beat
+  // only searches ~5. Capped on both sides to avoid degenerate cases.
+  const WINDOW_LEN = 5; // beat-words used as the match window
+  const startIdxs: number[] = [];
+  for (let bi = 0; bi < beatTexts.length; bi++) {
+    const beatWords = beatTexts[bi].trim().split(/\s+/).filter(Boolean).map(normalizeWord).filter(Boolean);
+    const expected = expectedStarts[bi];
+    if (!beatWords.length) {
+      startIdxs.push(Math.min(expected, words.length - 1));
+      continue;
+    }
+    const win = beatWords.slice(0, Math.min(WINDOW_LEN, beatWords.length));
+    const slack = Math.max(3, Math.min(20, Math.floor(beatWordCounts[bi] * scale * 0.4)));
+    const lowerBound = bi > 0 ? startIdxs[bi - 1] + 1 : 0;
+    const searchStart = Math.max(lowerBound, expected - slack);
+    const searchEnd = Math.min(words.length, expected + slack + 1);
+    let bestPos = expected;
+    let bestScore = -1;
+    let bestDistance = Infinity;
+    for (let j = searchStart; j < searchEnd; j++) {
+      let m = 0;
+      for (let k = 0; k < win.length && j + k < words.length; k++) if (norm[j + k] === win[k]) m++;
+      if (m === 0) continue;
+      const dist = Math.abs(j - expected);
+      if (m > bestScore || (m === bestScore && dist < bestDistance)) {
+        bestScore = m;
+        bestDistance = dist;
+        bestPos = j;
+      }
+    }
+    // Require at least 2 matching words to trust the match — otherwise
+    // a single common-word hit on the wrong position is worse than the
+    // proportional prediction. Clamp to monotonicity bound.
+    if (bestScore < 2) bestPos = Math.max(lowerBound, expected);
+    startIdxs.push(Math.min(bestPos, words.length - 1));
   }
   // The true end of speech is the last transcribed word's end time, not the
   // full audio file length. If the voiceover has trailing silence, using
@@ -224,26 +298,26 @@ function alignBeats(beatTexts: string[], words: TranscriptionWord[], totalDurati
   const SPEECH_TAIL_PAD_SEC = 2;
   const speechEnd = Math.min(totalDuration, lastWordEnd + SPEECH_TAIL_PAD_SEC);
 
-  // Proportional cap: word-count share of total speech, with 1.5x slack to
-  // absorb pacing variance. If alignBeats' word-window matcher fails to find
-  // a beat's anchor in the transcription (common on the last beat when the
-  // script's tail words are short or unusual), the timestamp-based duration
-  // could be hugely inflated — last beat absorbing 3+ minutes of unmatched
-  // tail audio is the "last clip keeps looping" bug. Capping forces the
-  // joined video to end roughly where its visual content should.
-  const beatWordCounts = beatTexts.map((t) => Math.max(1, t.trim().split(/\s+/).filter(Boolean).length));
-  const totalScriptWords = beatWordCounts.reduce((s, n) => s + n, 0);
-  const speechSpan = Math.max(1, speechEnd - getStart(words[Math.min(startIdxs[0], words.length - 1)]));
-  const proportionalCap = (i: number) => (beatWordCounts[i] / totalScriptWords) * speechSpan * 1.5;
-
+  // Per-beat durations come straight from the word-timestamp gaps:
+  //   beat i runs from word[startIdxs[i]].start to word[startIdxs[i+1]].start
+  //   (last beat ends at speechEnd, capped by the lastWordEnd + 2s guard
+  //   above).
+  // No more proportional cap — the cap (originally 1.5× word-share) was
+  // clipping beats that genuinely take longer than their word-share due
+  // to natural pauses or slow delivery, which made every subsequent
+  // beat's visual show early and drift cascaded through the video. With
+  // the speechEnd guard bounding the last beat AND the post-concat
+  // freeze-pad in runAssembly filling any trailing-silence gap to the
+  // voiceover's totalDuration, the cap no longer protects against
+  // anything load-bearing. Removing it keeps every beat exactly on its
+  // narration boundaries.
   const durations: number[] = [];
   for (let i = 0; i < beatTexts.length; i++) {
     const si = startIdxs[i];
     const ni = i < beatTexts.length - 1 ? startIdxs[i + 1] : words.length;
     const start = getStart(words[Math.min(si, words.length - 1)]);
     const end = ni < words.length ? getStart(words[ni]) : speechEnd;
-    const rawDuration = Math.max(0.5, end - start);
-    durations.push(Math.min(rawDuration, proportionalCap(i)));
+    durations.push(Math.max(0.5, end - start));
   }
   return durations;
 }
@@ -323,6 +397,74 @@ async function translateSegments(segs: SrtSegment[], lang: string, anthropic: An
   });
 }
 
+// ── Checkpoint state ──────────────────────────────────────────────────────────
+//
+// Persisted on projects.assembly_checkpoint after each completed stage
+// so a user-requested Stop can be resumed without redoing the work.
+// Two hashes are tracked so we can invalidate just the suffix of stages
+// that depend on the changed options:
+//
+//   core_hash   = aspectRatio + voiceoverType. If this changes between
+//                 stop and resume, *everything* downstream of the
+//                 voiceover/scale decision must be re-done (the saved
+//                 clip / joined / mixed mp4s are wrong sizes / wrong
+//                 audio basis).
+//   captions_hash = captionsEnabled + the four caption-style options
+//                 (language, style, size, position). If only this
+//                 changes, we can keep the saved mixed.mp4 and just
+//                 re-burn captions.
+//
+// Stage outputs are uploaded to R2 under a `_assembly/` prefix and
+// deleted by the cleanup pass on successful completion. clip_urls is
+// sparse — entry i is set only when beat i's normalized clip has been
+// uploaded; null/undefined means "not done yet, normalize on this run".
+interface AssemblyCheckpoint {
+  core_hash: string;
+  captions_hash: string;
+  transcription_words?: TranscriptionWord[];
+  clip_urls?: (string | null)[];
+  joined_url?: string;
+  padded_url?: string;
+  mixed_url?: string;
+  captioned_url?: string;
+}
+
+function hashString(s: string): string {
+  // FNV-1a 32-bit — plenty for change detection, no crypto dep needed.
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(16);
+}
+
+function coreHash(opts: AssembleOptions): string {
+  return hashString(`${opts.aspectRatio}|${opts.voiceoverType}`);
+}
+
+function captionsHash(opts: AssembleOptions): string {
+  return hashString(`${opts.captionsEnabled}|${opts.captionsLanguage}|${opts.captionsStyle}|${opts.captionsSize}|${opts.captionsPosition}`);
+}
+
+async function loadCheckpoint(projectId: string): Promise<AssemblyCheckpoint | null> {
+  const { data } = await supabase.from("projects").select("assembly_checkpoint").eq("id", projectId).single();
+  return (data?.assembly_checkpoint as AssemblyCheckpoint | null) ?? null;
+}
+
+async function saveCheckpoint(projectId: string, ckpt: AssemblyCheckpoint): Promise<void> {
+  await supabase.from("projects").update({ assembly_checkpoint: ckpt }).eq("id", projectId);
+}
+
+async function clearCheckpoint(projectId: string): Promise<void> {
+  await supabase.from("projects").update({ assembly_checkpoint: null }).eq("id", projectId);
+}
+
+async function isStopRequested(projectId: string): Promise<boolean> {
+  const { data } = await supabase.from("projects").select("assembly_stop_requested").eq("id", projectId).single();
+  return !!(data?.assembly_stop_requested as boolean | undefined);
+}
+
 // ── Background assembly job ───────────────────────────────────────────────────
 
 interface AssembleOptions {
@@ -340,6 +482,61 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
   };
 
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "assemble-"));
+
+  // Stop signal: a background poll watches projects.assembly_stop_requested
+  // every 3s. When set, we abort any running ffmpeg via the shared
+  // AbortController; the catch path below sees STOPPED_MARKER and
+  // transitions the project to assembly_status="stopped" with the
+  // checkpoint intact for Resume. Explicit checkStop() calls between
+  // stages mean we don't have to wait up to 3s for the poll to notice
+  // when an awaited stage finishes.
+  const aborter = new AbortController();
+  const signal = aborter.signal;
+  const stopPoll = setInterval(async () => {
+    if (signal.aborted) return;
+    try {
+      if (await isStopRequested(projectId)) {
+        console.log(`[assemble] ${projectId}: stop requested — aborting`);
+        aborter.abort(new Error(STOPPED_MARKER));
+      }
+    } catch {
+      // poll error — swallow, will retry next tick
+    }
+  }, 3000);
+  const checkStop = async (): Promise<void> => {
+    if (signal.aborted) throw new Error(STOPPED_MARKER);
+    // Also check directly so a Stop click between stages doesn't wait
+    // up to a poll tick.
+    if (await isStopRequested(projectId)) {
+      aborter.abort(new Error(STOPPED_MARKER));
+      throw new Error(STOPPED_MARKER);
+    }
+  };
+
+  // Checkpoint: skip stages whose output is already in R2 from a prior
+  // run of this same project. Validated against the current options
+  // hashes so a config change since Stop invalidates the suffix of
+  // stages that depend on the changed pieces.
+  const currentCoreHash = coreHash(opts);
+  const currentCaptionsHash = captionsHash(opts);
+  let checkpoint: AssemblyCheckpoint;
+  {
+    const loaded = await loadCheckpoint(projectId);
+    if (loaded && loaded.core_hash === currentCoreHash) {
+      if (loaded.captions_hash === currentCaptionsHash) {
+        checkpoint = loaded;
+      } else {
+        console.log(`[assemble] ${projectId}: captions opts changed — discarding captioned_url`);
+        checkpoint = { ...loaded, captions_hash: currentCaptionsHash, captioned_url: undefined };
+      }
+    } else {
+      if (loaded) console.log(`[assemble] ${projectId}: core opts changed — discarding checkpoint`);
+      checkpoint = { core_hash: currentCoreHash, captions_hash: currentCaptionsHash };
+    }
+  }
+  const persistCheckpoint = async (): Promise<void> => { await saveCheckpoint(projectId, checkpoint); };
+  const userFolder = await userFolderForId(userId);
+  const ckptPathFor = (name: string): string => `${userFolder}/${projectId}/_assembly/${name}`;
 
   // Ping our own health endpoint every 4 min so Render free tier doesn't
   // spin the service down during a long background assembly
@@ -372,6 +569,7 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
     const videoCount = beats.filter((b) => b.video_url).length;
     console.log(`[assemble] ${projectId}: assembling ${beats.length}/${allBeats.length} beats (${videoCount} video, ${beats.length - videoCount} image)`);
 
+    await checkStop();
     await progress("Downloading voiceover…");
     const voiceoverPath = path.join(tmpDir, "voiceover.mp3");
     await downloadFile(voiceoverUrl, voiceoverPath);
@@ -379,14 +577,24 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
     if (totalDuration <= 0) throw new Error("Could not determine voiceover duration");
     console.log(`[assemble] ${projectId}: voiceover duration = ${totalDuration.toFixed(2)}s`);
 
-    await progress("Transcribing voiceover…");
-    let transcriptionWords: TranscriptionWord[] = [];
-    try {
-      const { elevenlabs_api_key } = await getSettings(userId);
-      if (!elevenlabs_api_key) throw new Error("ElevenLabs API key not configured.");
-      transcriptionWords = await transcribeAudio(voiceoverPath, elevenlabs_api_key);
-    } catch (e) {
-      console.warn("[assemble] transcription failed, using proportional fallback:", e);
+    // ── Stage A: transcription ─────────────────────────────────────────
+    let transcriptionWords: TranscriptionWord[] = checkpoint.transcription_words ?? [];
+    if (transcriptionWords.length) {
+      console.log(`[assemble] ${projectId}: transcription loaded from checkpoint (${transcriptionWords.length} words)`);
+    } else {
+      await checkStop();
+      await progress("Transcribing voiceover…");
+      try {
+        const { elevenlabs_api_key } = await getSettings(userId);
+        if (!elevenlabs_api_key) throw new Error("ElevenLabs API key not configured.");
+        transcriptionWords = await transcribeAudio(voiceoverPath, elevenlabs_api_key);
+      } catch (e) {
+        console.warn("[assemble] transcription failed, using proportional fallback:", e);
+      }
+      if (transcriptionWords.length) {
+        checkpoint.transcription_words = transcriptionWords;
+        await persistCheckpoint();
+      }
     }
     if (transcriptionWords.length) {
       const lastWord = transcriptionWords[transcriptionWords.length - 1];
@@ -396,16 +604,32 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
 
     const durations = alignBeats(beats.map((b) => b.script_segment ?? ""), transcriptionWords, totalDuration);
 
-    await progress("Processing video clips…");
-    const clipPaths: string[] = new Array(beats.length).fill("");
-
-    // Process clips sequentially to stay within Render's 512 MB RAM limit
-    for (let start = 0; start < beats.length; start += 1) {
-      const slice = beats.slice(start, start + 1);
-      await progress(`Processing clip ${start + 1} of ${beats.length}…`);
-      await Promise.all(slice.map(async (beat, localIdx) => {
-        const i = start + localIdx;
+    // ── Stage B: per-clip normalization → concat → joined.mp4 ───────────
+    //
+    // Each clip is uploaded to R2 after encoding (checkpoint.clip_urls[i])
+    // so a Stop mid-loop preserves completed clips. On Resume, we
+    // re-download cached clips instead of re-encoding them.
+    if (!checkpoint.joined_url) {
+      checkpoint.clip_urls = checkpoint.clip_urls ?? new Array(beats.length).fill(null);
+      const clipPaths: string[] = new Array(beats.length).fill("");
+      await progress("Processing video clips…");
+      for (let i = 0; i < beats.length; i++) {
+        await checkStop();
         const clipPath = path.join(tmpDir, `clip_${String(i).padStart(3, "0")}.mp4`);
+        const cached = checkpoint.clip_urls[i];
+        if (cached) {
+          await progress(`Restoring clip ${i + 1} of ${beats.length}…`);
+          try {
+            await downloadFile(cached, clipPath);
+            clipPaths[i] = clipPath;
+            continue;
+          } catch (e) {
+            console.warn(`[assemble] beat ${beats[i].beat_number}: cached clip download failed, re-encoding:`, e);
+            // fall through to fresh encode
+          }
+        }
+        const beat = beats[i];
+        await progress(`Processing clip ${i + 1} of ${beats.length}…`);
         try {
           if (beat.video_url) {
             const ext = beat.video_url.includes(".webm") ? "webm" : "mp4";
@@ -413,7 +637,7 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
             console.log(`[assemble] beat ${beat.beat_number}: downloading video…`);
             await downloadFile(beat.video_url, src);
             console.log(`[assemble] beat ${beat.beat_number}: encoding clip…`);
-            await normalizeClip(src, false, durations[i], clipPath, w, h);
+            await normalizeClip(src, false, durations[i], clipPath, w, h, signal);
             try { fs.unlinkSync(src); } catch { /* ignore */ }
           } else if (beat.image_url) {
             const ext = beat.image_url.toLowerCase().includes(".png") ? "png" : "jpg";
@@ -421,105 +645,217 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
             console.log(`[assemble] beat ${beat.beat_number}: downloading image…`);
             await downloadFile(beat.image_url, src);
             console.log(`[assemble] beat ${beat.beat_number}: encoding clip…`);
-            await normalizeClip(src, true, durations[i], clipPath, w, h);
+            await normalizeClip(src, true, durations[i], clipPath, w, h, signal);
             try { fs.unlinkSync(src); } catch { /* ignore */ }
+          }
+          // Upload the normalized clip so a future Stop can resume past it.
+          try {
+            const clipUrl = await uploadFile(ckptPathFor(`clip_${String(i).padStart(3, "0")}.mp4`), clipPath, "video/mp4");
+            checkpoint.clip_urls[i] = clipUrl;
+            await persistCheckpoint();
+          } catch (uploadErr) {
+            console.warn(`[assemble] beat ${beat.beat_number}: clip checkpoint upload failed:`, uploadErr);
+            // Not fatal — we just lose the resume guarantee for this clip.
           }
           console.log(`[assemble] beat ${beat.beat_number}: done`);
           clipPaths[i] = clipPath;
         } catch (e) {
-          console.error(`[assemble] beat ${beat.beat_number} skipped:`, e);
+          if (e instanceof Error && e.message === STOPPED_MARKER) throw e;
+          console.error(`[assemble] beat ${beats[i].beat_number} skipped:`, e);
           // leave clipPaths[i] as "" — filtered out of concat below
         }
-      }));
+      }
+
+      await checkStop();
+      await progress("Joining clips…");
+      const validClipPaths = clipPaths.filter((p) => p !== "");
+      if (!validClipPaths.length) throw new Error("All clips failed to encode — nothing to assemble.");
+      const listPath = path.join(tmpDir, "concat.txt");
+      fs.writeFileSync(listPath, validClipPaths.map((p) => `file '${p.replace(/\\/g, "/")}'`).join("\n"));
+      const joinedLocal = path.join(tmpDir, "joined.mp4");
+      await concatClips(listPath, joinedLocal, signal);
+      for (const p of validClipPaths) { try { fs.unlinkSync(p); } catch { /* ignore */ } }
+      try {
+        const joinedUrl = await uploadFile(ckptPathFor("joined.mp4"), joinedLocal, "video/mp4");
+        checkpoint.joined_url = joinedUrl;
+        await persistCheckpoint();
+      } catch (e) {
+        console.warn(`[assemble] joined.mp4 checkpoint upload failed:`, e);
+      }
     }
 
-    await progress("Joining clips…");
-    const validClipPaths = clipPaths.filter((p) => p !== "");
-    if (!validClipPaths.length) throw new Error("All clips failed to encode — nothing to assemble.");
-    const listPath = path.join(tmpDir, "concat.txt");
-    fs.writeFileSync(listPath, validClipPaths.map((p) => `file '${p.replace(/\\/g, "/")}'`).join("\n"));
-    const joinedPath = path.join(tmpDir, "joined.mp4");
-    await concatClips(listPath, joinedPath);
-    // Free disk space — individual clips are no longer needed
-    for (const p of validClipPaths) { try { fs.unlinkSync(p); } catch { /* ignore */ } }
+    // ── Stage C: freeze-pad → padded.mp4 (only when needed) ─────────────
+    //
+    // Per-beat durations from alignBeats are word-timestamp-anchored, so
+    // every beat's visual lands on its narration. With the original
+    // (untrimmed) voiceover, the sum of those beats stops at lastWordEnd
+    // + 2s while the audio file keeps going through trailing silence —
+    // joined.mp4 ends up shorter than totalDuration. We can't scale the
+    // durations uniformly (drifts every beat) and we can't extend the
+    // last beat's clip (re-introduces the "last clip loops for 3 min"
+    // bug). Holding the last frame for the gap preserves both.
+    //
+    // Skipped when joined ≈ totalDuration (cleaned voiceover, fast path)
+    // or when mixed.mp4 is already cached (skip-ahead on Resume).
+    const PAD_EPSILON_SEC = 0.2;
+    if (!checkpoint.mixed_url) {
+      const joinedDisk = path.join(tmpDir, "joined.mp4");
+      if (!fs.existsSync(joinedDisk)) {
+        await checkStop();
+        await progress("Restoring joined video…");
+        await downloadFile(checkpoint.joined_url!, joinedDisk);
+      }
+      const joinedDuration = await getMediaDuration(joinedDisk).catch(() => 0);
+      console.log(`[assemble] ${projectId}: joined duration = ${joinedDuration.toFixed(2)}s`);
+      if (joinedDuration <= 0) throw new Error("Joined video has 0 duration — clip encoding produced invalid output");
+      const tailDuration = Math.max(0, totalDuration - joinedDuration);
+      if (tailDuration > PAD_EPSILON_SEC && !checkpoint.padded_url) {
+        await checkStop();
+        await progress(`Padding video to voiceover length (+${tailDuration.toFixed(1)}s freeze)…`);
+        const paddedPath = path.join(tmpDir, "padded.mp4");
+        console.log(`[assemble] ${projectId}: freezing last frame for ${tailDuration.toFixed(2)}s (joined=${joinedDuration.toFixed(2)}s → target=${totalDuration.toFixed(2)}s)`);
+        await ffmpegWithTimeout((cmd) =>
+          cmd
+            .input(joinedDisk)
+            .outputOptions([
+              "-vf", `tpad=stop_mode=clone:stop_duration=${tailDuration}`,
+              "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
+              "-an", "-pix_fmt", "yuv420p",
+            ])
+            .output(paddedPath),
+          "padToVoiceover",
+          signal,
+        );
+        try { fs.unlinkSync(joinedDisk); } catch { /* ignore */ }
+        try {
+          const paddedUrl = await uploadFile(ckptPathFor("padded.mp4"), paddedPath, "video/mp4");
+          checkpoint.padded_url = paddedUrl;
+          await persistCheckpoint();
+        } catch (e) {
+          console.warn(`[assemble] padded.mp4 checkpoint upload failed:`, e);
+        }
+      }
+    }
 
-    const joinedDuration = await getMediaDuration(joinedPath).catch(() => 0);
-    console.log(`[assemble] ${projectId}: joined duration = ${joinedDuration.toFixed(2)}s`);
-    if (joinedDuration <= 0) throw new Error("Joined video has 0 duration — clip encoding produced invalid output");
-
-    await progress("Mixing voiceover…");
+    // ── Stage D: mix audio → output.mp4 ─────────────────────────────────
     const outputPath = path.join(tmpDir, "output.mp4");
-    await mixAudio(joinedPath, voiceoverPath, outputPath, joinedDuration);
-    try { fs.unlinkSync(joinedPath); } catch { /* ignore */ }
+    if (checkpoint.mixed_url) {
+      await checkStop();
+      await progress("Restoring mixed video…");
+      await downloadFile(checkpoint.mixed_url, outputPath);
+    } else {
+      // Decide which source to mix from: padded.mp4 if we made one,
+      // else joined.mp4.
+      let mixSrc: string;
+      if (checkpoint.padded_url) {
+        mixSrc = path.join(tmpDir, "padded.mp4");
+        if (!fs.existsSync(mixSrc)) {
+          await checkStop();
+          await progress("Restoring padded video…");
+          await downloadFile(checkpoint.padded_url, mixSrc);
+        }
+      } else {
+        mixSrc = path.join(tmpDir, "joined.mp4");
+        if (!fs.existsSync(mixSrc)) {
+          await checkStop();
+          await progress("Restoring joined video…");
+          await downloadFile(checkpoint.joined_url!, mixSrc);
+        }
+      }
+      await checkStop();
+      await progress("Mixing voiceover…");
+      // Cap at totalDuration (voiceover length). The pad step above
+      // ensures the video is at least totalDuration when there's
+      // significant trailing silence; the cap also trims any tiny
+      // encoding-rounding overshoot.
+      await mixAudio(mixSrc, voiceoverPath, outputPath, totalDuration, signal);
+      try { fs.unlinkSync(mixSrc); } catch { /* ignore */ }
+      try {
+        const mixedUrl = await uploadFile(ckptPathFor("mixed.mp4"), outputPath, "video/mp4");
+        checkpoint.mixed_url = mixedUrl;
+        await persistCheckpoint();
+      } catch (e) {
+        console.warn(`[assemble] mixed.mp4 checkpoint upload failed:`, e);
+      }
+    }
 
+    // ── Stage E: burn captions → captioned.mp4 (optional) ────────────────
     let finalPath = outputPath;
     if (captionsEnabled) {
-      await progress("Generating captions…");
-      let segs = transcriptionWords.length > 0 ? buildSrtSegments(transcriptionWords) : buildSrtSegmentsFromBeats(beats, durations);
-      console.log(`[assemble] ${projectId}: ${segs.length} caption segments`);
-      if (!segs.length) throw new Error("No caption segments could be generated — check that beats have script text");
-      if (captionsLanguage !== "source") {
-        await progress(`Translating captions to ${captionsLanguage}…`);
-        // Honors the global Config → Anthropic routing setting. Surfaces
-        // a clear "key not configured" error for whichever path the admin
-        // picked, instead of failing cryptically inside the SDK.
-        const anthropic = await getAnthropicClient(userId);
-        segs = await translateSegments(segs, captionsLanguage, anthropic);
+      if (checkpoint.captioned_url) {
+        await checkStop();
+        await progress("Restoring captioned video…");
+        const cached = path.join(tmpDir, "captioned.mp4");
+        await downloadFile(checkpoint.captioned_url, cached);
+        try { fs.unlinkSync(outputPath); } catch { /* ignore */ }
+        finalPath = cached;
+      } else {
+        await checkStop();
+        await progress("Generating captions…");
+        let segs = transcriptionWords.length > 0 ? buildSrtSegments(transcriptionWords) : buildSrtSegmentsFromBeats(beats, durations);
+        console.log(`[assemble] ${projectId}: ${segs.length} caption segments`);
+        if (!segs.length) throw new Error("No caption segments could be generated — check that beats have script text");
+        if (captionsLanguage !== "source") {
+          await progress(`Translating captions to ${captionsLanguage}…`);
+          const anthropic = await getAnthropicClient(userId);
+          segs = await translateSegments(segs, captionsLanguage, anthropic);
+        }
+        const assPath = path.join(tmpDir, "captions.ass");
+        writeAss(segs, buildAssStyle(captionsStyle, captionsSize, captionsPosition, h), w, h, assPath);
+        console.log(`[assemble] ${projectId}: ASS file written → ${assPath}`);
+        await checkStop();
+        await progress("Burning captions…");
+        const captionedPath = path.join(tmpDir, "captioned.mp4");
+        await burnSubtitles(outputPath, assPath, captionedPath, signal);
+        try { fs.unlinkSync(outputPath); } catch { /* ignore */ }
+        finalPath = captionedPath;
+        console.log(`[assemble] ${projectId}: captions burned`);
+        try {
+          const captionedUrl = await uploadFile(ckptPathFor("captioned.mp4"), captionedPath, "video/mp4");
+          checkpoint.captioned_url = captionedUrl;
+          await persistCheckpoint();
+        } catch (e) {
+          console.warn(`[assemble] captioned.mp4 checkpoint upload failed:`, e);
+        }
       }
-      const assPath = path.join(tmpDir, "captions.ass");
-      writeAss(segs, buildAssStyle(captionsStyle, captionsSize, captionsPosition, h), w, h, assPath);
-      console.log(`[assemble] ${projectId}: ASS file written → ${assPath}`);
-      await progress("Burning captions…");
-      const captionedPath = path.join(tmpDir, "captioned.mp4");
-      await burnSubtitles(outputPath, assPath, captionedPath);
-      try { fs.unlinkSync(outputPath); } catch { /* ignore */ }
-      finalPath = captionedPath;
-      console.log(`[assemble] ${projectId}: captions burned`);
     }
 
-    // Validate final output before saving
+    // ── Stage F: validate + remux + upload final ────────────────────────
     const finalStat = fs.statSync(finalPath);
     console.log(`[assemble] ${projectId}: final file size = ${finalStat.size} bytes`);
     if (finalStat.size < 1024) throw new Error(`Assembly produced an invalid output (${finalStat.size} bytes) — ffmpeg may have failed silently`);
 
-    // Probe the output duration — fail fast so the user sees an error instead of a 0:00 preview
     const probedDuration = await getMediaDuration(finalPath).catch(() => 0);
     console.log(`[assemble] ${projectId}: probed duration = ${probedDuration.toFixed(2)}s`);
     if (probedDuration <= 0) throw new Error("Output video has 0 duration — moov atom may be corrupt; please reassemble");
 
-    // Final remux: ffprobe reads duration from packets but browsers rely on the moov atom
-    // header. Running through ffmpeg with -c copy forces it to compute the moov duration
-    // from actual packet timestamps, producing a browser-playable file.
     const persistentPath = path.join(PREVIEW_DIR, `${projectId}.mp4`);
-    await new Promise<void>((resolve, reject) => {
-      ffmpeg()
+    await checkStop();
+    // Final remux: ffprobe reads duration from packets but browsers
+    // rely on the moov atom header. -c copy + +faststart computes a
+    // browser-playable file.
+    await ffmpegWithTimeout((cmd) =>
+      cmd
         .input(finalPath)
-        // +faststart moves the moov atom to the front so browsers can show
-        // duration and start playback without a round-trip range request.
-        // Safe here because the full input file already exists on disk.
         .outputOptions(["-c", "copy", "-movflags", "+faststart"])
-        .output(persistentPath)
-        .on("end", () => resolve())
-        .on("error", (err: Error) => reject(new Error(`remux failed: ${err.message}`)))
-        .run();
-    });
+        .output(persistentPath),
+      "remux",
+      signal,
+    );
     const remuxedDuration = await getMediaDuration(persistentPath).catch(() => 0);
     console.log(`[assemble] ${projectId}: remuxed duration = ${remuxedDuration.toFixed(2)}s`);
     if (remuxedDuration <= 0) throw new Error("Remuxed video has 0 duration — please reassemble");
 
-    // Upload directly to Supabase so the URL is permanent (no ephemeral /tmp dependency)
     await progress("Uploading to cloud…");
     previewFiles.set(projectId, persistentPath);
     let publicUrl: string;
     try {
-      const userFolder = await userFolderForId(userId);
       publicUrl = await uploadFile(`${userFolder}/${projectId}/assembled_${Date.now()}.mp4`, persistentPath, "video/mp4");
     } catch (uploadErr) {
       // The assembled video is fine — only the upload step failed. Preserve
       // the file and flip the project to `preview` so the user can retry
       // *just* the upload (POST /api/upload/:projectId) instead of redoing
-      // the entire ffmpeg pipeline. Skip the outer catch's cleanup by
-      // returning early; the finally block still clears tmpDir.
+      // the entire ffmpeg pipeline.
       const message = uploadErr instanceof Error ? uploadErr.message : "Upload failed";
       console.error(`[assemble] ${projectId} upload failed (preview preserved for retry):`, message);
       await supabase.from("projects")
@@ -530,20 +866,50 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
     previewFiles.delete(projectId);
     try { fs.unlinkSync(persistentPath); } catch { /* ignore */ }
 
+    // Successful completion — clear the checkpoint. (R2 _assembly/ stage
+    // objects are left behind; they're small and overwritten by the
+    // next run, or cleaned up by the project-delete folder sweep.)
     await supabase.from("projects")
-      .update({ assembly_status: "done", assembled_url: publicUrl, assembly_progress: null, assembly_error: null, current_state: 15 })
+      .update({
+        assembly_status: "done",
+        assembled_url: publicUrl,
+        assembly_progress: null,
+        assembly_error: null,
+        assembly_checkpoint: null,
+        assembly_stop_requested: false,
+        current_state: 15,
+      })
       .eq("id", projectId);
 
     console.log(`[assemble] ${projectId}: done → ${publicUrl}`);
   } catch (err) {
     const message = err instanceof Error ? err.message : "Assembly failed";
-    console.error(`[assemble] ${projectId} failed:`, message);
-    previewFiles.delete(projectId);
-    try { fs.unlinkSync(path.join(PREVIEW_DIR, `${projectId}.mp4`)); } catch { /* ignore */ }
-    await supabase.from("projects")
-      .update({ assembly_status: "failed", assembly_error: message, assembly_progress: null })
-      .eq("id", projectId);
+    if (message === STOPPED_MARKER) {
+      // User-requested stop — keep the checkpoint so Resume picks up
+      // from the last completed stage. Clear stop_requested so the next
+      // Resume → claim cycle doesn't trip the abort the moment the new
+      // run starts.
+      console.log(`[assemble] ${projectId}: stopped — checkpoint preserved`);
+      await supabase.from("projects")
+        .update({
+          assembly_status: "stopped",
+          assembly_progress: "Stopped — click Resume to continue",
+          assembly_error: null,
+          assembly_stop_requested: false,
+        })
+        .eq("id", projectId);
+    } else {
+      console.error(`[assemble] ${projectId} failed:`, message);
+      previewFiles.delete(projectId);
+      try { fs.unlinkSync(path.join(PREVIEW_DIR, `${projectId}.mp4`)); } catch { /* ignore */ }
+      await supabase.from("projects")
+        .update({ assembly_status: "failed", assembly_error: message, assembly_progress: null })
+        .eq("id", projectId);
+      // Drop checkpoint on real failures so the next attempt starts clean.
+      await clearCheckpoint(projectId).catch(() => {});
+    }
   } finally {
+    clearInterval(stopPoll);
     if (keepAlive) clearInterval(keepAlive);
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
   }
