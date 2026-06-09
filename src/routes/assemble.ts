@@ -10,6 +10,7 @@ import { getAnthropicClient } from "../lib/anthropic.js";
 import fs from "fs";
 import path from "path";
 import os from "os";
+import { createHash } from "crypto";
 
 const _require = createRequire(import.meta.url);
 // eslint-disable-next-line @typescript-eslint/no-require-imports
@@ -327,7 +328,7 @@ function alignBeats(beatTexts: string[], words: TranscriptionWord[], totalDurati
 interface SrtSegment { index: number; start: number; end: number; text: string; }
 interface AssStyle { fontSize: number; alignment: number; marginV: number; primaryColour: string; outlineColour: string; backColour: string; bold: number; borderStyle: number; outline: number; shadow: number; }
 
-type Beat = { beat_number: number; script_segment: string | null; video_url: string | null; image_url: string | null; };
+type Beat = { beat_number: number; script_segment: string | null; video_url: string | null; image_url: string | null; duration_ms?: number | null; };
 
 function buildSrtSegmentsFromBeats(beats: Beat[], durations: number[], wps = 7): SrtSegment[] {
   const segs: SrtSegment[] = []; let cursor = 0;
@@ -552,12 +553,12 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
     await progress("Loading project data…");
 
     const [projectRes, beatsRes] = await Promise.all([
-      supabase.from("projects").select("tts_url, tts_cleaned_url").eq("id", projectId).single(),
-      supabase.from("project_beats").select("beat_number, script_segment, video_url, image_url").eq("project_id", projectId).order("beat_number"),
+      supabase.from("projects").select("tts_url, tts_cleaned_url, beat_timings_voiceover_hash").eq("id", projectId).single(),
+      supabase.from("project_beats").select("beat_number, script_segment, video_url, image_url, duration_ms").eq("project_id", projectId).order("beat_number"),
     ]);
     if (projectRes.error) throw new Error("Project not found");
 
-    const proj = projectRes.data as { tts_url: string | null; tts_cleaned_url: string | null };
+    const proj = projectRes.data as { tts_url: string | null; tts_cleaned_url: string | null; beat_timings_voiceover_hash: string | null };
     const allBeats = (beatsRes.data ?? []) as Beat[];
     const voiceoverUrl = voiceoverType === "original" ? (proj.tts_url ?? proj.tts_cleaned_url) : (proj.tts_cleaned_url ?? proj.tts_url);
     if (!voiceoverUrl) throw new Error("No voiceover found — generate a voiceover on the Generate page first.");
@@ -577,11 +578,37 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
     if (totalDuration <= 0) throw new Error("Could not determine voiceover duration");
     console.log(`[assemble] ${projectId}: voiceover duration = ${totalDuration.toFixed(2)}s`);
 
-    // ── Stage A: transcription ─────────────────────────────────────────
+    // ── Stage A: transcription + beat alignment ────────────────────────
+    //
+    // Three things may need to happen here, each with its own cache:
+    //   1. STT (ElevenLabs) — required for caption text and for
+    //      alignBeats. Cached in the assembly checkpoint so a Resume
+    //      doesn't pay for it twice within the same run.
+    //   2. alignBeats — measures per-beat narration durations.
+    //      Persisted to project_beats.duration_ms so reassemblies of
+    //      the same project (different aspect ratio, captions tweak,
+    //      voiceover trim) skip STT *and* the matcher entirely.
+    //   3. Caption transcription — when captions are enabled the
+    //      assembler still needs word-level timestamps even if
+    //      durations are cached. We re-STT in that case (could be
+    //      cached separately on the project row later).
+    //
+    // Cache invalidation: voiceover URL is hashed; if it differs from
+    // projects.beat_timings_voiceover_hash, stored durations are stale
+    // and a fresh STT+match pass runs. The URL changes on every TTS
+    // regeneration (filename includes a Date.now() timestamp) so the
+    // signal is reliable.
+    const voiceoverHash = createHash("sha256").update(voiceoverUrl).digest("hex");
+    const allBeatsHaveDuration = beats.every((b) => typeof b.duration_ms === "number" && (b.duration_ms ?? 0) > 0);
+    const hashMatches = proj.beat_timings_voiceover_hash === voiceoverHash;
+    const canUseStoredDurations = allBeatsHaveDuration && hashMatches;
+    const needSttForCaptions = captionsEnabled;
+    const needSttForAlignment = !canUseStoredDurations;
+
     let transcriptionWords: TranscriptionWord[] = checkpoint.transcription_words ?? [];
     if (transcriptionWords.length) {
       console.log(`[assemble] ${projectId}: transcription loaded from checkpoint (${transcriptionWords.length} words)`);
-    } else {
+    } else if (needSttForAlignment || needSttForCaptions) {
       await checkStop();
       await progress("Transcribing voiceover…");
       try {
@@ -595,6 +622,8 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
         checkpoint.transcription_words = transcriptionWords;
         await persistCheckpoint();
       }
+    } else {
+      console.log(`[assemble] ${projectId}: skipping STT — beats already aligned and captions disabled`);
     }
     if (transcriptionWords.length) {
       const lastWord = transcriptionWords[transcriptionWords.length - 1];
@@ -602,7 +631,39 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
       console.log(`[assemble] ${projectId}: transcribed ${transcriptionWords.length} words, lastWordEnd = ${lastEnd.toFixed(2)}s (audio is ${totalDuration.toFixed(2)}s; trailing silence ≈ ${(totalDuration - lastEnd).toFixed(2)}s)`);
     }
 
-    const durations = alignBeats(beats.map((b) => b.script_segment ?? ""), transcriptionWords, totalDuration);
+    // Per-beat durations: prefer stored (skips alignBeats entirely),
+    // fall back to running the matcher and persisting the result for
+    // next time.
+    let durations: number[];
+    if (canUseStoredDurations) {
+      durations = beats.map((b) => Math.max(0.5, (b.duration_ms ?? 0) / 1000));
+      console.log(`[assemble] ${projectId}: using stored beat durations (sum=${durations.reduce((s, d) => s + d, 0).toFixed(2)}s, voiceover=${totalDuration.toFixed(2)}s)`);
+    } else {
+      durations = alignBeats(beats.map((b) => b.script_segment ?? ""), transcriptionWords, totalDuration);
+      // Persist newly-measured timings so the next assembly skips this
+      // pass. Best-effort: a DB hiccup here doesn't fail the current
+      // assembly, just means the next one re-measures.
+      try {
+        const updates = beats.map((b, i) => ({
+          beat_number: b.beat_number,
+          duration_ms: Math.round(durations[i] * 1000),
+        }));
+        await Promise.all(updates.map((u) =>
+          supabase
+            .from("project_beats")
+            .update({ duration_ms: u.duration_ms })
+            .eq("project_id", projectId)
+            .eq("beat_number", u.beat_number)
+        ));
+        await supabase
+          .from("projects")
+          .update({ beat_timings_voiceover_hash: voiceoverHash })
+          .eq("id", projectId);
+        console.log(`[assemble] ${projectId}: persisted ${updates.length} beat timings (voiceoverHash=${voiceoverHash.slice(0, 12)}…)`);
+      } catch (e) {
+        console.warn(`[assemble] ${projectId}: failed to persist beat timings — next assembly will re-measure:`, e);
+      }
+    }
 
     // ── Stage B: per-clip normalization → concat → joined.mp4 ───────────
     //
