@@ -252,7 +252,30 @@ function alignBeats(beatTexts: string[], words: TranscriptionWord[], totalDurati
   // Window size scales with the expected per-beat length so a 50-word
   // beat searches ~10 words around its anchor while a 10-word beat
   // only searches ~5. Capped on both sides to avoid degenerate cases.
-  const WINDOW_LEN = 5; // beat-words used as the match window
+  // Wider window (7 vs 5) gives the matcher more disambiguation power
+  // when common starter words (And, The, But, Then) would otherwise
+  // produce false matches in multiple places.
+  const WINDOW_LEN = 7;
+
+  // Pre-compute the inter-word gap *before* each transcription word.
+  // A long preceding gap is a strong "beat could start here" signal —
+  // narrators pause naturally at clause/sentence boundaries, which are
+  // also where the script-segmenter usually drew beat boundaries. We
+  // add this as a small score bonus during matching so an ambiguous
+  // word match (common starter word, low count) doesn't override a
+  // clearly pause-anchored position.
+  //
+  // Tuning: pause windows are calibrated against typical narrator
+  // cadence. <150ms = inter-word, 150–250ms = natural breath,
+  // 250–400ms = clause break, >400ms = strong sentence/topic break.
+  const precedingGapBonus = new Array<number>(words.length).fill(0);
+  for (let i = 1; i < words.length; i++) {
+    const gap = getStart(words[i]) - getEnd(words[i - 1]);
+    if (gap >= 0.40) precedingGapBonus[i] = 1.0;       // strong pause
+    else if (gap >= 0.25) precedingGapBonus[i] = 0.5;  // typical clause break
+    else if (gap >= 0.15) precedingGapBonus[i] = 0.2;  // light pause / breath
+  }
+
   const startIdxs: number[] = [];
   for (let bi = 0; bi < beatTexts.length; bi++) {
     const beatWords = beatTexts[bi].trim().split(/\s+/).filter(Boolean).map(normalizeWord).filter(Boolean);
@@ -268,22 +291,35 @@ function alignBeats(beatTexts: string[], words: TranscriptionWord[], totalDurati
     const searchEnd = Math.min(words.length, expected + slack + 1);
     let bestPos = expected;
     let bestScore = -1;
+    let bestRawMatches = -1;
     let bestDistance = Infinity;
     for (let j = searchStart; j < searchEnd; j++) {
       let m = 0;
       for (let k = 0; k < win.length && j + k < words.length; k++) if (norm[j + k] === win[k]) m++;
-      if (m === 0) continue;
+      // Allow positions with 0 word matches to still be considered —
+      // a strong pause anchor can hint at the right boundary even
+      // when TTS rendered words don't perfectly match the script
+      // (e.g. "$100" → "one hundred dollars").
+      const score = m + (bi > 0 ? precedingGapBonus[j] : 0);
+      if (m === 0 && score === 0) continue;
       const dist = Math.abs(j - expected);
-      if (m > bestScore || (m === bestScore && dist < bestDistance)) {
-        bestScore = m;
+      if (
+        score > bestScore ||
+        (score === bestScore && m > bestRawMatches) ||
+        (score === bestScore && m === bestRawMatches && dist < bestDistance)
+      ) {
+        bestScore = score;
+        bestRawMatches = m;
         bestDistance = dist;
         bestPos = j;
       }
     }
-    // Require at least 2 matching words to trust the match — otherwise
-    // a single common-word hit on the wrong position is worse than the
+    // Require either 2+ raw word matches OR a position carrying a
+    // strong-pause anchor (>=0.5) to trust the match — otherwise a
+    // single common-word hit on the wrong position is worse than the
     // proportional prediction. Clamp to monotonicity bound.
-    if (bestScore < 2) bestPos = Math.max(lowerBound, expected);
+    const trustMatch = bestRawMatches >= 2 || (bestRawMatches >= 1 && bestScore - bestRawMatches >= 0.5);
+    if (!trustMatch) bestPos = Math.max(lowerBound, expected);
     startIdxs.push(Math.min(bestPos, words.length - 1));
   }
   // The true end of speech is the last transcribed word's end time, not the
