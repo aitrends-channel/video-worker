@@ -139,6 +139,47 @@ function concatClips(listFile: string, output: string, signal?: AbortSignal): Pr
   );
 }
 
+// Trim leading + trailing silence from an mp3 without disturbing
+// internal pauses (the breath beats between sentences inside a single
+// clip stay put). This is what removes the ~150–300ms of dead air that
+// ElevenLabs Turbo leaves at the front and back of every render — those
+// pads add up when you concat N beats head-to-tail.
+//
+// Filter graph explanation:
+//   1. silenceremove start_periods=1 start_threshold=-50dB
+//      → drop one block of silence from the head (everything below
+//        -50dBFS until the first non-silent sample).
+//   2. aformat dblp + areverse
+//      → flip the buffer end-to-end so the original tail is now at the
+//        head. silenceremove only trims from the head, so this is how
+//        we reach the trailing silence.
+//   3. silenceremove again with the same params trims the (reversed)
+//      head, which is the original tail.
+//   4. aformat dblp + areverse flips it back to forward time.
+//
+// We re-encode to libmp3lame 128k mono/stereo (matches Turbo's own
+// output) so every trimmed file shares codec + sample rate. That keeps
+// the downstream concatClips() `-c copy` pass valid (no re-encode at
+// the join step → still no audible artifacts at boundaries).
+function trimSilence(input: string, output: string, signal?: AbortSignal): Promise<void> {
+  return ffmpegWithTimeout((cmd) =>
+    cmd
+      .input(input)
+      .audioFilters([
+        "silenceremove=start_periods=1:start_silence=0:start_threshold=-50dB:detection=peak",
+        "aformat=dblp",
+        "areverse",
+        "silenceremove=start_periods=1:start_silence=0:start_threshold=-50dB:detection=peak",
+        "aformat=dblp",
+        "areverse",
+      ])
+      .outputOptions(["-c:a", "libmp3lame", "-b:a", "128k", "-ar", "44100"])
+      .output(output),
+    "trimSilence",
+    signal,
+  );
+}
+
 function mixAudio(video: string, audio: string, output: string, videoDuration: number, signal?: AbortSignal): Promise<void> {
   return ffmpegWithTimeout((cmd) =>
     cmd
@@ -364,7 +405,15 @@ function alignBeats(beatTexts: string[], words: TranscriptionWord[], totalDurati
 interface SrtSegment { index: number; start: number; end: number; text: string; }
 interface AssStyle { fontSize: number; alignment: number; marginV: number; primaryColour: string; outlineColour: string; backColour: string; bold: number; borderStyle: number; outline: number; shadow: number; }
 
-type Beat = { beat_number: number; script_segment: string | null; video_url: string | null; image_url: string | null; duration_ms?: number | null; };
+type Beat = {
+  beat_number: number;
+  script_segment: string | null;
+  video_url: string | null;
+  image_url: string | null;
+  duration_ms?: number | null;
+  voiceover_url?: string | null;
+  voiceover_duration_ms?: number | null;
+};
 
 function buildSrtSegmentsFromBeats(beats: Beat[], durations: number[], wps = 7): SrtSegment[] {
   const segs: SrtSegment[] = []; let cursor = 0;
@@ -590,7 +639,7 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
 
     const [projectRes, beatsRes] = await Promise.all([
       supabase.from("projects").select("tts_url, tts_cleaned_url, beat_timings_voiceover_hash").eq("id", projectId).single(),
-      supabase.from("project_beats").select("beat_number, script_segment, video_url, image_url, duration_ms").eq("project_id", projectId).order("beat_number"),
+      supabase.from("project_beats").select("beat_number, script_segment, video_url, image_url, duration_ms, voiceover_url, voiceover_duration_ms").eq("project_id", projectId).order("beat_number"),
     ]);
     if (projectRes.error) {
       // PostgREST returns specific codes/messages — surfacing them
@@ -604,108 +653,193 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
 
     const proj = projectRes.data as { tts_url: string | null; tts_cleaned_url: string | null; beat_timings_voiceover_hash: string | null };
     const allBeats = (beatsRes.data ?? []) as Beat[];
-    const voiceoverUrl = voiceoverType === "original" ? (proj.tts_url ?? proj.tts_cleaned_url) : (proj.tts_cleaned_url ?? proj.tts_url);
-    if (!voiceoverUrl) throw new Error("No voiceover found — generate a voiceover on the Generate page first.");
     if (!allBeats.length) throw new Error("No beats found in this project.");
 
-    // Include all beats that have either a video clip or an image — skip empty beats
-    const beats = allBeats.filter((beat) => beat.video_url || beat.image_url);
-    if (!beats.length) throw new Error("No images or video clips found — generate images on the Generate page first.");
+    // ── Mode selection ─────────────────────────────────────────────────
+    //
+    // Per-beat mode: ANY beat carries its own voiceover_url. Each
+    // beat's clip duration = its audio file's duration. No STT for
+    // alignment, no alignBeats matcher — there's nothing to align
+    // because the boundaries ARE the audio files. We assemble the
+    // subset of beats that have BOTH a visual and a voiceover. Beats
+    // without a voiceover are dropped, so partial generation runs
+    // (e.g. dev word cap, stopped mid-batch) produce a shorter video
+    // covering only the available audio instead of failing.
+    //
+    // Legacy mode: the project has a single voiceover (tts_url or
+    // tts_cleaned_url) and zero per-beat audio. The assembler runs
+    // STT + the predictive matcher to figure out per-beat durations,
+    // as before. Kept intact for backward compatibility with projects
+    // assembled before migration 045 / the per-beat voiceover feature.
+    const anyVoiceover = allBeats.some((b) => !!b.voiceover_url);
+    const perBeatMode = anyVoiceover;
+
+    // Filter beats per the chosen mode. In per-beat mode we require
+    // BOTH a visual and a voiceover; in legacy mode just a visual.
+    const beats = perBeatMode
+      ? allBeats.filter((b) => (b.video_url || b.image_url) && b.voiceover_url)
+      : allBeats.filter((b) => b.video_url || b.image_url);
+    if (!beats.length) {
+      throw new Error(perBeatMode
+        ? "No beats have both a visual and a voiceover yet — generate at least one beat's voiceover and visual first."
+        : "No images or video clips found — generate images on the Generate page first.");
+    }
     const videoCount = beats.filter((b) => b.video_url).length;
-    console.log(`[assemble] ${projectId}: assembling ${beats.length}/${allBeats.length} beats (${videoCount} video, ${beats.length - videoCount} image)`);
+    const droppedNoVoiceover = perBeatMode
+      ? allBeats.filter((b) => (b.video_url || b.image_url) && !b.voiceover_url).length
+      : 0;
+    console.log(`[assemble] ${projectId}: mode=${perBeatMode ? "per-beat" : "legacy single-voiceover"}, assembling ${beats.length}/${allBeats.length} beats (${videoCount} video, ${beats.length - videoCount} image${droppedNoVoiceover > 0 ? `, ${droppedNoVoiceover} dropped: no voiceover` : ""})`);
 
-    await checkStop();
-    await progress("Downloading voiceover…");
     const voiceoverPath = path.join(tmpDir, "voiceover.mp3");
-    await downloadFile(voiceoverUrl, voiceoverPath);
-    const totalDuration = await getMediaDuration(voiceoverPath);
-    if (totalDuration <= 0) throw new Error("Could not determine voiceover duration");
-    console.log(`[assemble] ${projectId}: voiceover duration = ${totalDuration.toFixed(2)}s`);
+    let totalDuration: number;
+    let durations: number[];
+    let transcriptionWords: TranscriptionWord[] = [];
 
-    // ── Stage A: transcription + beat alignment ────────────────────────
-    //
-    // Three things may need to happen here, each with its own cache:
-    //   1. STT (ElevenLabs) — required for caption text and for
-    //      alignBeats. Cached in the assembly checkpoint so a Resume
-    //      doesn't pay for it twice within the same run.
-    //   2. alignBeats — measures per-beat narration durations.
-    //      Persisted to project_beats.duration_ms so reassemblies of
-    //      the same project (different aspect ratio, captions tweak,
-    //      voiceover trim) skip STT *and* the matcher entirely.
-    //   3. Caption transcription — when captions are enabled the
-    //      assembler still needs word-level timestamps even if
-    //      durations are cached. We re-STT in that case (could be
-    //      cached separately on the project row later).
-    //
-    // Cache invalidation: voiceover URL is hashed; if it differs from
-    // projects.beat_timings_voiceover_hash, stored durations are stale
-    // and a fresh STT+match pass runs. The URL changes on every TTS
-    // regeneration (filename includes a Date.now() timestamp) so the
-    // signal is reliable.
-    const voiceoverHash = createHash("sha256").update(voiceoverUrl).digest("hex");
-    const allBeatsHaveDuration = beats.every((b) => typeof b.duration_ms === "number" && (b.duration_ms ?? 0) > 0);
-    const hashMatches = proj.beat_timings_voiceover_hash === voiceoverHash;
-    const canUseStoredDurations = allBeatsHaveDuration && hashMatches;
-    const needSttForCaptions = captionsEnabled;
-    const needSttForAlignment = !canUseStoredDurations;
-
-    let transcriptionWords: TranscriptionWord[] = checkpoint.transcription_words ?? [];
-    if (transcriptionWords.length) {
-      console.log(`[assemble] ${projectId}: transcription loaded from checkpoint (${transcriptionWords.length} words)`);
-    } else if (needSttForAlignment || needSttForCaptions) {
+    if (perBeatMode) {
+      // ── PER-BEAT PATH ────────────────────────────────────────────────
       await checkStop();
-      await progress("Transcribing voiceover…");
-      try {
-        const { elevenlabs_api_key } = await getSettings(userId);
-        if (!elevenlabs_api_key) throw new Error("ElevenLabs API key not configured.");
-        transcriptionWords = await transcribeAudio(voiceoverPath, elevenlabs_api_key);
-      } catch (e) {
-        console.warn("[assemble] transcription failed, using proportional fallback:", e);
+      await progress(`Downloading ${beats.length} beat voiceovers…`);
+      const rawAudioPaths: string[] = [];
+      for (let i = 0; i < beats.length; i++) {
+        await checkStop();
+        const beat = beats[i];
+        const audioPath = path.join(tmpDir, `audio_${String(i).padStart(3, "0")}.mp3`);
+        await downloadFile(beat.voiceover_url!, audioPath);
+        rawAudioPaths.push(audioPath);
+      }
+
+      // Trim leading + trailing silence on every beat. Each render
+      // ships with ~150-300ms of dead air at start/end that, when
+      // accumulated across the concat, manifests as the audible "short
+      // pauses between beats" the user reported. Internal pauses inside
+      // each clip are preserved.
+      //
+      // Re-measure duration AFTER trim — the persisted
+      // voiceover_duration_ms reflects untrimmed audio so we can't
+      // reuse it for video-clip timing without skew. The trimmed
+      // durations are what the visual timeline must line up against.
+      await checkStop();
+      await progress(`Trimming silence on ${rawAudioPaths.length} clips…`);
+      const audioPaths: string[] = [];
+      const measuredDurations: number[] = [];
+      for (let i = 0; i < rawAudioPaths.length; i++) {
+        await checkStop();
+        const trimmed = path.join(tmpDir, `audio_trim_${String(i).padStart(3, "0")}.mp3`);
+        await trimSilence(rawAudioPaths[i], trimmed, signal);
+        const dur = await getMediaDuration(trimmed);
+        audioPaths.push(trimmed);
+        measuredDurations.push(Math.max(0.1, dur));
+        // Drop the raw download once trimmed.
+        try { fs.unlinkSync(rawAudioPaths[i]); } catch { /* ignore */ }
+      }
+
+      durations = measuredDurations;
+      totalDuration = durations.reduce((s, d) => s + d, 0);
+      console.log(`[assemble] ${projectId}: per-beat trimmed durations sum=${totalDuration.toFixed(2)}s (${durations.length} beats)`);
+
+      // Concatenate per-beat audio into one track for the mix step.
+      // All trimmed files share codec/sample rate (mp3 128k 44.1kHz
+      // from trimSilence), so `-c copy` works cleanly — no re-encode at
+      // the join step means no audible artifacts at boundaries.
+      await checkStop();
+      await progress("Joining per-beat audio…");
+      const audioListPath = path.join(tmpDir, "audio_concat.txt");
+      fs.writeFileSync(audioListPath, audioPaths.map((p) => `file '${p.replace(/\\/g, "/")}'`).join("\n"));
+      await concatClips(audioListPath, voiceoverPath, signal);
+      for (const p of audioPaths) { try { fs.unlinkSync(p); } catch { /* ignore */ } }
+
+      // Captions need word-level timestamps even in per-beat mode.
+      // Run STT on the concatenated audio so caption timings line up
+      // with the final mixed track.
+      if (captionsEnabled) {
+        transcriptionWords = checkpoint.transcription_words ?? [];
+        if (!transcriptionWords.length) {
+          await checkStop();
+          await progress("Transcribing for captions…");
+          try {
+            const { elevenlabs_api_key } = await getSettings(userId);
+            if (!elevenlabs_api_key) throw new Error("ElevenLabs API key not configured.");
+            transcriptionWords = await transcribeAudio(voiceoverPath, elevenlabs_api_key);
+          } catch (e) {
+            console.warn("[assemble] per-beat caption transcription failed:", e);
+          }
+          if (transcriptionWords.length) {
+            checkpoint.transcription_words = transcriptionWords;
+            await persistCheckpoint();
+          }
+        }
+      }
+    } else {
+      // ── LEGACY SINGLE-VOICEOVER PATH ─────────────────────────────────
+      const legacyVoiceoverUrl = voiceoverType === "original" ? (proj.tts_url ?? proj.tts_cleaned_url) : (proj.tts_cleaned_url ?? proj.tts_url);
+      if (!legacyVoiceoverUrl) throw new Error("No voiceover found — either generate a per-beat voiceover on the Voiceover step OR a single voiceover on the legacy Generate flow.");
+
+      await checkStop();
+      await progress("Downloading voiceover…");
+      await downloadFile(legacyVoiceoverUrl, voiceoverPath);
+      totalDuration = await getMediaDuration(voiceoverPath);
+      if (totalDuration <= 0) throw new Error("Could not determine voiceover duration");
+      console.log(`[assemble] ${projectId}: voiceover duration = ${totalDuration.toFixed(2)}s`);
+
+      // Stage A (legacy): STT + alignBeats with hash-based caching.
+      const voiceoverHash = createHash("sha256").update(legacyVoiceoverUrl).digest("hex");
+      const allBeatsHaveDuration = beats.every((b) => typeof b.duration_ms === "number" && (b.duration_ms ?? 0) > 0);
+      const hashMatches = proj.beat_timings_voiceover_hash === voiceoverHash;
+      const canUseStoredDurations = allBeatsHaveDuration && hashMatches;
+      const needSttForCaptions = captionsEnabled;
+      const needSttForAlignment = !canUseStoredDurations;
+
+      transcriptionWords = checkpoint.transcription_words ?? [];
+      if (transcriptionWords.length) {
+        console.log(`[assemble] ${projectId}: transcription loaded from checkpoint (${transcriptionWords.length} words)`);
+      } else if (needSttForAlignment || needSttForCaptions) {
+        await checkStop();
+        await progress("Transcribing voiceover…");
+        try {
+          const { elevenlabs_api_key } = await getSettings(userId);
+          if (!elevenlabs_api_key) throw new Error("ElevenLabs API key not configured.");
+          transcriptionWords = await transcribeAudio(voiceoverPath, elevenlabs_api_key);
+        } catch (e) {
+          console.warn("[assemble] transcription failed, using proportional fallback:", e);
+        }
+        if (transcriptionWords.length) {
+          checkpoint.transcription_words = transcriptionWords;
+          await persistCheckpoint();
+        }
+      } else {
+        console.log(`[assemble] ${projectId}: skipping STT — beats already aligned and captions disabled`);
       }
       if (transcriptionWords.length) {
-        checkpoint.transcription_words = transcriptionWords;
-        await persistCheckpoint();
+        const lastWord = transcriptionWords[transcriptionWords.length - 1];
+        const lastEnd = lastWord.end ?? lastWord.end_time ?? lastWord.start ?? lastWord.start_time ?? 0;
+        console.log(`[assemble] ${projectId}: transcribed ${transcriptionWords.length} words, lastWordEnd = ${lastEnd.toFixed(2)}s (audio is ${totalDuration.toFixed(2)}s; trailing silence ≈ ${(totalDuration - lastEnd).toFixed(2)}s)`);
       }
-    } else {
-      console.log(`[assemble] ${projectId}: skipping STT — beats already aligned and captions disabled`);
-    }
-    if (transcriptionWords.length) {
-      const lastWord = transcriptionWords[transcriptionWords.length - 1];
-      const lastEnd = lastWord.end ?? lastWord.end_time ?? lastWord.start ?? lastWord.start_time ?? 0;
-      console.log(`[assemble] ${projectId}: transcribed ${transcriptionWords.length} words, lastWordEnd = ${lastEnd.toFixed(2)}s (audio is ${totalDuration.toFixed(2)}s; trailing silence ≈ ${(totalDuration - lastEnd).toFixed(2)}s)`);
-    }
 
-    // Per-beat durations: prefer stored (skips alignBeats entirely),
-    // fall back to running the matcher and persisting the result for
-    // next time.
-    let durations: number[];
-    if (canUseStoredDurations) {
-      durations = beats.map((b) => Math.max(0.5, (b.duration_ms ?? 0) / 1000));
-      console.log(`[assemble] ${projectId}: using stored beat durations (sum=${durations.reduce((s, d) => s + d, 0).toFixed(2)}s, voiceover=${totalDuration.toFixed(2)}s)`);
-    } else {
-      durations = alignBeats(beats.map((b) => b.script_segment ?? ""), transcriptionWords, totalDuration);
-      // Persist newly-measured timings so the next assembly skips this
-      // pass. Best-effort: a DB hiccup here doesn't fail the current
-      // assembly, just means the next one re-measures.
-      try {
-        const updates = beats.map((b, i) => ({
-          beat_number: b.beat_number,
-          duration_ms: Math.round(durations[i] * 1000),
-        }));
-        await Promise.all(updates.map((u) =>
-          supabase
-            .from("project_beats")
-            .update({ duration_ms: u.duration_ms })
-            .eq("project_id", projectId)
-            .eq("beat_number", u.beat_number)
-        ));
-        await supabase
-          .from("projects")
-          .update({ beat_timings_voiceover_hash: voiceoverHash })
-          .eq("id", projectId);
-        console.log(`[assemble] ${projectId}: persisted ${updates.length} beat timings (voiceoverHash=${voiceoverHash.slice(0, 12)}…)`);
-      } catch (e) {
-        console.warn(`[assemble] ${projectId}: failed to persist beat timings — next assembly will re-measure:`, e);
+      if (canUseStoredDurations) {
+        durations = beats.map((b) => Math.max(0.5, (b.duration_ms ?? 0) / 1000));
+        console.log(`[assemble] ${projectId}: using stored beat durations (sum=${durations.reduce((s, d) => s + d, 0).toFixed(2)}s, voiceover=${totalDuration.toFixed(2)}s)`);
+      } else {
+        durations = alignBeats(beats.map((b) => b.script_segment ?? ""), transcriptionWords, totalDuration);
+        try {
+          const updates = beats.map((b, i) => ({
+            beat_number: b.beat_number,
+            duration_ms: Math.round(durations[i] * 1000),
+          }));
+          await Promise.all(updates.map((u) =>
+            supabase
+              .from("project_beats")
+              .update({ duration_ms: u.duration_ms })
+              .eq("project_id", projectId)
+              .eq("beat_number", u.beat_number)
+          ));
+          await supabase
+            .from("projects")
+            .update({ beat_timings_voiceover_hash: voiceoverHash })
+            .eq("id", projectId);
+          console.log(`[assemble] ${projectId}: persisted ${updates.length} beat timings (voiceoverHash=${voiceoverHash.slice(0, 12)}…)`);
+        } catch (e) {
+          console.warn(`[assemble] ${projectId}: failed to persist beat timings — next assembly will re-measure:`, e);
+        }
       }
     }
 
