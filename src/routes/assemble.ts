@@ -526,7 +526,11 @@ function hashString(s: string): string {
 }
 
 function coreHash(opts: AssembleOptions): string {
-  return hashString(`${opts.aspectRatio}|${opts.voiceoverType}`);
+  // trimSilenceEnabled changes the audio track contents, so it has to
+  // be in the core hash — toggling it invalidates everything from the
+  // mix step down. Aspect ratio and voiceoverType already covered the
+  // core but didn't anticipate the silence-trim flag.
+  return hashString(`${opts.aspectRatio}|${opts.voiceoverType}|${opts.trimSilenceEnabled ? "trim" : "raw"}`);
 }
 
 function captionsHash(opts: AssembleOptions): string {
@@ -556,10 +560,15 @@ async function isStopRequested(projectId: string): Promise<boolean> {
 interface AssembleOptions {
   userId: string; projectId: string; aspectRatio: string; voiceoverType: "cleaned" | "original";
   captionsEnabled: boolean; captionsLanguage: string; captionsStyle: string; captionsSize: string; captionsPosition: string;
+  // When true, run the per-beat trimSilence pass before concat. Off by
+  // default so a normal Assemble produces audio identical to the source
+  // beats. Toggled on by the assemble page's dedicated "Trim silences"
+  // button — the user opts in explicitly.
+  trimSilenceEnabled: boolean;
 }
 
 async function runAssembly(opts: AssembleOptions): Promise<void> {
-  const { userId, projectId, aspectRatio, voiceoverType, captionsEnabled, captionsLanguage, captionsStyle, captionsSize, captionsPosition } = opts;
+  const { userId, projectId, aspectRatio, voiceoverType, captionsEnabled, captionsLanguage, captionsStyle, captionsSize, captionsPosition, trimSilenceEnabled } = opts;
   const [w, h] = aspectRatio === "9:16" ? [480, 854] : aspectRatio === "1:1" ? [480, 480] : [854, 480];
 
   const progress = (msg: string) => {
@@ -708,34 +717,46 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
         rawAudioPaths.push(audioPath);
       }
 
-      // Trim leading + trailing silence on every beat. Each render
-      // ships with ~150-300ms of dead air at start/end that, when
-      // accumulated across the concat, manifests as the audible "short
-      // pauses between beats" the user reported. Internal pauses inside
-      // each clip are preserved.
+      // Optional per-beat silence trim. Off by default — only runs
+      // when the user clicked "Trim silences" on the assemble page,
+      // which sets trimSilenceEnabled=true. Each render normally ships
+      // with ~150-300ms of dead air at start/end; trimming removes
+      // those pads so the concat doesn't accumulate inter-beat pauses.
+      // Internal pauses inside each clip are preserved either way.
       //
-      // Re-measure duration AFTER trim — the persisted
-      // voiceover_duration_ms reflects untrimmed audio so we can't
-      // reuse it for video-clip timing without skew. The trimmed
-      // durations are what the visual timeline must line up against.
-      await checkStop();
-      await progress(`Trimming silence on ${rawAudioPaths.length} clips…`);
+      // Even when trim is off we still need a per-beat duration to
+      // anchor the visual timeline. With trim on, the persisted
+      // voiceover_duration_ms is wrong (it describes untrimmed audio),
+      // so re-measure via ffprobe on the trimmed file. With trim off,
+      // prefer the cached value when present to save the ffprobe call.
       const audioPaths: string[] = [];
       const measuredDurations: number[] = [];
-      for (let i = 0; i < rawAudioPaths.length; i++) {
+      if (trimSilenceEnabled) {
         await checkStop();
-        const trimmed = path.join(tmpDir, `audio_trim_${String(i).padStart(3, "0")}.mp3`);
-        await trimSilence(rawAudioPaths[i], trimmed, signal);
-        const dur = await getMediaDuration(trimmed);
-        audioPaths.push(trimmed);
-        measuredDurations.push(Math.max(0.1, dur));
-        // Drop the raw download once trimmed.
-        try { fs.unlinkSync(rawAudioPaths[i]); } catch { /* ignore */ }
+        await progress(`Trimming silence on ${rawAudioPaths.length} clips…`);
+        for (let i = 0; i < rawAudioPaths.length; i++) {
+          await checkStop();
+          const trimmed = path.join(tmpDir, `audio_trim_${String(i).padStart(3, "0")}.mp3`);
+          await trimSilence(rawAudioPaths[i], trimmed, signal);
+          const dur = await getMediaDuration(trimmed);
+          audioPaths.push(trimmed);
+          measuredDurations.push(Math.max(0.1, dur));
+          try { fs.unlinkSync(rawAudioPaths[i]); } catch { /* ignore */ }
+        }
+      } else {
+        for (let i = 0; i < rawAudioPaths.length; i++) {
+          await checkStop();
+          const beat = beats[i];
+          let dur = beat.voiceover_duration_ms ? beat.voiceover_duration_ms / 1000 : 0;
+          if (!dur || dur <= 0) dur = await getMediaDuration(rawAudioPaths[i]);
+          audioPaths.push(rawAudioPaths[i]);
+          measuredDurations.push(Math.max(0.1, dur));
+        }
       }
 
       durations = measuredDurations;
       totalDuration = durations.reduce((s, d) => s + d, 0);
-      console.log(`[assemble] ${projectId}: per-beat trimmed durations sum=${totalDuration.toFixed(2)}s (${durations.length} beats)`);
+      console.log(`[assemble] ${projectId}: per-beat durations sum=${totalDuration.toFixed(2)}s (${durations.length} beats, trim=${trimSilenceEnabled ? "on" : "off"})`);
 
       // Concatenate per-beat audio into one track for the mix step.
       // All trimmed files share codec/sample rate (mp3 128k 44.1kHz
@@ -1195,6 +1216,7 @@ async function assemblyPollLoop() {
             captionsStyle: (opts.captionsStyle as string | undefined) ?? "default",
             captionsSize: (opts.captionsSize as string | undefined) ?? "medium",
             captionsPosition: (opts.captionsPosition as string | undefined) ?? "bottom",
+            trimSilenceEnabled: (opts.trimSilenceEnabled as boolean | undefined) ?? false,
           }).finally(() => {
             assemblingProjects.delete(projectId);
             redis.del(`assembly:${projectId}`).catch(() => {});
@@ -1311,10 +1333,12 @@ export function setupAssembleRoute(app: Express): void {
     const { token, projectId, aspectRatio = "16:9", voiceoverType = "cleaned",
       captionsEnabled = false, captionsLanguage = "source",
       captionsStyle = "classic", captionsSize = "medium", captionsPosition = "bottom",
+      trimSilenceEnabled = false,
     } = req.body as {
       token: string; projectId: string; aspectRatio?: string; voiceoverType?: "cleaned" | "original";
       captionsEnabled?: boolean; captionsLanguage?: string;
       captionsStyle?: string; captionsSize?: string; captionsPosition?: string;
+      trimSilenceEnabled?: boolean;
     };
 
     if (!token) { res.status(401).json({ error: "Unauthorized" }); return; }
@@ -1347,6 +1371,7 @@ export function setupAssembleRoute(app: Express): void {
     // Fire and forget — no SSE, no long-lived connection
     runAssembly({ userId: user.id, projectId, aspectRatio, voiceoverType: voiceoverType as "cleaned" | "original",
       captionsEnabled: Boolean(captionsEnabled), captionsLanguage, captionsStyle, captionsSize, captionsPosition,
+      trimSilenceEnabled: Boolean(trimSilenceEnabled),
     }).catch(console.error).finally(() => assemblingProjects.delete(projectId));
 
     res.json({ started: true });
