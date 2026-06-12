@@ -1383,6 +1383,7 @@ async function assemblyPollLoop() {
           if (!claimed) continue;
 
           const opts = (await redis.get(`assembly:${projectId}`) as Record<string, unknown> | null) ?? {};
+          console.log(`[assembly-queue] ${projectId}: opts from redis = bgm=${JSON.stringify(opts.backgroundMusicUrl)} vol=${JSON.stringify(opts.backgroundMusicVolume)} logo=${JSON.stringify(opts.logoUrl)} logoXY=${JSON.stringify(opts.logoX)},${JSON.stringify(opts.logoY)} logoSize=${JSON.stringify(opts.logoSize)} keys=[${Object.keys(opts).join(",")}]`);
 
           assemblingProjects.add(projectId);
           runAssembly({
