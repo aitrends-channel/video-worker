@@ -180,15 +180,74 @@ function trimSilence(input: string, output: string, signal?: AbortSignal): Promi
   );
 }
 
-function mixAudio(video: string, audio: string, output: string, videoDuration: number, signal?: AbortSignal): Promise<void> {
+function mixAudio(
+  video: string,
+  audio: string,
+  output: string,
+  videoDuration: number,
+  signal?: AbortSignal,
+  bgm?: { path: string; volume: number } | null,
+): Promise<void> {
+  return ffmpegWithTimeout((cmd) => {
+    cmd.input(video).inputOptions(["-fflags", "+genpts"]);
+    cmd.input(audio);
+    if (bgm) {
+      // Three inputs: video, voiceover (1), bgm (2). -stream_loop -1
+      // on the bgm input loops the file indefinitely so a short
+      // music track fills the entire voiceover duration instead of
+      // dropping out mid-narration. amix duration=first caps the
+      // combined output to the voiceover length so the looped bgm
+      // never trails past the end. volume=`bgm.volume` keeps music
+      // well under the dialog (default 0.15 ≈ -16 dB, classic
+      // "podcast bed" level).
+      cmd.input(bgm.path).inputOptions(["-stream_loop", "-1"]);
+      cmd.complexFilter([
+        `[2:a]volume=${bgm.volume}[bgmDucked]`,
+        `[1:a][bgmDucked]amix=inputs=2:duration=first:dropout_transition=0[mix]`,
+      ]);
+      cmd.outputOptions(["-map", "0:v", "-map", "[mix]", "-c:v", "copy", "-c:a", "aac", "-t", String(videoDuration)]);
+    } else {
+      cmd.outputOptions(["-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-t", String(videoDuration)]);
+    }
+    // +faststart skipped: on constrained disk it can corrupt the moov atom; range-request serving handles moov-at-end fine
+    return cmd.output(output);
+  }, "audio mix", signal);
+}
+
+// Composite a logo image onto the video. Re-encodes the video stream
+// (overlay filter requires it). Audio is stream-copied so this stage
+// is roughly half the cost of caption burning. Position + size are
+// percentages of the video dimensions so the same logoX/logoY values
+// work across resolution presets.
+function overlayLogo(
+  video: string,
+  logoPath: string,
+  output: string,
+  videoW: number,
+  videoH: number,
+  logoSizePct: number, // 0–1, width of logo as fraction of video width
+  logoX: number,        // 0–1, top-left x as fraction of video width
+  logoY: number,        // 0–1, top-left y as fraction of video height
+  signal?: AbortSignal,
+): Promise<void> {
+  // Logo render width in px, rounded to even (h264 requires even
+  // dimensions). h=-2 keeps the aspect ratio while also snapping to
+  // an even number. Clamp to a sensible min/max so a degenerate
+  // 0% or 100% doesn't break ffmpeg.
+  const logoW = Math.max(8, Math.min(videoW, Math.round(videoW * logoSizePct / 2) * 2));
+  const x = Math.round(videoW * logoX);
+  const y = Math.round(videoH * logoY);
   return ffmpegWithTimeout((cmd) =>
     cmd
-      .input(video).inputOptions(["-fflags", "+genpts"])
-      .input(audio)
-      // +faststart skipped: on constrained disk it can corrupt the moov atom; range-request serving handles moov-at-end fine
-      .outputOptions(["-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-t", String(videoDuration)])
+      .input(video)
+      .input(logoPath)
+      .complexFilter([
+        `[1:v]scale=w=${logoW}:h=-2[logo]`,
+        `[0:v][logo]overlay=x=${x}:y=${y}:format=auto[v]`,
+      ])
+      .outputOptions(["-map", "[v]", "-map", "0:a?", "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "copy", "-movflags", "+faststart"])
       .output(output),
-    "audio mix",
+    "overlayLogo",
     signal,
   );
 }
@@ -530,7 +589,21 @@ function coreHash(opts: AssembleOptions): string {
   // be in the core hash — toggling it invalidates everything from the
   // mix step down. Aspect ratio and voiceoverType already covered the
   // core but didn't anticipate the silence-trim flag.
-  return hashString(`${opts.aspectRatio}|${opts.voiceoverType}|${opts.trimSilenceEnabled ? "trim" : "raw"}`);
+  // Background music is also part of the audio mix, so a change
+  // (different file or different volume) must blow away the mixed
+  // checkpoint.
+  const bgmKey = opts.backgroundMusicUrl
+    ? `${opts.backgroundMusicUrl}@${opts.backgroundMusicVolume ?? 0.15}`
+    : "nobgm";
+  // resolution changes the dimensions every clip is encoded at, so it
+  // must invalidate the entire checkpoint chain from normalizeClip
+  // forward.
+  // Logo properties go into the core hash too — changing the file,
+  // position, or size invalidates the post-mix overlay output.
+  const logoKey = opts.logoUrl
+    ? `${opts.logoUrl}@${opts.logoSize ?? 0.1}x${opts.logoX ?? 0.85},${opts.logoY ?? 0.05}`
+    : "nologo";
+  return hashString(`${opts.aspectRatio}|${opts.voiceoverType}|${opts.trimSilenceEnabled ? "trim" : "raw"}|${bgmKey}|${opts.resolution ?? "1080p"}|${logoKey}`);
 }
 
 function captionsHash(opts: AssembleOptions): string {
@@ -557,6 +630,8 @@ async function isStopRequested(projectId: string): Promise<boolean> {
 
 // ── Background assembly job ───────────────────────────────────────────────────
 
+type ResolutionPreset = "720p" | "1080p" | "1440p" | "2160p";
+
 interface AssembleOptions {
   userId: string; projectId: string; aspectRatio: string; voiceoverType: "cleaned" | "original";
   captionsEnabled: boolean; captionsLanguage: string; captionsStyle: string; captionsSize: string; captionsPosition: string;
@@ -565,11 +640,45 @@ interface AssembleOptions {
   // beats. Toggled on by the assemble page's dedicated "Trim silences"
   // button — the user opts in explicitly.
   trimSilenceEnabled: boolean;
+  // Optional background music. When present, the file at this URL is
+  // downloaded and mixed under the voiceover at the given volume (0–1,
+  // default 0.15). The mix duration matches the voiceover so the track
+  // never extends past the narration. Empty/undefined disables bgm.
+  backgroundMusicUrl?: string | null;
+  backgroundMusicVolume?: number;
+  // Render resolution preset. Drives the [w, h] passed to normalizeClip
+  // for every per-beat clip. Defaults to "1080p" (1920×1080 for 16:9).
+  // Picked from the assemble page; backwards compat with the old
+  // hardcoded 480p when undefined keeps existing in-flight runs sane.
+  resolution?: ResolutionPreset;
+  // Optional channel logo overlay. URL is the user-uploaded logo
+  // image; position is the top-left corner as a fraction of video
+  // dimensions (0–1); size is the logo width as a fraction of video
+  // width. All three are needed to render the overlay — null/undefined
+  // disables it.
+  logoUrl?: string | null;
+  logoX?: number;
+  logoY?: number;
+  logoSize?: number;
+}
+
+// Aspect-ratio-aware dimensions for a resolution preset. The number
+// stays the "short side" for vertical (9:16) so the user gets a
+// portrait video at the expected total pixels (e.g. 1080p portrait =
+// 1080×1920 like TikTok/Reels), and the "long side" for 16:9 so 1080p
+// horizontal = 1920×1080 like YouTube. Square keeps it on both axes.
+function dimsFor(aspect: string, preset: ResolutionPreset | undefined): [number, number] {
+  const map = { "720p": { long: 1280, short: 720 }, "1080p": { long: 1920, short: 1080 }, "1440p": { long: 2560, short: 1440 }, "2160p": { long: 3840, short: 2160 } } as const;
+  const { long, short } = map[preset ?? "1080p"];
+  if (aspect === "9:16") return [short, long];
+  if (aspect === "1:1") return [short, short];
+  return [long, short]; // 16:9 default
 }
 
 async function runAssembly(opts: AssembleOptions): Promise<void> {
-  const { userId, projectId, aspectRatio, voiceoverType, captionsEnabled, captionsLanguage, captionsStyle, captionsSize, captionsPosition, trimSilenceEnabled } = opts;
-  const [w, h] = aspectRatio === "9:16" ? [480, 854] : aspectRatio === "1:1" ? [480, 480] : [854, 480];
+  const { userId, projectId, aspectRatio, voiceoverType, captionsEnabled, captionsLanguage, captionsStyle, captionsSize, captionsPosition, trimSilenceEnabled, backgroundMusicUrl, backgroundMusicVolume, resolution, logoUrl, logoX, logoY, logoSize } = opts;
+  const [w, h] = dimsFor(aspectRatio, resolution);
+  console.log(`[assemble] ${projectId}: resolution=${resolution ?? "1080p"} dims=${w}x${h}`);
 
   const progress = (msg: string) => {
     console.log(`[assemble] ${projectId}: ${msg}`);
@@ -1023,19 +1132,89 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
         }
       }
       await checkStop();
-      await progress("Mixing voiceover…");
+      // Download the user's background music to a local temp file if
+      // one was provided. Failure here logs and disables bgm rather
+      // than failing the entire mix — the assembly still succeeds with
+      // voiceover-only audio so the user doesn't lose progress over a
+      // music-file outage.
+      let bgmPath: string | null = null;
+      let bgmVolume = backgroundMusicVolume ?? 0.15;
+      // Clamp volume to a sensible range so an accidental >1 doesn't
+      // produce a wall-of-music clip and a negative doesn't crash.
+      if (bgmVolume < 0) bgmVolume = 0;
+      if (bgmVolume > 1) bgmVolume = 1;
+      if (backgroundMusicUrl) {
+        try {
+          await progress("Downloading background music…");
+          bgmPath = path.join(tmpDir, "bgm.mp3");
+          await downloadFile(backgroundMusicUrl, bgmPath);
+        } catch (e) {
+          console.warn(`[assemble] bgm download failed, continuing without music:`, e);
+          bgmPath = null;
+        }
+      }
+      await progress(bgmPath ? "Mixing voiceover + music…" : "Mixing voiceover…");
       // Cap at totalDuration (voiceover length). The pad step above
       // ensures the video is at least totalDuration when there's
       // significant trailing silence; the cap also trims any tiny
       // encoding-rounding overshoot.
-      await mixAudio(mixSrc, voiceoverPath, outputPath, totalDuration, signal);
+      await mixAudio(
+        mixSrc,
+        voiceoverPath,
+        outputPath,
+        totalDuration,
+        signal,
+        bgmPath ? { path: bgmPath, volume: bgmVolume } : null,
+      );
       try { fs.unlinkSync(mixSrc); } catch { /* ignore */ }
+      if (bgmPath) { try { fs.unlinkSync(bgmPath); } catch { /* ignore */ } }
       try {
         const mixedUrl = await uploadFile(ckptPathFor("mixed.mp4"), outputPath, "video/mp4");
         checkpoint.mixed_url = mixedUrl;
         await persistCheckpoint();
       } catch (e) {
         console.warn(`[assemble] mixed.mp4 checkpoint upload failed:`, e);
+      }
+    }
+
+    // ── Stage D.5: overlay channel logo (optional) ────────────────────
+    // Re-encodes the video stream once with the logo composited at the
+    // configured position + size. Audio is stream-copied so this is
+    // ~half the cost of caption burning. Runs before captions so the
+    // caption text stays drawn on top of the logo (avoids the logo
+    // ever obscuring captions if the user happens to place it in the
+    // caption gutter).
+    if (logoUrl) {
+      await checkStop();
+      let logoPath: string | null = null;
+      try {
+        await progress("Downloading channel logo…");
+        logoPath = path.join(tmpDir, "logo");
+        await downloadFile(logoUrl, logoPath);
+      } catch (e) {
+        console.warn(`[assemble] logo download failed, skipping overlay:`, e);
+        logoPath = null;
+      }
+      if (logoPath) {
+        await checkStop();
+        await progress("Overlaying logo…");
+        const overlaidPath = path.join(tmpDir, "logoed.mp4");
+        await overlayLogo(
+          outputPath,
+          logoPath,
+          overlaidPath,
+          w,
+          h,
+          typeof logoSize === "number" ? logoSize : 0.1,
+          typeof logoX === "number" ? logoX : 0.85,
+          typeof logoY === "number" ? logoY : 0.05,
+          signal,
+        );
+        try { fs.unlinkSync(outputPath); } catch { /* ignore */ }
+        try { fs.unlinkSync(logoPath); } catch { /* ignore */ }
+        // Swap outputPath under the caption stage so it picks up the
+        // logoed file as its input without further branching.
+        fs.renameSync(overlaidPath, outputPath);
       }
     }
 
@@ -1217,6 +1396,13 @@ async function assemblyPollLoop() {
             captionsSize: (opts.captionsSize as string | undefined) ?? "medium",
             captionsPosition: (opts.captionsPosition as string | undefined) ?? "bottom",
             trimSilenceEnabled: (opts.trimSilenceEnabled as boolean | undefined) ?? false,
+            backgroundMusicUrl: (opts.backgroundMusicUrl as string | undefined) ?? null,
+            backgroundMusicVolume: (opts.backgroundMusicVolume as number | undefined) ?? 0.15,
+            resolution: (opts.resolution as ResolutionPreset | undefined) ?? "1080p",
+            logoUrl: (opts.logoUrl as string | undefined) ?? null,
+            logoX: (opts.logoX as number | undefined) ?? 0.85,
+            logoY: (opts.logoY as number | undefined) ?? 0.05,
+            logoSize: (opts.logoSize as number | undefined) ?? 0.1,
           }).finally(() => {
             assemblingProjects.delete(projectId);
             redis.del(`assembly:${projectId}`).catch(() => {});
@@ -1334,11 +1520,25 @@ export function setupAssembleRoute(app: Express): void {
       captionsEnabled = false, captionsLanguage = "source",
       captionsStyle = "classic", captionsSize = "medium", captionsPosition = "bottom",
       trimSilenceEnabled = false,
+      backgroundMusicUrl = null,
+      backgroundMusicVolume = 0.15,
+      resolution = "1080p",
+      logoUrl = null,
+      logoX = 0.85,
+      logoY = 0.05,
+      logoSize = 0.1,
     } = req.body as {
       token: string; projectId: string; aspectRatio?: string; voiceoverType?: "cleaned" | "original";
       captionsEnabled?: boolean; captionsLanguage?: string;
       captionsStyle?: string; captionsSize?: string; captionsPosition?: string;
       trimSilenceEnabled?: boolean;
+      backgroundMusicUrl?: string | null;
+      backgroundMusicVolume?: number;
+      resolution?: ResolutionPreset;
+      logoUrl?: string | null;
+      logoX?: number;
+      logoY?: number;
+      logoSize?: number;
     };
 
     if (!token) { res.status(401).json({ error: "Unauthorized" }); return; }
@@ -1372,6 +1572,13 @@ export function setupAssembleRoute(app: Express): void {
     runAssembly({ userId: user.id, projectId, aspectRatio, voiceoverType: voiceoverType as "cleaned" | "original",
       captionsEnabled: Boolean(captionsEnabled), captionsLanguage, captionsStyle, captionsSize, captionsPosition,
       trimSilenceEnabled: Boolean(trimSilenceEnabled),
+      backgroundMusicUrl,
+      backgroundMusicVolume: typeof backgroundMusicVolume === "number" ? backgroundMusicVolume : 0.15,
+      resolution,
+      logoUrl,
+      logoX: typeof logoX === "number" ? logoX : 0.85,
+      logoY: typeof logoY === "number" ? logoY : 0.05,
+      logoSize: typeof logoSize === "number" ? logoSize : 0.1,
     }).catch(console.error).finally(() => assemblingProjects.delete(projectId));
 
     res.json({ started: true });
