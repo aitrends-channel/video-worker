@@ -95,7 +95,13 @@ async function processBeat(beat: QueuedBeat) {
   if (!videoUrl) throw new Error("Video generation timed out after 20 minutes");
 
   const userFolder = await userFolderForId(userId);
-  const storagePath = `${userFolder}/${projectId}/videos/beat-${beatNumber}.mp4`;
+  // Timestamp in the key guarantees every render produces a unique
+  // URL — without it, browsers + CDNs cache the OLD render against the
+  // same URL and the user sees stale content when a re-queued beat
+  // finishes. Same pattern as the image route's beat-N_TS.png keys.
+  // The engine's /api/generate/videos route deletes the prior R2
+  // object by URL before queueing the new job so storage stays bounded.
+  const storagePath = `${userFolder}/${projectId}/videos/beat-${beatNumber}_${Date.now()}.mp4`;
   const publicUrl = await uploadFromUrl(storagePath, videoUrl, "video/mp4");
   console.log(`[worker] Uploaded: ${publicUrl}`);
 
