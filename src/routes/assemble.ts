@@ -1539,6 +1539,7 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
         assembly_error: null,
         assembly_checkpoint: null,
         assembly_stop_requested: false,
+        assembly_finished_at: new Date().toISOString(),
         current_state: 15,
       })
       .eq("id", projectId);
@@ -1558,6 +1559,7 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
           assembly_progress: "Stopped — click Resume to continue",
           assembly_error: null,
           assembly_stop_requested: false,
+          assembly_finished_at: new Date().toISOString(),
         })
         .eq("id", projectId);
     } else {
@@ -1565,7 +1567,12 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
       previewFiles.delete(projectId);
       try { fs.unlinkSync(path.join(PREVIEW_DIR, `${projectId}.mp4`)); } catch { /* ignore */ }
       await supabase.from("projects")
-        .update({ assembly_status: "failed", assembly_error: message, assembly_progress: null })
+        .update({
+          assembly_status: "failed",
+          assembly_error: message,
+          assembly_progress: null,
+          assembly_finished_at: new Date().toISOString(),
+        })
         .eq("id", projectId);
       // Drop checkpoint on real failures so the next attempt starts clean.
       await clearCheckpoint(projectId).catch(() => {});
@@ -1642,10 +1649,20 @@ async function assemblyPollLoop() {
           // Skip if it's already in flight (race between fetch + claim).
           if (assemblingProjects.has(projectId)) continue;
 
-          // Atomic claim
+          // Atomic claim. assembly_started_at is stamped here so the
+          // duration we compute later reflects wall-clock from worker
+          // pickup — not from the user's click (which sat in the
+          // queue waiting for a free slot). assembly_finished_at is
+          // cleared so a Resume after a Stop doesn't carry a stale
+          // finish stamp from the prior attempt.
           const { data: claimed } = await supabase
             .from("projects")
-            .update({ assembly_status: "processing", assembly_progress: "Starting…" })
+            .update({
+              assembly_status: "processing",
+              assembly_progress: "Starting…",
+              assembly_started_at: new Date().toISOString(),
+              assembly_finished_at: null,
+            })
             .eq("id", projectId)
             .eq("assembly_status", "queued")
             .select("id")
@@ -1833,9 +1850,17 @@ export function setupAssembleRoute(app: Express): void {
       return;
     }
 
-    // Mark as processing immediately so the client sees state change on next poll
+    // Mark as processing immediately so the client sees state change on next poll.
+    // assembly_started_at / _finished_at maintained the same way as the
+    // queue claim site for consistent analytics across both entry paths.
     await supabase.from("projects")
-      .update({ assembly_status: "processing", assembly_progress: "Starting…", assembly_error: null })
+      .update({
+        assembly_status: "processing",
+        assembly_progress: "Starting…",
+        assembly_error: null,
+        assembly_started_at: new Date().toISOString(),
+        assembly_finished_at: null,
+      })
       .eq("id", projectId).eq("user_id", user.id);
 
     assemblingProjects.add(projectId);
