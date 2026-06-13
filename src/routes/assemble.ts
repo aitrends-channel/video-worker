@@ -116,14 +116,80 @@ function ffmpegWithTimeout(
   });
 }
 
-function normalizeClip(src: string, isImage: boolean, duration: number, output: string, w: number, h: number, signal?: AbortSignal): Promise<void> {
-  const vf = `scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2:black,fps=24`;
+export type LogoOverlay = {
+  logoPath: string;
+  sizePct: number; // 0–1, logo width as fraction of video width
+  xPct: number;    // 0–1, top-left x as fraction of video width
+  yPct: number;    // 0–1, top-left y as fraction of video height
+};
+
+function normalizeClip(
+  src: string,
+  isImage: boolean,
+  duration: number,
+  output: string,
+  w: number,
+  h: number,
+  logoOverlay: LogoOverlay | null,
+  subtitles: { assPath: string } | null,
+  signal?: AbortSignal,
+): Promise<void> {
+  const baseFilter = `scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2:black,fps=24`;
+  const assFilter = subtitles ? `ass=${escapeAssPath(subtitles.assPath)}` : null;
+  // Preset/CRF depends on whether this is now the FINAL encoder pass.
+  //   - subtitles=null: the clip is intermediate — concatClips uses
+  //     `-c copy` and the mix step also stream-copies the video, so
+  //     the current ultrafast/crf 28 stands as the output the user
+  //     sees. Keep it fast.
+  //   - subtitles=set: captions are baked in here instead of in a
+  //     downstream full-video burn pass. That burn pass used
+  //     veryfast/crf 23 — match it so captioned final-quality is
+  //     identical to the old pipeline. The +CPU cost per beat is
+  //     dwarfed by the eliminated whole-video re-encode.
+  const preset = subtitles ? "veryfast" : "ultrafast";
+  const crf = subtitles ? "23" : "28";
+
   return ffmpegWithTimeout((cmd) => {
     if (isImage) cmd.input(src).inputOptions(["-loop", "1"]);
     else cmd.input(src).inputOptions(["-stream_loop", "-1"]);
-    return cmd
-      .outputOptions(["-t", String(duration), "-vf", vf, "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-an", "-pix_fmt", "yuv420p"])
-      .output(output);
+
+    if (logoOverlay) {
+      // Composite the logo during the same encode pass that's
+      // already happening for each clip — eliminates the separate
+      // full-video re-encode we used to do downstream. The encoder
+      // is the dominant cost; adding the overlay filter is ~free.
+      // When subtitles are also baked in, append the ass filter
+      // *after* the logo overlay so captions render on top of the
+      // composited frame, not under the logo.
+      const logoW = Math.max(8, Math.min(w, Math.round((w * logoOverlay.sizePct) / 2) * 2));
+      const x = Math.round(w * logoOverlay.xPct);
+      const y = Math.round(h * logoOverlay.yPct);
+      const overlayLabel = assFilter ? "[premix]" : "[v]";
+      const graph: string[] = [
+        `[0:v]${baseFilter}[base]`,
+        `[1:v]scale=w=${logoW}:h=-2[logo]`,
+        `[base][logo]overlay=x=${x}:y=${y}:format=auto${overlayLabel}`,
+      ];
+      if (assFilter) graph.push(`[premix]${assFilter}[v]`);
+      cmd.input(logoOverlay.logoPath)
+        .complexFilter(graph)
+        .outputOptions([
+          "-map", "[v]",
+          "-t", String(duration),
+          "-c:v", "libx264", "-preset", preset, "-crf", crf,
+          "-an", "-pix_fmt", "yuv420p",
+        ]);
+    } else {
+      const vf = assFilter ? `${baseFilter},${assFilter}` : baseFilter;
+      cmd.outputOptions([
+        "-t", String(duration),
+        "-vf", vf,
+        "-c:v", "libx264", "-preset", preset, "-crf", crf,
+        "-an", "-pix_fmt", "yuv420p",
+      ]);
+    }
+
+    return cmd.output(output);
   }, `normalizeClip`, signal);
 }
 
@@ -212,58 +278,6 @@ function mixAudio(
     // +faststart skipped: on constrained disk it can corrupt the moov atom; range-request serving handles moov-at-end fine
     return cmd.output(output);
   }, "audio mix", signal);
-}
-
-// Composite a logo image onto the video. Re-encodes the video stream
-// (overlay filter requires it). Audio is stream-copied so this stage
-// is roughly half the cost of caption burning. Position + size are
-// percentages of the video dimensions so the same logoX/logoY values
-// work across resolution presets.
-function overlayLogo(
-  video: string,
-  logoPath: string,
-  output: string,
-  videoW: number,
-  videoH: number,
-  logoSizePct: number, // 0–1, width of logo as fraction of video width
-  logoX: number,        // 0–1, top-left x as fraction of video width
-  logoY: number,        // 0–1, top-left y as fraction of video height
-  signal?: AbortSignal,
-): Promise<void> {
-  // Logo render width in px, rounded to even (h264 requires even
-  // dimensions). h=-2 keeps the aspect ratio while also snapping to
-  // an even number. Clamp to a sensible min/max so a degenerate
-  // 0% or 100% doesn't break ffmpeg.
-  const logoW = Math.max(8, Math.min(videoW, Math.round(videoW * logoSizePct / 2) * 2));
-  const x = Math.round(videoW * logoX);
-  const y = Math.round(videoH * logoY);
-  return ffmpegWithTimeout((cmd) =>
-    cmd
-      .input(video)
-      .input(logoPath)
-      .complexFilter([
-        `[1:v]scale=w=${logoW}:h=-2[logo]`,
-        `[0:v][logo]overlay=x=${x}:y=${y}:format=auto[v]`,
-      ])
-      .outputOptions(["-map", "[v]", "-map", "0:a?", "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "copy", "-movflags", "+faststart"])
-      .output(output),
-    "overlayLogo",
-    signal,
-  );
-}
-
-function burnSubtitles(video: string, assPath: string, output: string, signal?: AbortSignal): Promise<void> {
-  // Escape backslashes and colons for ffmpeg filtergraph syntax (no shell quoting needed)
-  const escaped = assPath.replace(/\\/g, "/").replace(/:/g, "\\:");
-  return ffmpegWithTimeout((cmd) =>
-    cmd
-      .input(video)
-      // "veryfast" cuts burn time ~2x vs "fast" on Render's shared CPU,
-      // at the cost of ~15-20% larger output. Captions are a re-encode
-      // pass so we trade size for staying under the timeout ceiling.
-      .outputOptions(["-vf", `ass=${escaped}`, "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "copy", "-movflags", "+faststart"])
-      .output(output),
-  "burnSubtitles", signal);
 }
 
 // ── Transcription ─────────────────────────────────────────────────────────────
@@ -527,6 +541,37 @@ function writeAss(segs: SrtSegment[], s: AssStyle, w: number, h: number, file: s
     `[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n${dlg}`, "utf-8");
 }
 
+// Escape an ASS subtitle file path for ffmpeg's filtergraph syntax.
+// Backslashes become forward slashes (Windows compatibility) and
+// colons get escaped so ffmpeg doesn't read the rest of the path as
+// filter options. Used by both the per-clip normalizeClip caption
+// bake-in and (historically) the standalone burn pass.
+function escapeAssPath(p: string): string {
+  return p.replace(/\\/g, "/").replace(/:/g, "\\:");
+}
+
+// Slice the absolute-timeline segment list down to a single beat's
+// window and re-base timings to be beat-relative. The per-beat
+// normalizeClip pass burns captions directly into each clip; each
+// beat needs only the segments that fall (or partially fall) within
+// its [beatStart, beatStart + duration) window, with start/end
+// shifted by -beatStart and clipped to [0, duration]. Segments that
+// span beat boundaries are sliced into both beats so the caption
+// text appears continuously across the concat boundary.
+function sliceSegmentsForBeat(segs: SrtSegment[], beatStart: number, duration: number): SrtSegment[] {
+  const beatEnd = beatStart + duration;
+  const out: SrtSegment[] = [];
+  for (const seg of segs) {
+    if (seg.end <= beatStart || seg.start >= beatEnd) continue;
+    const start = Math.max(seg.start, beatStart) - beatStart;
+    const end = Math.min(seg.end, beatEnd) - beatStart;
+    if (end > start) {
+      out.push({ index: out.length + 1, start, end, text: seg.text });
+    }
+  }
+  return out;
+}
+
 async function translateSegments(segs: SrtSegment[], lang: string, anthropic: Anthropic): Promise<SrtSegment[]> {
   if (!segs.length) return segs;
   const numbered = segs.map((s) => `${s.index}. ${s.text}`).join("\n");
@@ -566,6 +611,16 @@ async function translateSegments(segs: SrtSegment[], lang: string, anthropic: An
 interface AssemblyCheckpoint {
   core_hash: string;
   captions_hash: string;
+  // True when the per-beat clips in clip_urls had captions baked into
+  // their normalizeClip pass (the new pipeline). Compared against
+  // the current run's captionsEnabled at load — a mismatch (caption
+  // state flipped, or style changed) invalidates clip_urls and every
+  // visuals stage downstream, because the cached clips' caption
+  // layer (or its absence) won't match what this run wants. Old
+  // checkpoints written before this field existed read as undefined
+  // → falsy, which is the right default for projects that pre-date
+  // the bake-in path.
+  clips_baked_captions?: boolean;
   transcription_words?: TranscriptionWord[];
   clip_urls?: (string | null)[];
   joined_url?: string;
@@ -727,10 +782,31 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
   {
     const loaded = await loadCheckpoint(projectId);
     if (loaded && loaded.core_hash === currentCoreHash) {
-      if (loaded.captions_hash === currentCaptionsHash) {
+      const prevBaked = !!loaded.clips_baked_captions;
+      const captionsMatch = loaded.captions_hash === currentCaptionsHash && prevBaked === captionsEnabled;
+      if (captionsMatch) {
         checkpoint = loaded;
+      } else if (captionsEnabled || prevBaked) {
+        // Captions are now baked into per-beat normalizeClip passes
+        // (instead of a downstream burn). So any change to caption
+        // state — toggling on/off or restyling — invalidates every
+        // cached clip and everything downstream. Keep just the audio
+        // side: transcription_words is style-independent and
+        // expensive to redo. The new run will re-encode clips with
+        // the right (or no) caption layer.
+        console.log(`[assemble] ${projectId}: caption state changed (baked=${prevBaked}→${captionsEnabled}, hash=${loaded.captions_hash}→${currentCaptionsHash}) — discarding visuals checkpoint`);
+        checkpoint = {
+          core_hash: loaded.core_hash,
+          captions_hash: currentCaptionsHash,
+          transcription_words: loaded.transcription_words,
+        };
       } else {
-        console.log(`[assemble] ${projectId}: captions opts changed — discarding captioned_url`);
+        // captionsEnabled=false on both sides — nothing was baked in
+        // either way. Only the standalone captioned_url would have
+        // been affected, but that no longer exists on this path.
+        // Old checkpoints with a captioned_url field are tolerated
+        // (the field just goes unused).
+        console.log(`[assemble] ${projectId}: captions opts changed (off→off) — checkpoint usable as-is`);
         checkpoint = { ...loaded, captions_hash: currentCaptionsHash, captioned_url: undefined };
       }
     } else {
@@ -973,6 +1049,48 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
       }
     }
 
+    // Captions: build the segment list ONCE here, then bake a per-beat
+    // slice into each clip's normalizeClip pass below. This replaces
+    // the old downstream burnSubtitles full-video re-encode — the
+    // encoder is already running per beat for scale/pad/logo, so
+    // adding the ass filter is essentially free. Translation also
+    // runs once at this point so every per-beat slice carries
+    // pre-translated text.
+    //
+    // The base segment list comes from STT word timings when
+    // available (most accurate) or proportional segmentation of each
+    // beat's script_segment as a fallback (when STT silently failed).
+    // The fallback path used to live inside the burn block; moving it
+    // up here means a missing STT no longer surfaces as a late
+    // "captions disabled" surprise.
+    let baseCaptionSegs: SrtSegment[] = [];
+    if (captionsEnabled) {
+      const raw = transcriptionWords.length > 0
+        ? buildSrtSegments(transcriptionWords)
+        : buildSrtSegmentsFromBeats(beats, durations);
+      if (!raw.length) {
+        throw new Error("No caption segments could be generated — check that beats have script text");
+      }
+      if (captionsLanguage !== "source") {
+        await checkStop();
+        await progress(`Translating captions to ${captionsLanguage}…`);
+        const anthropic = await getAnthropicClient(userId);
+        baseCaptionSegs = await translateSegments(raw, captionsLanguage, anthropic);
+      } else {
+        baseCaptionSegs = raw;
+      }
+      console.log(`[assemble] ${projectId}: prepared ${baseCaptionSegs.length} caption segments to bake into per-beat clips`);
+    }
+
+    // Cumulative start time of each beat in the master timeline,
+    // computed once from durations[] so the per-beat slicer doesn't
+    // re-sum on every loop iteration. cumulativeStarts[i] is the
+    // offset where beat i's clip begins after concat.
+    const cumulativeStarts: number[] = new Array(beats.length).fill(0);
+    for (let i = 1; i < beats.length; i++) {
+      cumulativeStarts[i] = cumulativeStarts[i - 1] + durations[i - 1];
+    }
+
     // ── Stage B: per-clip normalization → concat → joined.mp4 ───────────
     //
     // Each clip is uploaded to R2 after encoding (checkpoint.clip_urls[i])
@@ -980,8 +1098,38 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
     // re-download cached clips instead of re-encoding them.
     if (!checkpoint.joined_url) {
       checkpoint.clip_urls = checkpoint.clip_urls ?? new Array(beats.length).fill(null);
+      // Stamp the bake-in mode on the checkpoint so the loader can
+      // detect a state flip on a future Resume (e.g. user disabled
+      // captions after a Stop). Set BEFORE the worker pool launches
+      // because individual clip uploads persistCheckpoint as they
+      // finish and we want this flag to land with the first clip.
+      checkpoint.clips_baked_captions = captionsEnabled;
       const clipPaths: string[] = new Array(beats.length).fill("");
       await progress("Processing video clips…");
+
+      // Download the channel logo once so every clip in the worker
+      // pool can read it. Baking the overlay into the per-clip
+      // encode here replaces the old Stage D.5 full-video re-encode.
+      // The coreHash already includes logoKey, so any cached clips
+      // we restore from checkpoint were encoded with the same logo
+      // settings — no risk of mixing logoed/non-logoed clips.
+      let stageBLogoOverlay: LogoOverlay | null = null;
+      if (logoUrl) {
+        await checkStop();
+        await progress("Downloading channel logo…");
+        const logoPath = path.join(tmpDir, "logo");
+        try {
+          await downloadFile(logoUrl, logoPath);
+          stageBLogoOverlay = {
+            logoPath,
+            sizePct: typeof logoSize === "number" ? logoSize : 0.1,
+            xPct:    typeof logoX === "number"    ? logoX    : 0.85,
+            yPct:    typeof logoY === "number"    ? logoY    : 0.05,
+          };
+        } catch (e) {
+          console.warn(`[assemble] logo download failed, encoding clips without overlay:`, e);
+        }
+      }
 
       // Worker-pool over the beat list. Each worker pulls the next
       // un-claimed index, processes it independently, then loops back
@@ -1008,6 +1156,22 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
           }
         }
         const beat = beats[i];
+        // Captions bake-in: slice the master segment list to this
+        // beat's [beatStart, beatStart + duration) window, shift to
+        // beat-relative timings, and write a per-beat ASS file.
+        // normalizeClip will inject `ass=<path>` into its filter
+        // chain so captions land on the clip as part of the same
+        // encoder pass that's already doing scale/pad/logo. Empty
+        // slices (no captions in this beat's window) just write an
+        // events-less ASS file — ffmpeg renders no overlay text but
+        // the filter is still invoked harmlessly.
+        let beatSubtitles: { assPath: string } | null = null;
+        if (captionsEnabled && baseCaptionSegs.length > 0) {
+          const beatSegs = sliceSegmentsForBeat(baseCaptionSegs, cumulativeStarts[i], durations[i]);
+          const assPath = path.join(tmpDir, `captions_${String(i).padStart(3, "0")}.ass`);
+          writeAss(beatSegs, buildAssStyle(captionsStyle, captionsSize, captionsPosition, h), w, h, assPath);
+          beatSubtitles = { assPath };
+        }
         try {
           if (beat.video_url) {
             const ext = beat.video_url.includes(".webm") ? "webm" : "mp4";
@@ -1015,7 +1179,7 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
             console.log(`[assemble] beat ${beat.beat_number}: downloading video…`);
             await downloadFile(beat.video_url, src);
             console.log(`[assemble] beat ${beat.beat_number}: encoding clip…`);
-            await normalizeClip(src, false, durations[i], clipPath, w, h, signal);
+            await normalizeClip(src, false, durations[i], clipPath, w, h, stageBLogoOverlay, beatSubtitles, signal);
             try { fs.unlinkSync(src); } catch { /* ignore */ }
           } else if (beat.image_url) {
             const ext = beat.image_url.toLowerCase().includes(".png") ? "png" : "jpg";
@@ -1023,9 +1187,10 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
             console.log(`[assemble] beat ${beat.beat_number}: downloading image…`);
             await downloadFile(beat.image_url, src);
             console.log(`[assemble] beat ${beat.beat_number}: encoding clip…`);
-            await normalizeClip(src, true, durations[i], clipPath, w, h, signal);
+            await normalizeClip(src, true, durations[i], clipPath, w, h, stageBLogoOverlay, beatSubtitles, signal);
             try { fs.unlinkSync(src); } catch { /* ignore */ }
           }
+          if (beatSubtitles) { try { fs.unlinkSync(beatSubtitles.assPath); } catch { /* ignore */ } }
           // Upload the normalized clip so a future Stop can resume past it.
           try {
             const clipUrl = await uploadFile(ckptPathFor(`clip_${String(i).padStart(3, "0")}.mp4`), clipPath, "video/mp4");
@@ -1071,6 +1236,12 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
 
       await Promise.all(Array.from({ length: beatLimit }, () => beatWorker()));
       if (firstError) throw firstError;
+
+      // Logo was baked into each clip; the source file isn't needed
+      // for any later stage.
+      if (stageBLogoOverlay) {
+        try { fs.unlinkSync(stageBLogoOverlay.logoPath); } catch { /* ignore */ }
+      }
 
       await checkStop();
       await progress("Joining clips…");
@@ -1214,89 +1385,21 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
       }
     }
 
-    // ── Stage D.5: overlay channel logo (optional) ────────────────────
-    // Re-encodes the video stream once with the logo composited at the
-    // configured position + size. Audio is stream-copied so this is
-    // ~half the cost of caption burning. Runs before captions so the
-    // caption text stays drawn on top of the logo (avoids the logo
-    // ever obscuring captions if the user happens to place it in the
-    // caption gutter).
-    if (logoUrl) {
-      await checkStop();
-      let logoPath: string | null = null;
-      try {
-        await progress("Downloading channel logo…");
-        logoPath = path.join(tmpDir, "logo");
-        await downloadFile(logoUrl, logoPath);
-      } catch (e) {
-        console.warn(`[assemble] logo download failed, skipping overlay:`, e);
-        logoPath = null;
-      }
-      if (logoPath) {
-        await checkStop();
-        await progress("Overlaying logo…");
-        const overlaidPath = path.join(tmpDir, "logoed.mp4");
-        await overlayLogo(
-          outputPath,
-          logoPath,
-          overlaidPath,
-          w,
-          h,
-          typeof logoSize === "number" ? logoSize : 0.1,
-          typeof logoX === "number" ? logoX : 0.85,
-          typeof logoY === "number" ? logoY : 0.05,
-          signal,
-        );
-        try { fs.unlinkSync(outputPath); } catch { /* ignore */ }
-        try { fs.unlinkSync(logoPath); } catch { /* ignore */ }
-        // Swap outputPath under the caption stage so it picks up the
-        // logoed file as its input without further branching.
-        fs.renameSync(overlaidPath, outputPath);
-      }
-    }
-
-    // ── Stage E: burn captions → captioned.mp4 (optional) ────────────────
-    let finalPath = outputPath;
-    if (captionsEnabled) {
-      if (checkpoint.captioned_url) {
-        await checkStop();
-        await progress("Restoring captioned video…");
-        const cached = path.join(tmpDir, "captioned.mp4");
-        await downloadFile(checkpoint.captioned_url, cached);
-        try { fs.unlinkSync(outputPath); } catch { /* ignore */ }
-        finalPath = cached;
-      } else {
-        await checkStop();
-        await progress("Generating captions…");
-        let segs = transcriptionWords.length > 0 ? buildSrtSegments(transcriptionWords) : buildSrtSegmentsFromBeats(beats, durations);
-        console.log(`[assemble] ${projectId}: ${segs.length} caption segments`);
-        if (!segs.length) throw new Error("No caption segments could be generated — check that beats have script text");
-        if (captionsLanguage !== "source") {
-          await progress(`Translating captions to ${captionsLanguage}…`);
-          const anthropic = await getAnthropicClient(userId);
-          segs = await translateSegments(segs, captionsLanguage, anthropic);
-        }
-        const assPath = path.join(tmpDir, "captions.ass");
-        writeAss(segs, buildAssStyle(captionsStyle, captionsSize, captionsPosition, h), w, h, assPath);
-        console.log(`[assemble] ${projectId}: ASS file written → ${assPath}`);
-        await checkStop();
-        await progress("Burning captions…");
-        const captionedPath = path.join(tmpDir, "captioned.mp4");
-        await burnSubtitles(outputPath, assPath, captionedPath, signal);
-        try { fs.unlinkSync(outputPath); } catch { /* ignore */ }
-        finalPath = captionedPath;
-        console.log(`[assemble] ${projectId}: captions burned`);
-        try {
-          const captionedUrl = await uploadFile(ckptPathFor("captioned.mp4"), captionedPath, "video/mp4");
-          checkpoint.captioned_url = captionedUrl;
-          await persistCheckpoint();
-        } catch (e) {
-          console.warn(`[assemble] captioned.mp4 checkpoint upload failed:`, e);
-        }
-      }
-    }
+    // Stage D.5 (full-video logo re-encode) used to live here. It was
+    // replaced by baking the logo into the per-clip Stage B encode —
+    // saves a full-video re-encode pass on every assembly.
+    //
+    // Stage E (standalone burnSubtitles full-video re-encode) used to
+    // run here too. Captions are now baked into each beat's
+    // normalizeClip pass (Stage B) so the mixAudio output already
+    // carries the burned-in caption layer. Eliminating the second
+    // whole-video re-encode saves several minutes on long captioned
+    // projects. The fallback path through buildSrtSegmentsFromBeats
+    // and the translation step were moved upstream too — see the
+    // baseCaptionSegs block above Stage B.
 
     // ── Stage F: validate + remux + upload final ────────────────────────
+    const finalPath = outputPath;
     const finalStat = fs.statSync(finalPath);
     console.log(`[assemble] ${projectId}: final file size = ${finalStat.size} bytes`);
     if (finalStat.size < 1024) throw new Error(`Assembly produced an invalid output (${finalStat.size} bytes) — ffmpeg may have failed silently`);
