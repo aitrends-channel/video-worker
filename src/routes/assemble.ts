@@ -1132,12 +1132,37 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
       checkpoint.clip_urls = checkpoint.clip_urls ?? new Array(beats.length).fill(null);
       // Stamp the bake-in mode on the checkpoint so the loader can
       // detect a state flip on a future Resume (e.g. user disabled
-      // captions after a Stop). Set BEFORE the worker pool launches
-      // because individual clip uploads persistCheckpoint as they
-      // finish and we want this flag to land with the first clip.
+      // captions after a Stop). Persist BEFORE the worker pool
+      // launches — clip uploads are fire-and-forget below, so the
+      // first one's checkpoint write isn't guaranteed to land before
+      // a Stop arrives. This explicit upfront persist closes that
+      // window and only costs one DB write.
       checkpoint.clips_baked_captions = captionsEnabled;
+      await persistCheckpoint();
       const clipPaths: string[] = new Array(beats.length).fill("");
       await progress("Processing video clips…");
+
+      // Fire-and-forget machinery for the per-clip R2 upload + the
+      // checkpoint persist that follows it. Workers used to block on
+      // the R2 round-trip (~200-800ms each) before returning to the
+      // pool — for a 100-beat project that was 30-80s of upload
+      // latency the encoder was idle on. Hand the upload to a
+      // background promise instead, and drain any still-in-flight
+      // ones at the post-pool sync point below.
+      //
+      // persistChain serializes the checkpoint writes so two
+      // concurrent uploads can't race: without it, persist A could
+      // serialize its JSON payload (containing url-A), then persist
+      // B writes (containing both A + B), then persist A's HTTP
+      // request lands AFTER B's, clobbering B's url. The chain
+      // forces them through one at a time even when many uploads
+      // finish back-to-back.
+      const pendingClipUploads = new Set<Promise<void>>();
+      let persistChain: Promise<void> = Promise.resolve();
+      const persistSerial = (): Promise<void> => {
+        persistChain = persistChain.then(persistCheckpoint, persistCheckpoint);
+        return persistChain;
+      };
 
       // Download the channel logo once so every clip in the worker
       // pool can read it. Baking the overlay into the per-clip
@@ -1223,16 +1248,27 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
             try { fs.unlinkSync(src); } catch { /* ignore */ }
           }
           if (beatSubtitles) { try { fs.unlinkSync(beatSubtitles.assPath); } catch { /* ignore */ } }
-          // Upload the normalized clip so a future Stop can resume past it.
-          try {
-            const clipUrl = await uploadFile(ckptPathFor(`clip_${String(i).padStart(3, "0")}.mp4`), clipPath, "video/mp4");
-            checkpoint.clip_urls![i] = clipUrl;
-            await persistCheckpoint();
-          } catch (uploadErr) {
-            console.warn(`[assemble] beat ${beat.beat_number}: clip checkpoint upload failed:`, uploadErr);
-            // Not fatal — we just lose the resume guarantee for this clip.
-          }
-          console.log(`[assemble] beat ${beat.beat_number}: done`);
+          // Fire-and-forget the clip upload (and the serialized
+          // checkpoint persist that follows) so this worker is free
+          // to grab the next beat immediately instead of stalling on
+          // R2 latency. See pendingClipUploads block above for the
+          // design notes. The drain at the end of Stage B awaits any
+          // still-pending uploads before concat unlinks the local
+          // files.
+          const uploadPromise = (async () => {
+            try {
+              const clipUrl = await uploadFile(ckptPathFor(`clip_${String(i).padStart(3, "0")}.mp4`), clipPath, "video/mp4");
+              checkpoint.clip_urls![i] = clipUrl;
+              await persistSerial();
+            } catch (uploadErr) {
+              console.warn(`[assemble] beat ${beat.beat_number}: clip checkpoint upload failed:`, uploadErr);
+              // Not fatal — we just lose the resume guarantee for
+              // this clip. Worker has already returned by this point.
+            }
+          })();
+          pendingClipUploads.add(uploadPromise);
+          void uploadPromise.finally(() => { pendingClipUploads.delete(uploadPromise); });
+          console.log(`[assemble] beat ${beat.beat_number}: encode done (upload in flight)`);
           clipPaths[i] = clipPath;
         } catch (e) {
           if (e instanceof Error && e.message === STOPPED_MARKER) throw e;
@@ -1267,6 +1303,21 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
       };
 
       await Promise.all(Array.from({ length: beatLimit }, () => beatWorker()));
+
+      // Drain pending fire-and-forget clip uploads BEFORE either
+      // throwing (Stop case) or moving on to concat. Two reasons:
+      //   1. Checkpoint must reflect work that actually landed in
+      //      R2, otherwise a Resume re-encodes clips we paid for.
+      //   2. concat unlinks each clipPath after reading the concat
+      //      list — an upload still reading the file at that point
+      //      would fail and leave the checkpoint stale.
+      // allSettled is defensive: uploadPromise catches its own
+      // errors (so it never rejects today), but allSettled keeps
+      // the drain working if that ever changes.
+      if (pendingClipUploads.size > 0) {
+        await progress(`Finalizing ${pendingClipUploads.size} clip checkpoints…`);
+        await Promise.allSettled([...pendingClipUploads]);
+      }
       if (firstError) throw firstError;
 
       // Logo was baked into each clip; the source file isn't needed
