@@ -982,23 +982,32 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
       checkpoint.clip_urls = checkpoint.clip_urls ?? new Array(beats.length).fill(null);
       const clipPaths: string[] = new Array(beats.length).fill("");
       await progress("Processing video clips…");
-      for (let i = 0; i < beats.length; i++) {
-        await checkStop();
+
+      // Worker-pool over the beat list. Each worker pulls the next
+      // un-claimed index, processes it independently, then loops back
+      // for more. clipPaths[]/checkpoint.clip_urls[] are indexed by
+      // beat position so there are no inter-worker write conflicts.
+      // STOPPED_MARKER propagates via firstError so all in-flight
+      // workers bail at the next iteration.
+      const beatLimit = Math.max(1, Math.min(getAssemblyBeatLimit(), beats.length));
+      let nextIdx = 0;
+      let completed = 0;
+      let firstError: Error | null = null;
+
+      const processOne = async (i: number): Promise<void> => {
         const clipPath = path.join(tmpDir, `clip_${String(i).padStart(3, "0")}.mp4`);
-        const cached = checkpoint.clip_urls[i];
+        const cached = checkpoint.clip_urls![i];
         if (cached) {
-          await progress(`Restoring clip ${i + 1} of ${beats.length}…`);
           try {
             await downloadFile(cached, clipPath);
             clipPaths[i] = clipPath;
-            continue;
+            return;
           } catch (e) {
             console.warn(`[assemble] beat ${beats[i].beat_number}: cached clip download failed, re-encoding:`, e);
             // fall through to fresh encode
           }
         }
         const beat = beats[i];
-        await progress(`Processing clip ${i + 1} of ${beats.length}…`);
         try {
           if (beat.video_url) {
             const ext = beat.video_url.includes(".webm") ? "webm" : "mp4";
@@ -1020,7 +1029,7 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
           // Upload the normalized clip so a future Stop can resume past it.
           try {
             const clipUrl = await uploadFile(ckptPathFor(`clip_${String(i).padStart(3, "0")}.mp4`), clipPath, "video/mp4");
-            checkpoint.clip_urls[i] = clipUrl;
+            checkpoint.clip_urls![i] = clipUrl;
             await persistCheckpoint();
           } catch (uploadErr) {
             console.warn(`[assemble] beat ${beat.beat_number}: clip checkpoint upload failed:`, uploadErr);
@@ -1033,7 +1042,35 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
           console.error(`[assemble] beat ${beats[i].beat_number} skipped:`, e);
           // leave clipPaths[i] as "" — filtered out of concat below
         }
-      }
+      };
+
+      const beatWorker = async (): Promise<void> => {
+        while (true) {
+          if (firstError) return;
+          const i = nextIdx++;
+          if (i >= beats.length) return;
+          try {
+            await checkStop();
+            await processOne(i);
+          } catch (e) {
+            if (e instanceof Error && (e.message === STOPPED_MARKER || /stop/i.test(e.message))) {
+              if (!firstError) firstError = e;
+              return;
+            }
+            // processOne already swallows non-stop errors per-beat;
+            // anything that bubbles here is a stop signal.
+            if (!firstError) firstError = e instanceof Error ? e : new Error(String(e));
+            return;
+          }
+          completed++;
+          if (beats.length > 0) {
+            await progress(`Processed ${completed} of ${beats.length} clips…`);
+          }
+        }
+      };
+
+      await Promise.all(Array.from({ length: beatLimit }, () => beatWorker()));
+      if (firstError) throw firstError;
 
       await checkStop();
       await progress("Joining clips…");
@@ -1356,20 +1393,68 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
 
 // ── Assembly queue poll loop ──────────────────────────────────────────────────
 
+// Admin-tunable concurrency for the assembly worker. Read from
+// product_config.badged_processes every ~30s so the dashboard can
+// raise/lower these without restarting the worker.
+//   assemblyProjectLimit  → how many whole assemblies run in parallel
+//   assemblyBeatLimit     → parallel beats per assembly (Stage B) —
+//                           consumed inside runAssembly via getAssemblyBeatLimit()
+let assemblyProjectLimit = 1;
+let assemblyBeatLimit = 1;
+
+export function getAssemblyBeatLimit(): number {
+  return assemblyBeatLimit;
+}
+
+async function refreshAssemblyConcurrency(): Promise<void> {
+  try {
+    const { data } = await supabase
+      .from("product_config")
+      .select("badged_processes")
+      .eq("service", "_global")
+      .single();
+    const cfg = (data as { badged_processes?: { assembly_projects?: unknown; assembly_beats?: unknown } } | null)?.badged_processes;
+    const projRaw = cfg?.assembly_projects;
+    const beatRaw = cfg?.assembly_beats;
+    const proj = typeof projRaw === "number" ? projRaw : Number(projRaw);
+    const beat = typeof beatRaw === "number" ? beatRaw : Number(beatRaw);
+    if (Number.isInteger(proj) && proj >= 1 && proj <= 5 && proj !== assemblyProjectLimit) {
+      console.log(`[assembly-queue] project limit changed: ${assemblyProjectLimit} → ${proj}`);
+      assemblyProjectLimit = proj;
+    }
+    if (Number.isInteger(beat) && beat >= 1 && beat <= 10 && beat !== assemblyBeatLimit) {
+      console.log(`[assembly-queue] beat limit changed: ${assemblyBeatLimit} → ${beat}`);
+      assemblyBeatLimit = beat;
+    }
+  } catch (err) {
+    console.warn("[assembly-queue] Failed to refresh concurrency from product_config:", err instanceof Error ? err.message : err);
+  }
+}
+
 async function assemblyPollLoop() {
-  console.log("[assembly-queue] poll loop started");
+  await refreshAssemblyConcurrency();
+  console.log(`[assembly-queue] poll loop started (projects=${assemblyProjectLimit}, beats=${assemblyBeatLimit})`);
+  let ticks = 0;
   while (true) {
     try {
-      if (assemblingProjects.size === 0) {
+      // Re-read admin knobs every ~30s (6 ticks × 5s) so changes propagate
+      // without a worker restart.
+      if (ticks++ % 6 === 0) await refreshAssemblyConcurrency();
+
+      const slots = assemblyProjectLimit - assemblingProjects.size;
+      if (slots > 0) {
         const { data: rows } = await supabase
           .from("projects")
           .select("id, user_id")
           .eq("assembly_status", "queued")
-          .limit(1);
+          .limit(slots);
 
         for (const row of rows ?? []) {
           const projectId = row.id as string;
           const userId = row.user_id as string;
+
+          // Skip if it's already in flight (race between fetch + claim).
+          if (assemblingProjects.has(projectId)) continue;
 
           // Atomic claim
           const { data: claimed } = await supabase

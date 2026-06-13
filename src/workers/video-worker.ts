@@ -17,11 +17,37 @@ interface QueuedBeat {
   user_id: string;
 }
 
-const CONCURRENCY = 3;
+// Default concurrency cap. The actual value is sourced from
+// product_config._global.badged_processes.video_worker on each poll
+// tick so the admin can tune it from the dashboard without a restart.
+// We keep a constant default to fall back to if the DB read fails.
+const DEFAULT_CONCURRENCY = 3;
+let concurrency = DEFAULT_CONCURRENCY;
 const POLL_INTERVAL_MS = 5000;
 const CREDITS_RETRY_MS = 5 * 60 * 1000; // retry after 5 minutes
 let activeJobs = 0;
 let creditsExhaustedAt: number | null = null;
+
+async function refreshConcurrency(): Promise<void> {
+  try {
+    const { data } = await supabase
+      .from("product_config")
+      .select("badged_processes")
+      .eq("service", "_global")
+      .single();
+    const raw = (data as { badged_processes?: { video_worker?: unknown } } | null)
+      ?.badged_processes?.video_worker;
+    const n = typeof raw === "number" ? raw : Number(raw);
+    if (Number.isInteger(n) && n >= 1 && n <= 50) {
+      if (n !== concurrency) {
+        console.log(`[worker] Concurrency changed: ${concurrency} → ${n}`);
+        concurrency = n;
+      }
+    }
+  } catch (err) {
+    console.warn("[worker] Failed to refresh concurrency from product_config:", err instanceof Error ? err.message : err);
+  }
+}
 
 async function failAllQueued(errorMessage: string) {
   const { error } = await supabase
@@ -138,10 +164,15 @@ async function tryClaimBeat(beat: QueuedBeat): Promise<boolean> {
 }
 
 async function pollLoop() {
-  console.log(`[worker] Supabase-polling worker started (concurrency: ${CONCURRENCY})`);
+  await refreshConcurrency();
+  console.log(`[worker] Supabase-polling worker started (concurrency: ${concurrency})`);
+  let ticks = 0;
   while (true) {
     try {
-      const slots = CONCURRENCY - activeJobs;
+      // Re-read the admin-tunable concurrency every ~30s (6 ticks at
+      // 5s/tick) so the worker picks up changes without a restart.
+      if (ticks++ % 6 === 0) await refreshConcurrency();
+      const slots = concurrency - activeJobs;
       if (creditsExhaustedAt !== null) {
         if (Date.now() - creditsExhaustedAt < CREDITS_RETRY_MS) {
           await sleep(POLL_INTERVAL_MS);
