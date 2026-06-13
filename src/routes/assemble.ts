@@ -891,17 +891,18 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
 
     if (perBeatMode) {
       // ── PER-BEAT PATH ────────────────────────────────────────────────
-      await checkStop();
-      await progress(`Downloading ${beats.length} beat voiceovers…`);
-      const rawAudioPaths: string[] = [];
-      for (let i = 0; i < beats.length; i++) {
-        await checkStop();
-        const beat = beats[i];
-        const audioPath = path.join(tmpDir, `audio_${String(i).padStart(3, "0")}.mp3`);
-        await downloadFile(beat.voiceover_url!, audioPath);
-        rawAudioPaths.push(audioPath);
-      }
-
+      //
+      // Three previous sequential loops (download → trim → measure)
+      // collapsed into one worker pool that processes each beat
+      // end-to-end. Same admin-tunable concurrency knob the visuals
+      // pool uses (assembly_beats from product_config), so the audio
+      // and visuals stages scale together when ops dials it up.
+      //
+      // Output arrays are pre-allocated and indexed by beat position
+      // so workers can't race — `audioPaths[i]` and
+      // `measuredDurations[i]` are written exactly once each. The
+      // concat list below still reads in beat order, unchanged.
+      //
       // Optional per-beat silence trim. Off by default — only runs
       // when the user clicked "Trim silences" on the assemble page,
       // which sets trimSilenceEnabled=true. Each render normally ships
@@ -914,30 +915,61 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
       // voiceover_duration_ms is wrong (it describes untrimmed audio),
       // so re-measure via ffprobe on the trimmed file. With trim off,
       // prefer the cached value when present to save the ffprobe call.
-      const audioPaths: string[] = [];
-      const measuredDurations: number[] = [];
-      if (trimSilenceEnabled) {
+      await checkStop();
+      await progress(`Preparing ${beats.length} beat voiceovers…`);
+      const audioPaths: string[] = new Array(beats.length).fill("");
+      const measuredDurations: number[] = new Array(beats.length).fill(0);
+
+      const audioLimit = Math.max(1, Math.min(getAssemblyBeatLimit(), beats.length));
+      let nextAudioIdx = 0;
+      let audioCompleted = 0;
+      let audioFirstError: Error | null = null;
+
+      const processOneAudio = async (i: number): Promise<void> => {
         await checkStop();
-        await progress(`Trimming silence on ${rawAudioPaths.length} clips…`);
-        for (let i = 0; i < rawAudioPaths.length; i++) {
-          await checkStop();
-          const trimmed = path.join(tmpDir, `audio_trim_${String(i).padStart(3, "0")}.mp3`);
-          await trimSilence(rawAudioPaths[i], trimmed, signal);
+        const beat = beats[i];
+        const rawPath = path.join(tmpDir, `audio_raw_${String(i).padStart(3, "0")}.mp3`);
+        await downloadFile(beat.voiceover_url!, rawPath);
+        if (trimSilenceEnabled) {
+          const trimmed = path.join(tmpDir, `audio_${String(i).padStart(3, "0")}.mp3`);
+          await trimSilence(rawPath, trimmed, signal);
           const dur = await getMediaDuration(trimmed);
-          audioPaths.push(trimmed);
-          measuredDurations.push(Math.max(0.1, dur));
-          try { fs.unlinkSync(rawAudioPaths[i]); } catch { /* ignore */ }
-        }
-      } else {
-        for (let i = 0; i < rawAudioPaths.length; i++) {
-          await checkStop();
-          const beat = beats[i];
+          audioPaths[i] = trimmed;
+          measuredDurations[i] = Math.max(0.1, dur);
+          try { fs.unlinkSync(rawPath); } catch { /* ignore */ }
+        } else {
           let dur = beat.voiceover_duration_ms ? beat.voiceover_duration_ms / 1000 : 0;
-          if (!dur || dur <= 0) dur = await getMediaDuration(rawAudioPaths[i]);
-          audioPaths.push(rawAudioPaths[i]);
-          measuredDurations.push(Math.max(0.1, dur));
+          if (!dur || dur <= 0) dur = await getMediaDuration(rawPath);
+          audioPaths[i] = rawPath;
+          measuredDurations[i] = Math.max(0.1, dur);
         }
-      }
+      };
+
+      const audioWorker = async (): Promise<void> => {
+        while (true) {
+          if (audioFirstError) return;
+          const i = nextAudioIdx++;
+          if (i >= beats.length) return;
+          try {
+            await processOneAudio(i);
+          } catch (e) {
+            // Unlike the visuals pool, an audio failure can't be
+            // silently skipped — a missing beat's audio leaves the
+            // master voiceover with a gap and throws off every
+            // downstream duration. Bubble the first error and let
+            // the other workers wind down on the next iteration.
+            if (!audioFirstError) audioFirstError = e instanceof Error ? e : new Error(String(e));
+            return;
+          }
+          audioCompleted++;
+          if (beats.length > 0) {
+            await progress(`Prepared ${audioCompleted} of ${beats.length} beat voiceovers…`);
+          }
+        }
+      };
+
+      await Promise.all(Array.from({ length: audioLimit }, () => audioWorker()));
+      if (audioFirstError) throw audioFirstError;
 
       durations = measuredDurations;
       totalDuration = durations.reduce((s, d) => s + d, 0);
