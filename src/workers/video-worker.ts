@@ -18,7 +18,7 @@ interface QueuedBeat {
 }
 
 // Default concurrency cap. The actual value is sourced from
-// product_config._global.badged_processes.video_worker on each poll
+// product_config._global.batched_processes.video_worker on each poll
 // tick so the admin can tune it from the dashboard without a restart.
 // We keep a constant default to fall back to if the DB read fails.
 const DEFAULT_CONCURRENCY = 3;
@@ -32,11 +32,11 @@ async function refreshConcurrency(): Promise<void> {
   try {
     const { data } = await supabase
       .from("product_config")
-      .select("badged_processes")
+      .select("batched_processes")
       .eq("service", "_global")
       .single();
-    const raw = (data as { badged_processes?: { video_worker?: unknown } } | null)
-      ?.badged_processes?.video_worker;
+    const raw = (data as { batched_processes?: { video_worker?: unknown } } | null)
+      ?.batched_processes?.video_worker;
     const n = typeof raw === "number" ? raw : Number(raw);
     if (Number.isInteger(n) && n >= 1 && n <= 50) {
       if (n !== concurrency) {

@@ -1394,7 +1394,7 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
 // ── Assembly queue poll loop ──────────────────────────────────────────────────
 
 // Admin-tunable concurrency for the assembly worker. Read from
-// product_config.badged_processes every ~30s so the dashboard can
+// product_config.batched_processes every ~30s so the dashboard can
 // raise/lower these without restarting the worker.
 //   assemblyProjectLimit  → how many whole assemblies run in parallel
 //   assemblyBeatLimit     → parallel beats per assembly (Stage B) —
@@ -1410,10 +1410,10 @@ async function refreshAssemblyConcurrency(): Promise<void> {
   try {
     const { data } = await supabase
       .from("product_config")
-      .select("badged_processes")
+      .select("batched_processes")
       .eq("service", "_global")
       .single();
-    const cfg = (data as { badged_processes?: { assembly_projects?: unknown; assembly_beats?: unknown } } | null)?.badged_processes;
+    const cfg = (data as { batched_processes?: { assembly_projects?: unknown; assembly_beats?: unknown } } | null)?.batched_processes;
     const projRaw = cfg?.assembly_projects;
     const beatRaw = cfg?.assembly_beats;
     const proj = typeof projRaw === "number" ? projRaw : Number(projRaw);
