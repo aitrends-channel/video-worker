@@ -137,6 +137,10 @@ export async function pollVideoJob(
   if (modelId === "veo3" || modelId === "veo3_fast") {
     const data = await kieRequest<KieRecordResponse>(`/api/v1/veo/record-info?taskId=${taskId}`, {}, apiKey);
     const flag = data.data?.successFlag;
+    if (flag === 1 || flag === 2 || flag === 3) {
+      // Cost recon — find which field carries credits consumed.
+      console.log(`[kie-cost-recon] video-veo model=${modelId} flag=${flag} response=`, JSON.stringify(data));
+    }
     if (flag === 1) return { status: "done", videoUrl: data.data?.videoUrl ?? (typeof data.data?.resultJson === "string" ? data.data.resultJson : undefined) };
     if (flag === 2 || flag === 3) {
       const reason = extractFailureReason(data.data);
@@ -151,6 +155,9 @@ export async function pollVideoJob(
     const data = await kieRequest<KieRecordResponse>(`/api/v1/runway/record-detail?taskId=${taskId}`, {}, apiKey);
     const d = data.data;
     const raw = (d?.state ?? "").toLowerCase();
+    if (raw === "success" || raw === "fail") {
+      console.log(`[kie-cost-recon] video-runway model=${modelId} state=${raw} response=`, JSON.stringify(data));
+    }
     if (raw === "success") return { status: "done", videoUrl: d?.videoInfo?.videoUrl };
     if (raw === "fail") {
       const reason = extractFailureReason(d);
@@ -175,6 +182,13 @@ export async function pollVideoJob(
   if (DONE.includes(raw)) jobStatus = "done";
   else if (FAIL.includes(raw)) jobStatus = "failed";
   else if (PROCESSING.includes(raw)) jobStatus = "processing";
+
+  if (jobStatus === "done" || jobStatus === "failed") {
+    // Reconnaissance log for cost tracking — dumps the full KIE
+    // recordInfo payload at terminal state so we can identify
+    // which field carries credits consumed. Fires once per task.
+    console.log(`[kie-cost-recon] video-generic model=${modelId} verdict=${jobStatus} response=`, JSON.stringify(data));
+  }
 
   let videoUrl: string | undefined;
   if (jobStatus === "done") {
