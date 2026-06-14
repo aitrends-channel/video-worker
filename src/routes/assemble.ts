@@ -5,6 +5,7 @@ import { type Express, type Request, type Response } from "express";
 import { supabase } from "../lib/supabase.js";
 import { uploadFile, userFolderForId } from "../lib/storage.js";
 import { redis } from "../lib/queue.js";
+import { logProjectCost } from "../lib/costs.js";
 import Anthropic from "@anthropic-ai/sdk";
 import { getAnthropicClient } from "../lib/anthropic.js";
 import fs from "fs";
@@ -1004,6 +1005,23 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
           if (transcriptionWords.length) {
             checkpoint.transcription_words = transcriptionWords;
             await persistCheckpoint();
+            // Log the cost — sum of characters across all returned
+            // words. ElevenLabs Scribe is the only real upstream
+            // charge in the assembler; ffmpeg work runs on our own
+            // Render box. Same approach in the legacy path below.
+            const chars = transcriptionWords.reduce(
+              (sum, w) => sum + (w.text ?? w.word ?? "").length,
+              0,
+            );
+            void logProjectCost({
+              projectId,
+              userId,
+              step: "assemble",
+              provider: "elevenlabs",
+              model: "scribe_v1",
+              units: chars,
+              unitKind: "elevenlabs_chars",
+            });
           }
         }
       }
@@ -1043,6 +1061,20 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
         if (transcriptionWords.length) {
           checkpoint.transcription_words = transcriptionWords;
           await persistCheckpoint();
+          // Same cost log as the per-beat path above.
+          const chars = transcriptionWords.reduce(
+            (sum, w) => sum + (w.text ?? w.word ?? "").length,
+            0,
+          );
+          void logProjectCost({
+            projectId,
+            userId,
+            step: "assemble",
+            provider: "elevenlabs",
+            model: "scribe_v1",
+            units: chars,
+            unitKind: "elevenlabs_chars",
+          });
         }
       } else {
         console.log(`[assemble] ${projectId}: skipping STT — beats already aligned and captions disabled`);

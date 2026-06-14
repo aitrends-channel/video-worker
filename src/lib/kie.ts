@@ -42,6 +42,9 @@ interface KieRecordResponse {
     successFlag?: number;
     videoUrl?: string;
     video_url?: string;
+    // KIE bills per task; recordInfo returns the credit count
+    // for the completed task. Used by the project_costs ledger.
+    creditsConsumed?: number;
     [key: string]: unknown;
   };
 }
@@ -131,21 +134,18 @@ export async function pollVideoJob(
   taskId: string,
   modelId: string,
   apiKey: string
-): Promise<{ status: "pending" | "processing" | "done" | "failed"; videoUrl?: string; error?: string }> {
+): Promise<{ status: "pending" | "processing" | "done" | "failed"; videoUrl?: string; error?: string; creditsConsumed?: number }> {
 
   // Veo
   if (modelId === "veo3" || modelId === "veo3_fast") {
     const data = await kieRequest<KieRecordResponse>(`/api/v1/veo/record-info?taskId=${taskId}`, {}, apiKey);
     const flag = data.data?.successFlag;
-    if (flag === 1 || flag === 2 || flag === 3) {
-      // Cost recon — find which field carries credits consumed.
-      console.log(`[kie-cost-recon] video-veo model=${modelId} flag=${flag} response=`, JSON.stringify(data));
-    }
-    if (flag === 1) return { status: "done", videoUrl: data.data?.videoUrl ?? (typeof data.data?.resultJson === "string" ? data.data.resultJson : undefined) };
+    const creditsConsumed = typeof data.data?.creditsConsumed === "number" ? data.data.creditsConsumed : undefined;
+    if (flag === 1) return { status: "done", videoUrl: data.data?.videoUrl ?? (typeof data.data?.resultJson === "string" ? data.data.resultJson : undefined), creditsConsumed };
     if (flag === 2 || flag === 3) {
       const reason = extractFailureReason(data.data);
       console.log(`[kie] Veo failed taskId=${taskId} flag=${flag} reason=${reason ?? "(none)"} keys=${Object.keys(data.data ?? {}).join(",")}`);
-      return { status: "failed", error: reason ?? "" };
+      return { status: "failed", error: reason ?? "", creditsConsumed };
     }
     return { status: "processing" };
   }
@@ -155,14 +155,12 @@ export async function pollVideoJob(
     const data = await kieRequest<KieRecordResponse>(`/api/v1/runway/record-detail?taskId=${taskId}`, {}, apiKey);
     const d = data.data;
     const raw = (d?.state ?? "").toLowerCase();
-    if (raw === "success" || raw === "fail") {
-      console.log(`[kie-cost-recon] video-runway model=${modelId} state=${raw} response=`, JSON.stringify(data));
-    }
-    if (raw === "success") return { status: "done", videoUrl: d?.videoInfo?.videoUrl };
+    const creditsConsumed = typeof d?.creditsConsumed === "number" ? d.creditsConsumed : undefined;
+    if (raw === "success") return { status: "done", videoUrl: d?.videoInfo?.videoUrl, creditsConsumed };
     if (raw === "fail") {
       const reason = extractFailureReason(d);
       console.log(`[kie] Runway failed taskId=${taskId} state=${raw} reason=${reason ?? "(none)"} keys=${Object.keys(d ?? {}).join(",")}`);
-      return { status: "failed", error: reason ?? "" };
+      return { status: "failed", error: reason ?? "", creditsConsumed };
     }
     return { status: raw === "generating" ? "processing" : "pending" };
   }
@@ -183,12 +181,7 @@ export async function pollVideoJob(
   else if (FAIL.includes(raw)) jobStatus = "failed";
   else if (PROCESSING.includes(raw)) jobStatus = "processing";
 
-  if (jobStatus === "done" || jobStatus === "failed") {
-    // Reconnaissance log for cost tracking — dumps the full KIE
-    // recordInfo payload at terminal state so we can identify
-    // which field carries credits consumed. Fires once per task.
-    console.log(`[kie-cost-recon] video-generic model=${modelId} verdict=${jobStatus} response=`, JSON.stringify(data));
-  }
+  const creditsConsumed = typeof d?.creditsConsumed === "number" ? d.creditsConsumed : undefined;
 
   let videoUrl: string | undefined;
   if (jobStatus === "done") {
@@ -217,8 +210,8 @@ export async function pollVideoJob(
       // candidates to extractFailureReason if KIE introduces a field.
       console.log(`[kie] Generic failed taskId=${taskId} state=${raw} keys=${Object.keys(d ?? {}).join(",")} data=${JSON.stringify(d).slice(0, 600)}`);
     }
-    return { status: jobStatus, videoUrl, error: reason ?? "" };
+    return { status: jobStatus, videoUrl, error: reason ?? "", creditsConsumed };
   }
 
-  return { status: jobStatus, videoUrl };
+  return { status: jobStatus, videoUrl, creditsConsumed };
 }

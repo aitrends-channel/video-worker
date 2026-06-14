@@ -1,6 +1,7 @@
 import { submitVideoJob, pollVideoJob } from "../lib/kie.js";
 import { uploadFromUrl, userFolderForId } from "../lib/storage.js";
 import { supabase } from "../lib/supabase.js";
+import { logProjectCost } from "../lib/costs.js";
 
 function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
@@ -97,6 +98,20 @@ async function processBeat(beat: QueuedBeat) {
     await sleep(10000);
     const status = await pollVideoJob(jobId, modelId, kieApiKey);
     console.log(`[worker] Poll attempt ${attempt + 1} beat=${beatNumber} status=${status.status} hasUrl=${!!status.videoUrl}${status.error ? ` err="${status.error}"` : ""}`);
+    // Log credits as soon as KIE bills us (done OR failed). The
+    // ledger should reflect actual spend even on failed jobs since
+    // KIE charged for the attempt.
+    if ((status.status === "done" || status.status === "failed") && status.creditsConsumed) {
+      void logProjectCost({
+        projectId,
+        userId,
+        step: "video_gen",
+        provider: "kie",
+        model: modelId,
+        units: status.creditsConsumed,
+        unitKind: "kie_credits",
+      });
+    }
     if (status.status === "done") {
       if (status.videoUrl) { videoUrl = status.videoUrl; break; }
       // Done but no URL — log full response and keep polling briefly in case URL appears
