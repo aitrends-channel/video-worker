@@ -80,7 +80,11 @@ export async function submitVideoJob(
 
   // Veo
   if (modelId === "veo3" || modelId === "veo3_fast") {
-    const body: Record<string, unknown> = { prompt };
+    // KIE's /api/v1/veo/generate serves both Veo 3 variants. Without
+    // a `model` field it returns "Invalid Model" because the endpoint
+    // can't tell which variant we want. Both ids are passed through
+    // as-is — KIE accepts "veo3" and "veo3_fast" verbatim.
+    const body: Record<string, unknown> = { prompt, model: modelId };
     if (!imageUrl) body.aspect_ratio = aspectRatio;
     if (imageUrl) body.imageUrls = [imageUrl];
     const res = await kieRequest<KieTaskResponse>("/api/v1/veo/generate", {
@@ -93,7 +97,11 @@ export async function submitVideoJob(
 
   // Runway
   if (modelId === "runway") {
-    const body: Record<string, unknown> = { prompt };
+    // KIE's Runway endpoint rejects submissions without a quality
+    // field — "Video quality cannot be empty". 720p is a safe default
+    // for Gen-3 Turbo; surface a user-selectable picker later if we
+    // want to expose 1080p / standard / high tiers.
+    const body: Record<string, unknown> = { prompt, quality: "720p" };
     if (!imageUrl) body.aspectRatio = aspectRatio;
     if (duration) body.duration = duration;
     if (imageUrl) body.imageUrl = imageUrl;
@@ -115,7 +123,11 @@ export async function submitVideoJob(
   if (imageUrl) {
     if (modelId === "grok-imagine/image-to-video") input.image_urls = [imageUrl];
     else if (modelId === "wan/2-7-image-to-video") input.first_frame_url = imageUrl;
-    else if (modelId === "wan/2-6-flash-image-to-video") input.image_urls = [imageUrl];
+    // wan/2-6-flash mirrors wan/2-7's input shape — first_frame_url,
+    // not image_urls. Previous image_urls was a guess from when the
+    // model first landed and KIE returns "Video model rejected" on
+    // the wrong field name.
+    else if (modelId === "wan/2-6-flash-image-to-video") input.first_frame_url = imageUrl;
     else if (modelId === "sora-2-image-to-video") input.image_urls = [imageUrl];
     else if (modelId === "bytedance/seedance-2-fast") input.first_frame_url = imageUrl;
     else if (modelId === "bytedance/seedance-1.5-pro") input.input_urls = [imageUrl];
@@ -147,7 +159,12 @@ export async function pollVideoJob(
       console.log(`[kie] Veo failed taskId=${taskId} flag=${flag} reason=${reason ?? "(none)"} keys=${Object.keys(data.data ?? {}).join(",")}`);
       return { status: "failed", error: reason ?? "", creditsConsumed };
     }
-    return { status: "processing" };
+    // Veo's recordInfo only exposes the terminal successFlag (1/2/3).
+    // There's no API signal that says "actively generating now" vs
+    // "queued in KIE's internal queue" — so we default to pending,
+    // which keeps the beat in "submitting" until KIE returns a real
+    // terminal state. Better to under-claim than to mislabel.
+    return { status: "pending" };
   }
 
   // Runway
@@ -174,12 +191,22 @@ export async function pollVideoJob(
 
   const DONE = ["succeed", "success", "completed", "done", "finish", "finished", "complete"];
   const FAIL = ["failed", "error", "fail"];
-  const PROCESSING = ["generating", "running", "processing", "active", "in_progress", "queued", "waiting"];
+  // Only states where KIE is ACTIVELY producing the video map to
+  // "processing". States like "queued" / "waiting" / "pending" mean
+  // the job is sitting in KIE's internal queue but hasn't started
+  // generation yet — those map to "pending" so the worker can keep
+  // the beat in "submitting" instead of prematurely promoting it
+  // to "rendering". (Previously this list lumped them all together,
+  // which meant the badge flipped to "rendering" the moment KIE
+  // acknowledged the job, even if no work was actually happening.)
+  const PROCESSING = ["generating", "running", "processing", "active", "in_progress"];
+  const PENDING = ["pending", "queued", "waiting", "created", "submitted"];
 
   let jobStatus: "pending" | "processing" | "done" | "failed" = "pending";
   if (DONE.includes(raw)) jobStatus = "done";
   else if (FAIL.includes(raw)) jobStatus = "failed";
   else if (PROCESSING.includes(raw)) jobStatus = "processing";
+  else if (PENDING.includes(raw)) jobStatus = "pending";
 
   const creditsConsumed = typeof d?.creditsConsumed === "number" ? d.creditsConsumed : undefined;
 
