@@ -148,7 +148,26 @@ export async function submitVideoJob(
     else if (modelId === "wan/2-6-flash-image-to-video") input.first_frame_url = imageUrl;
     else if (modelId === "sora-2-image-to-video") input.image_urls = [imageUrl];
     else if (modelId === "bytedance/seedance-2-fast") input.first_frame_url = imageUrl;
-    else if (modelId === "bytedance/seedance-1.5-pro") input.input_urls = [imageUrl];
+    else if (modelId === "bytedance/seedance-1.5-pro") {
+      // Seedance 1.5 Pro on KIE needs input_urls + a stack of
+      // required scalars (resolution, fixed_lens, generate_audio,
+      // nsfw_checker, aspect_ratio) that all surface as
+      // "This field is required" if missing. Confirmed via the
+      // KIE playground example body. Defaults:
+      //   resolution     = "720p" (cheaper tier; expose 1080p later if needed)
+      //   fixed_lens     = false  (allow camera motion)
+      //   generate_audio = false  (we add audio downstream via TTS)
+      //   nsfw_checker   = false  (don't auto-block legitimate content)
+      // aspect_ratio is required EVEN with input_urls present —
+      // the generic if-no-image branch above misses this case for
+      // Seedance, so we set it here explicitly.
+      input.input_urls = [imageUrl];
+      input.aspect_ratio = aspectRatio;
+      input.resolution = "720p";
+      input.fixed_lens = false;
+      input.generate_audio = false;
+      input.nsfw_checker = false;
+    }
     // Kling on KIE takes `image_urls` (array of one URL) AND a
     // required boolean `sound`. The "This field is required" we
     // saw with image_urls alone was actually KIE complaining
