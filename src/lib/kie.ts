@@ -160,8 +160,21 @@ export async function submitVideoJob(
       input.image_urls = [imageUrl];
       input.sound = false;
     } else if (modelId === "kling-3.0/video") {
+      // Kling 3.0 needs everything 2.6 wants plus aspect_ratio,
+      // mode, and multi_shots. mode is "std" | "pro" — std is
+      // cheaper, pro is higher quality (defaulting std). multi_shots
+      // controls Kling's storyboard-style multi-segment feature; we
+      // pass false to use the single prompt path. KIE rejects with
+      // "multi_shots cannot be empty" if the field is missing
+      // entirely, so it's effectively required even when off.
+      // aspect_ratio is required even with image_urls present,
+      // unlike most other KIE models where it only matters for
+      // text-to-video.
       input.image_urls = [imageUrl];
       input.sound = false;
+      input.aspect_ratio = aspectRatio;
+      input.mode = "std";
+      input.multi_shots = false;
     }
     else input.image_url = imageUrl;
   }
