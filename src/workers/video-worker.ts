@@ -112,6 +112,17 @@ async function processBeat(beat: QueuedBeat) {
     // ledger should reflect actual spend even on failed jobs since
     // KIE charged for the attempt.
     if ((status.status === "done" || status.status === "failed") && status.creditsConsumed) {
+      // durationSec drives the engine's "N cr/s" picker chip. We coerce
+      // the project's video_duration (string-or-number depending on
+      // how it was stored) to a number. Frame-counted models (Sora's
+      // n_frames knob) shouldn't write a seconds value — pass null so
+      // the per-sec query filter excludes them rather than computing
+      // a misleading credits-per-frame value.
+      const FRAME_COUNTED_MODELS = new Set(["sora-2-image-to-video"]);
+      const rawDuration = typeof duration === "string" ? Number(duration) : duration;
+      const durationSec = (!FRAME_COUNTED_MODELS.has(modelId) && typeof rawDuration === "number" && rawDuration > 0)
+        ? rawDuration
+        : null;
       void logProjectCost({
         projectId,
         userId,
@@ -120,6 +131,7 @@ async function processBeat(beat: QueuedBeat) {
         model: modelId,
         units: status.creditsConsumed,
         unitKind: "kie_credits",
+        durationSec,
       });
     }
 

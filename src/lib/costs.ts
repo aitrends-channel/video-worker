@@ -40,6 +40,15 @@ export interface CostEntry {
   model?: string | null;
   units: number;
   unitKind: CostUnitKind;
+  /** Generation duration in seconds — used so the engine's video
+   *  model picker can compute per-second cost as units / durationSec.
+   *  Required for video_gen kie_credits rows. Omit (or null) for
+   *  steps where seconds aren't the natural unit (e.g. Sora's
+   *  frame-counted duration knob). */
+  durationSec?: number | null;
+  /** Wall-clock milliseconds from submit to result-ready. Powers
+   *  the engine's "Fastest" tab in the model picker. Optional. */
+  elapsedMs?: number | null;
 }
 
 export async function logProjectCost(entry: CostEntry): Promise<void> {
@@ -56,6 +65,8 @@ export async function logProjectCost(entry: CostEntry): Promise<void> {
         model: entry.model ?? null,
         units: entry.units,
         unit_kind: entry.unitKind,
+        duration_sec: entry.durationSec ?? null,
+        elapsed_ms: entry.elapsedMs ?? null,
       });
     if (error) {
       console.warn(`[costs] insert failed step=${entry.step} provider=${entry.provider} unit_kind=${entry.unitKind}:`, error.message);
