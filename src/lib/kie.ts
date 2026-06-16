@@ -1,14 +1,26 @@
 const KIE_BASE_URL = "https://api.kie.ai";
 
 async function kieRequest<T>(endpoint: string, options: RequestInit, apiKey: string): Promise<T> {
-  const res = await fetch(`${KIE_BASE_URL}${endpoint}`, {
-    ...options,
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-      ...(options.headers ?? {}),
-    },
-  });
+  const url = `${KIE_BASE_URL}${endpoint}`;
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      ...options,
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+        ...(options.headers ?? {}),
+      },
+    });
+  } catch (err) {
+    // Node's undici throws a bare "fetch failed" with no URL context
+    // when the underlying network call can't complete (DNS, reset,
+    // KIE outage). Wrap it so the worker log + DB video_error tells
+    // us which endpoint died, which makes triaging the next outage
+    // an order of magnitude faster.
+    const cause = err instanceof Error ? err.message : String(err);
+    throw new Error(`kie.ai network error on ${endpoint}: ${cause}`);
+  }
   if (!res.ok) {
     const body = await res.text();
     throw new Error(`kie.ai error ${res.status}: ${body}`);
@@ -91,7 +103,10 @@ export async function submitVideoJob(
       method: "POST",
       body: JSON.stringify(body),
     }, apiKey);
-    if (res.code !== 200) throw new Error(res.msg ?? "Failed to submit Veo job");
+    if (res.code !== 200) {
+      console.error(`[kie] submit rejected modelId=${modelId} msg="${res.msg}" body=${JSON.stringify(body).slice(0, 600)}`);
+      throw new Error(res.msg ?? "Failed to submit Veo job");
+    }
     return res.data.taskId;
   }
 
@@ -109,7 +124,10 @@ export async function submitVideoJob(
       method: "POST",
       body: JSON.stringify(body),
     }, apiKey);
-    if (res.code !== 200) throw new Error(res.msg ?? "Failed to submit Runway job");
+    if (res.code !== 200) {
+      console.error(`[kie] submit rejected modelId=${modelId} msg="${res.msg}" body=${JSON.stringify(body).slice(0, 600)}`);
+      throw new Error(res.msg ?? "Failed to submit Runway job");
+    }
     return res.data.taskId;
   }
 
@@ -131,6 +149,20 @@ export async function submitVideoJob(
     else if (modelId === "sora-2-image-to-video") input.image_urls = [imageUrl];
     else if (modelId === "bytedance/seedance-2-fast") input.first_frame_url = imageUrl;
     else if (modelId === "bytedance/seedance-1.5-pro") input.input_urls = [imageUrl];
+    // Kling on KIE takes `image_urls` (array of one URL) AND a
+    // required boolean `sound`. The "This field is required" we
+    // saw with image_urls alone was actually KIE complaining
+    // about missing `sound`, not the image field. Confirmed via
+    // KIE playground example body for kling-2.6/image-to-video.
+    // We pass sound=false (no audio) — adding a user toggle later
+    // is straightforward if we want Kling's built-in audio gen.
+    else if (modelId === "kling-2.6/image-to-video") {
+      input.image_urls = [imageUrl];
+      input.sound = false;
+    } else if (modelId === "kling-3.0/video") {
+      input.image_urls = [imageUrl];
+      input.sound = false;
+    }
     else input.image_url = imageUrl;
   }
 
@@ -138,7 +170,15 @@ export async function submitVideoJob(
     method: "POST",
     body: JSON.stringify({ model: modelId, input }),
   }, apiKey);
-  if (res.code !== 200) throw new Error(res.msg ?? "Failed to submit video job");
+  if (res.code !== 200) {
+    // KIE often returns "This field is required" without naming the
+    // field, which makes it impossible to fix without seeing what we
+    // actually sent. Log the full submit body (truncated to 600 chars
+    // so a giant prompt doesn't dominate the log) so the missing
+    // field is obvious from the worker stdout.
+    console.error(`[kie] submit rejected modelId=${modelId} msg="${res.msg}" body=${JSON.stringify({ model: modelId, input }).slice(0, 600)}`);
+    throw new Error(res.msg ?? "Failed to submit video job");
+  }
   return res.data.taskId;
 }
 
