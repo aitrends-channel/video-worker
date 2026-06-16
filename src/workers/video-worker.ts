@@ -77,6 +77,12 @@ async function processBeat(beat: QueuedBeat) {
   const kieApiKey = settings?.kie_api_key ?? process.env.KIE_API_KEY;
   if (!kieApiKey) throw new Error(`No KIE API key found for user ${userId}`);
 
+  // Wall-clock from submit to terminal status — powers the engine's
+  // "Fastest" tab in the video model picker. Stamped here so the
+  // measured elapsed reflects what the user perceives: time between
+  // hitting Queue and the clip becoming available. Includes KIE
+  // queueing + actual generation, which is what matters for ranking.
+  const submitT0 = Date.now();
   const jobId = await submitVideoJob(videoPrompt, modelId, kieApiKey, imageUrl, duration, aspectRatio);
   console.log(`[worker] Submitted video job: ${jobId}`);
 
@@ -132,6 +138,7 @@ async function processBeat(beat: QueuedBeat) {
         units: status.creditsConsumed,
         unitKind: "kie_credits",
         durationSec,
+        elapsedMs: Date.now() - submitT0,
       });
     }
 
