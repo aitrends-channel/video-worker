@@ -1,14 +1,26 @@
 const KIE_BASE_URL = "https://api.kie.ai";
 
 async function kieRequest<T>(endpoint: string, options: RequestInit, apiKey: string): Promise<T> {
-  const res = await fetch(`${KIE_BASE_URL}${endpoint}`, {
-    ...options,
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-      ...(options.headers ?? {}),
-    },
-  });
+  const url = `${KIE_BASE_URL}${endpoint}`;
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      ...options,
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+        ...(options.headers ?? {}),
+      },
+    });
+  } catch (err) {
+    // Node's undici throws a bare "fetch failed" with no URL context
+    // when the underlying network call can't complete (DNS, reset,
+    // KIE outage). Wrap it so the worker log + DB video_error tells
+    // us which endpoint died, which makes triaging the next outage
+    // an order of magnitude faster.
+    const cause = err instanceof Error ? err.message : String(err);
+    throw new Error(`kie.ai network error on ${endpoint}: ${cause}`);
+  }
   if (!res.ok) {
     const body = await res.text();
     throw new Error(`kie.ai error ${res.status}: ${body}`);
@@ -42,6 +54,9 @@ interface KieRecordResponse {
     successFlag?: number;
     videoUrl?: string;
     video_url?: string;
+    // KIE bills per task; recordInfo returns the credit count
+    // for the completed task. Used by the project_costs ledger.
+    creditsConsumed?: number;
     [key: string]: unknown;
   };
 }
@@ -77,20 +92,31 @@ export async function submitVideoJob(
 
   // Veo
   if (modelId === "veo3" || modelId === "veo3_fast") {
-    const body: Record<string, unknown> = { prompt };
+    // KIE's /api/v1/veo/generate serves both Veo 3 variants. Without
+    // a `model` field it returns "Invalid Model" because the endpoint
+    // can't tell which variant we want. Both ids are passed through
+    // as-is — KIE accepts "veo3" and "veo3_fast" verbatim.
+    const body: Record<string, unknown> = { prompt, model: modelId };
     if (!imageUrl) body.aspect_ratio = aspectRatio;
     if (imageUrl) body.imageUrls = [imageUrl];
     const res = await kieRequest<KieTaskResponse>("/api/v1/veo/generate", {
       method: "POST",
       body: JSON.stringify(body),
     }, apiKey);
-    if (res.code !== 200) throw new Error(res.msg ?? "Failed to submit Veo job");
+    if (res.code !== 200) {
+      console.error(`[kie] submit rejected modelId=${modelId} msg="${res.msg}" body=${JSON.stringify(body).slice(0, 600)}`);
+      throw new Error(res.msg ?? "Failed to submit Veo job");
+    }
     return res.data.taskId;
   }
 
   // Runway
   if (modelId === "runway") {
-    const body: Record<string, unknown> = { prompt };
+    // KIE's Runway endpoint rejects submissions without a quality
+    // field — "Video quality cannot be empty". 720p is a safe default
+    // for Gen-3 Turbo; surface a user-selectable picker later if we
+    // want to expose 1080p / standard / high tiers.
+    const body: Record<string, unknown> = { prompt, quality: "720p" };
     if (!imageUrl) body.aspectRatio = aspectRatio;
     if (duration) body.duration = duration;
     if (imageUrl) body.imageUrl = imageUrl;
@@ -98,7 +124,10 @@ export async function submitVideoJob(
       method: "POST",
       body: JSON.stringify(body),
     }, apiKey);
-    if (res.code !== 200) throw new Error(res.msg ?? "Failed to submit Runway job");
+    if (res.code !== 200) {
+      console.error(`[kie] submit rejected modelId=${modelId} msg="${res.msg}" body=${JSON.stringify(body).slice(0, 600)}`);
+      throw new Error(res.msg ?? "Failed to submit Runway job");
+    }
     return res.data.taskId;
   }
 
@@ -112,10 +141,60 @@ export async function submitVideoJob(
   if (imageUrl) {
     if (modelId === "grok-imagine/image-to-video") input.image_urls = [imageUrl];
     else if (modelId === "wan/2-7-image-to-video") input.first_frame_url = imageUrl;
-    else if (modelId === "wan/2-6-flash-image-to-video") input.image_urls = [imageUrl];
+    // wan/2-6-flash mirrors wan/2-7's input shape — first_frame_url,
+    // not image_urls. Previous image_urls was a guess from when the
+    // model first landed and KIE returns "Video model rejected" on
+    // the wrong field name.
+    else if (modelId === "wan/2-6-flash-image-to-video") input.first_frame_url = imageUrl;
     else if (modelId === "sora-2-image-to-video") input.image_urls = [imageUrl];
     else if (modelId === "bytedance/seedance-2-fast") input.first_frame_url = imageUrl;
-    else if (modelId === "bytedance/seedance-1.5-pro") input.input_urls = [imageUrl];
+    else if (modelId === "bytedance/seedance-1.5-pro") {
+      // Seedance 1.5 Pro on KIE needs input_urls + a stack of
+      // required scalars (resolution, fixed_lens, generate_audio,
+      // nsfw_checker, aspect_ratio) that all surface as
+      // "This field is required" if missing. Confirmed via the
+      // KIE playground example body. Defaults:
+      //   resolution     = "720p" (cheaper tier; expose 1080p later if needed)
+      //   fixed_lens     = false  (allow camera motion)
+      //   generate_audio = false  (we add audio downstream via TTS)
+      //   nsfw_checker   = false  (don't auto-block legitimate content)
+      // aspect_ratio is required EVEN with input_urls present —
+      // the generic if-no-image branch above misses this case for
+      // Seedance, so we set it here explicitly.
+      input.input_urls = [imageUrl];
+      input.aspect_ratio = aspectRatio;
+      input.resolution = "720p";
+      input.fixed_lens = false;
+      input.generate_audio = false;
+      input.nsfw_checker = false;
+    }
+    // Kling on KIE takes `image_urls` (array of one URL) AND a
+    // required boolean `sound`. The "This field is required" we
+    // saw with image_urls alone was actually KIE complaining
+    // about missing `sound`, not the image field. Confirmed via
+    // KIE playground example body for kling-2.6/image-to-video.
+    // We pass sound=false (no audio) — adding a user toggle later
+    // is straightforward if we want Kling's built-in audio gen.
+    else if (modelId === "kling-2.6/image-to-video") {
+      input.image_urls = [imageUrl];
+      input.sound = false;
+    } else if (modelId === "kling-3.0/video") {
+      // Kling 3.0 needs everything 2.6 wants plus aspect_ratio,
+      // mode, and multi_shots. mode is "std" | "pro" — std is
+      // cheaper, pro is higher quality (defaulting std). multi_shots
+      // controls Kling's storyboard-style multi-segment feature; we
+      // pass false to use the single prompt path. KIE rejects with
+      // "multi_shots cannot be empty" if the field is missing
+      // entirely, so it's effectively required even when off.
+      // aspect_ratio is required even with image_urls present,
+      // unlike most other KIE models where it only matters for
+      // text-to-video.
+      input.image_urls = [imageUrl];
+      input.sound = false;
+      input.aspect_ratio = aspectRatio;
+      input.mode = "std";
+      input.multi_shots = false;
+    }
     else input.image_url = imageUrl;
   }
 
@@ -123,7 +202,15 @@ export async function submitVideoJob(
     method: "POST",
     body: JSON.stringify({ model: modelId, input }),
   }, apiKey);
-  if (res.code !== 200) throw new Error(res.msg ?? "Failed to submit video job");
+  if (res.code !== 200) {
+    // KIE often returns "This field is required" without naming the
+    // field, which makes it impossible to fix without seeing what we
+    // actually sent. Log the full submit body (truncated to 600 chars
+    // so a giant prompt doesn't dominate the log) so the missing
+    // field is obvious from the worker stdout.
+    console.error(`[kie] submit rejected modelId=${modelId} msg="${res.msg}" body=${JSON.stringify({ model: modelId, input }).slice(0, 600)}`);
+    throw new Error(res.msg ?? "Failed to submit video job");
+  }
   return res.data.taskId;
 }
 
@@ -131,19 +218,25 @@ export async function pollVideoJob(
   taskId: string,
   modelId: string,
   apiKey: string
-): Promise<{ status: "pending" | "processing" | "done" | "failed"; videoUrl?: string; error?: string }> {
+): Promise<{ status: "pending" | "processing" | "done" | "failed"; videoUrl?: string; error?: string; creditsConsumed?: number }> {
 
   // Veo
   if (modelId === "veo3" || modelId === "veo3_fast") {
     const data = await kieRequest<KieRecordResponse>(`/api/v1/veo/record-info?taskId=${taskId}`, {}, apiKey);
     const flag = data.data?.successFlag;
-    if (flag === 1) return { status: "done", videoUrl: data.data?.videoUrl ?? (typeof data.data?.resultJson === "string" ? data.data.resultJson : undefined) };
+    const creditsConsumed = typeof data.data?.creditsConsumed === "number" ? data.data.creditsConsumed : undefined;
+    if (flag === 1) return { status: "done", videoUrl: data.data?.videoUrl ?? (typeof data.data?.resultJson === "string" ? data.data.resultJson : undefined), creditsConsumed };
     if (flag === 2 || flag === 3) {
       const reason = extractFailureReason(data.data);
       console.log(`[kie] Veo failed taskId=${taskId} flag=${flag} reason=${reason ?? "(none)"} keys=${Object.keys(data.data ?? {}).join(",")}`);
-      return { status: "failed", error: reason ?? "" };
+      return { status: "failed", error: reason ?? "", creditsConsumed };
     }
-    return { status: "processing" };
+    // Veo's recordInfo only exposes the terminal successFlag (1/2/3).
+    // There's no API signal that says "actively generating now" vs
+    // "queued in KIE's internal queue" — so we default to pending,
+    // which keeps the beat in "submitting" until KIE returns a real
+    // terminal state. Better to under-claim than to mislabel.
+    return { status: "pending" };
   }
 
   // Runway
@@ -151,11 +244,12 @@ export async function pollVideoJob(
     const data = await kieRequest<KieRecordResponse>(`/api/v1/runway/record-detail?taskId=${taskId}`, {}, apiKey);
     const d = data.data;
     const raw = (d?.state ?? "").toLowerCase();
-    if (raw === "success") return { status: "done", videoUrl: d?.videoInfo?.videoUrl };
+    const creditsConsumed = typeof d?.creditsConsumed === "number" ? d.creditsConsumed : undefined;
+    if (raw === "success") return { status: "done", videoUrl: d?.videoInfo?.videoUrl, creditsConsumed };
     if (raw === "fail") {
       const reason = extractFailureReason(d);
       console.log(`[kie] Runway failed taskId=${taskId} state=${raw} reason=${reason ?? "(none)"} keys=${Object.keys(d ?? {}).join(",")}`);
-      return { status: "failed", error: reason ?? "" };
+      return { status: "failed", error: reason ?? "", creditsConsumed };
     }
     return { status: raw === "generating" ? "processing" : "pending" };
   }
@@ -169,12 +263,24 @@ export async function pollVideoJob(
 
   const DONE = ["succeed", "success", "completed", "done", "finish", "finished", "complete"];
   const FAIL = ["failed", "error", "fail"];
-  const PROCESSING = ["generating", "running", "processing", "active", "in_progress", "queued", "waiting"];
+  // Only states where KIE is ACTIVELY producing the video map to
+  // "processing". States like "queued" / "waiting" / "pending" mean
+  // the job is sitting in KIE's internal queue but hasn't started
+  // generation yet — those map to "pending" so the worker can keep
+  // the beat in "submitting" instead of prematurely promoting it
+  // to "rendering". (Previously this list lumped them all together,
+  // which meant the badge flipped to "rendering" the moment KIE
+  // acknowledged the job, even if no work was actually happening.)
+  const PROCESSING = ["generating", "running", "processing", "active", "in_progress"];
+  const PENDING = ["pending", "queued", "waiting", "created", "submitted"];
 
   let jobStatus: "pending" | "processing" | "done" | "failed" = "pending";
   if (DONE.includes(raw)) jobStatus = "done";
   else if (FAIL.includes(raw)) jobStatus = "failed";
   else if (PROCESSING.includes(raw)) jobStatus = "processing";
+  else if (PENDING.includes(raw)) jobStatus = "pending";
+
+  const creditsConsumed = typeof d?.creditsConsumed === "number" ? d.creditsConsumed : undefined;
 
   let videoUrl: string | undefined;
   if (jobStatus === "done") {
@@ -203,8 +309,8 @@ export async function pollVideoJob(
       // candidates to extractFailureReason if KIE introduces a field.
       console.log(`[kie] Generic failed taskId=${taskId} state=${raw} keys=${Object.keys(d ?? {}).join(",")} data=${JSON.stringify(d).slice(0, 600)}`);
     }
-    return { status: jobStatus, videoUrl, error: reason ?? "" };
+    return { status: jobStatus, videoUrl, error: reason ?? "", creditsConsumed };
   }
 
-  return { status: jobStatus, videoUrl };
+  return { status: jobStatus, videoUrl, creditsConsumed };
 }

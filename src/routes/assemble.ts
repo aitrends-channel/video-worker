@@ -5,6 +5,7 @@ import { type Express, type Request, type Response } from "express";
 import { supabase } from "../lib/supabase.js";
 import { uploadFile, userFolderForId } from "../lib/storage.js";
 import { redis } from "../lib/queue.js";
+import { logProjectCost } from "../lib/costs.js";
 import Anthropic from "@anthropic-ai/sdk";
 import { getAnthropicClient } from "../lib/anthropic.js";
 import fs from "fs";
@@ -116,14 +117,80 @@ function ffmpegWithTimeout(
   });
 }
 
-function normalizeClip(src: string, isImage: boolean, duration: number, output: string, w: number, h: number, signal?: AbortSignal): Promise<void> {
-  const vf = `scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2:black,fps=24`;
+export type LogoOverlay = {
+  logoPath: string;
+  sizePct: number; // 0–1, logo width as fraction of video width
+  xPct: number;    // 0–1, top-left x as fraction of video width
+  yPct: number;    // 0–1, top-left y as fraction of video height
+};
+
+function normalizeClip(
+  src: string,
+  isImage: boolean,
+  duration: number,
+  output: string,
+  w: number,
+  h: number,
+  logoOverlay: LogoOverlay | null,
+  subtitles: { assPath: string } | null,
+  signal?: AbortSignal,
+): Promise<void> {
+  const baseFilter = `scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2:black,fps=24`;
+  const assFilter = subtitles ? `ass=${escapeAssPath(subtitles.assPath)}` : null;
+  // Preset/CRF depends on whether this is now the FINAL encoder pass.
+  //   - subtitles=null: the clip is intermediate — concatClips uses
+  //     `-c copy` and the mix step also stream-copies the video, so
+  //     the current ultrafast/crf 28 stands as the output the user
+  //     sees. Keep it fast.
+  //   - subtitles=set: captions are baked in here instead of in a
+  //     downstream full-video burn pass. That burn pass used
+  //     veryfast/crf 23 — match it so captioned final-quality is
+  //     identical to the old pipeline. The +CPU cost per beat is
+  //     dwarfed by the eliminated whole-video re-encode.
+  const preset = subtitles ? "veryfast" : "ultrafast";
+  const crf = subtitles ? "23" : "28";
+
   return ffmpegWithTimeout((cmd) => {
     if (isImage) cmd.input(src).inputOptions(["-loop", "1"]);
     else cmd.input(src).inputOptions(["-stream_loop", "-1"]);
-    return cmd
-      .outputOptions(["-t", String(duration), "-vf", vf, "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-an", "-pix_fmt", "yuv420p"])
-      .output(output);
+
+    if (logoOverlay) {
+      // Composite the logo during the same encode pass that's
+      // already happening for each clip — eliminates the separate
+      // full-video re-encode we used to do downstream. The encoder
+      // is the dominant cost; adding the overlay filter is ~free.
+      // When subtitles are also baked in, append the ass filter
+      // *after* the logo overlay so captions render on top of the
+      // composited frame, not under the logo.
+      const logoW = Math.max(8, Math.min(w, Math.round((w * logoOverlay.sizePct) / 2) * 2));
+      const x = Math.round(w * logoOverlay.xPct);
+      const y = Math.round(h * logoOverlay.yPct);
+      const overlayLabel = assFilter ? "[premix]" : "[v]";
+      const graph: string[] = [
+        `[0:v]${baseFilter}[base]`,
+        `[1:v]scale=w=${logoW}:h=-2[logo]`,
+        `[base][logo]overlay=x=${x}:y=${y}:format=auto${overlayLabel}`,
+      ];
+      if (assFilter) graph.push(`[premix]${assFilter}[v]`);
+      cmd.input(logoOverlay.logoPath)
+        .complexFilter(graph)
+        .outputOptions([
+          "-map", "[v]",
+          "-t", String(duration),
+          "-c:v", "libx264", "-preset", preset, "-crf", crf,
+          "-an", "-pix_fmt", "yuv420p",
+        ]);
+    } else {
+      const vf = assFilter ? `${baseFilter},${assFilter}` : baseFilter;
+      cmd.outputOptions([
+        "-t", String(duration),
+        "-vf", vf,
+        "-c:v", "libx264", "-preset", preset, "-crf", crf,
+        "-an", "-pix_fmt", "yuv420p",
+      ]);
+    }
+
+    return cmd.output(output);
   }, `normalizeClip`, signal);
 }
 
@@ -180,31 +247,38 @@ function trimSilence(input: string, output: string, signal?: AbortSignal): Promi
   );
 }
 
-function mixAudio(video: string, audio: string, output: string, videoDuration: number, signal?: AbortSignal): Promise<void> {
-  return ffmpegWithTimeout((cmd) =>
-    cmd
-      .input(video).inputOptions(["-fflags", "+genpts"])
-      .input(audio)
-      // +faststart skipped: on constrained disk it can corrupt the moov atom; range-request serving handles moov-at-end fine
-      .outputOptions(["-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-t", String(videoDuration)])
-      .output(output),
-    "audio mix",
-    signal,
-  );
-}
-
-function burnSubtitles(video: string, assPath: string, output: string, signal?: AbortSignal): Promise<void> {
-  // Escape backslashes and colons for ffmpeg filtergraph syntax (no shell quoting needed)
-  const escaped = assPath.replace(/\\/g, "/").replace(/:/g, "\\:");
-  return ffmpegWithTimeout((cmd) =>
-    cmd
-      .input(video)
-      // "veryfast" cuts burn time ~2x vs "fast" on Render's shared CPU,
-      // at the cost of ~15-20% larger output. Captions are a re-encode
-      // pass so we trade size for staying under the timeout ceiling.
-      .outputOptions(["-vf", `ass=${escaped}`, "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "copy", "-movflags", "+faststart"])
-      .output(output),
-  "burnSubtitles", signal);
+function mixAudio(
+  video: string,
+  audio: string,
+  output: string,
+  videoDuration: number,
+  signal?: AbortSignal,
+  bgm?: { path: string; volume: number } | null,
+): Promise<void> {
+  return ffmpegWithTimeout((cmd) => {
+    cmd.input(video).inputOptions(["-fflags", "+genpts"]);
+    cmd.input(audio);
+    if (bgm) {
+      // Three inputs: video, voiceover (1), bgm (2). -stream_loop -1
+      // on the bgm input loops the file indefinitely so a short
+      // music track fills the entire voiceover duration instead of
+      // dropping out mid-narration. amix duration=first caps the
+      // combined output to the voiceover length so the looped bgm
+      // never trails past the end. volume=`bgm.volume` keeps music
+      // well under the dialog (default 0.15 ≈ -16 dB, classic
+      // "podcast bed" level).
+      cmd.input(bgm.path).inputOptions(["-stream_loop", "-1"]);
+      cmd.complexFilter([
+        `[2:a]volume=${bgm.volume}[bgmDucked]`,
+        `[1:a][bgmDucked]amix=inputs=2:duration=first:dropout_transition=0[mix]`,
+      ]);
+      cmd.outputOptions(["-map", "0:v", "-map", "[mix]", "-c:v", "copy", "-c:a", "aac", "-t", String(videoDuration)]);
+    } else {
+      cmd.outputOptions(["-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-t", String(videoDuration)]);
+    }
+    // +faststart skipped: on constrained disk it can corrupt the moov atom; range-request serving handles moov-at-end fine
+    return cmd.output(output);
+  }, "audio mix", signal);
 }
 
 // ── Transcription ─────────────────────────────────────────────────────────────
@@ -468,6 +542,37 @@ function writeAss(segs: SrtSegment[], s: AssStyle, w: number, h: number, file: s
     `[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n${dlg}`, "utf-8");
 }
 
+// Escape an ASS subtitle file path for ffmpeg's filtergraph syntax.
+// Backslashes become forward slashes (Windows compatibility) and
+// colons get escaped so ffmpeg doesn't read the rest of the path as
+// filter options. Used by both the per-clip normalizeClip caption
+// bake-in and (historically) the standalone burn pass.
+function escapeAssPath(p: string): string {
+  return p.replace(/\\/g, "/").replace(/:/g, "\\:");
+}
+
+// Slice the absolute-timeline segment list down to a single beat's
+// window and re-base timings to be beat-relative. The per-beat
+// normalizeClip pass burns captions directly into each clip; each
+// beat needs only the segments that fall (or partially fall) within
+// its [beatStart, beatStart + duration) window, with start/end
+// shifted by -beatStart and clipped to [0, duration]. Segments that
+// span beat boundaries are sliced into both beats so the caption
+// text appears continuously across the concat boundary.
+function sliceSegmentsForBeat(segs: SrtSegment[], beatStart: number, duration: number): SrtSegment[] {
+  const beatEnd = beatStart + duration;
+  const out: SrtSegment[] = [];
+  for (const seg of segs) {
+    if (seg.end <= beatStart || seg.start >= beatEnd) continue;
+    const start = Math.max(seg.start, beatStart) - beatStart;
+    const end = Math.min(seg.end, beatEnd) - beatStart;
+    if (end > start) {
+      out.push({ index: out.length + 1, start, end, text: seg.text });
+    }
+  }
+  return out;
+}
+
 async function translateSegments(segs: SrtSegment[], lang: string, anthropic: Anthropic): Promise<SrtSegment[]> {
   if (!segs.length) return segs;
   const numbered = segs.map((s) => `${s.index}. ${s.text}`).join("\n");
@@ -507,6 +612,16 @@ async function translateSegments(segs: SrtSegment[], lang: string, anthropic: An
 interface AssemblyCheckpoint {
   core_hash: string;
   captions_hash: string;
+  // True when the per-beat clips in clip_urls had captions baked into
+  // their normalizeClip pass (the new pipeline). Compared against
+  // the current run's captionsEnabled at load — a mismatch (caption
+  // state flipped, or style changed) invalidates clip_urls and every
+  // visuals stage downstream, because the cached clips' caption
+  // layer (or its absence) won't match what this run wants. Old
+  // checkpoints written before this field existed read as undefined
+  // → falsy, which is the right default for projects that pre-date
+  // the bake-in path.
+  clips_baked_captions?: boolean;
   transcription_words?: TranscriptionWord[];
   clip_urls?: (string | null)[];
   joined_url?: string;
@@ -530,7 +645,21 @@ function coreHash(opts: AssembleOptions): string {
   // be in the core hash — toggling it invalidates everything from the
   // mix step down. Aspect ratio and voiceoverType already covered the
   // core but didn't anticipate the silence-trim flag.
-  return hashString(`${opts.aspectRatio}|${opts.voiceoverType}|${opts.trimSilenceEnabled ? "trim" : "raw"}`);
+  // Background music is also part of the audio mix, so a change
+  // (different file or different volume) must blow away the mixed
+  // checkpoint.
+  const bgmKey = opts.backgroundMusicUrl
+    ? `${opts.backgroundMusicUrl}@${opts.backgroundMusicVolume ?? 0.15}`
+    : "nobgm";
+  // resolution changes the dimensions every clip is encoded at, so it
+  // must invalidate the entire checkpoint chain from normalizeClip
+  // forward.
+  // Logo properties go into the core hash too — changing the file,
+  // position, or size invalidates the post-mix overlay output.
+  const logoKey = opts.logoUrl
+    ? `${opts.logoUrl}@${opts.logoSize ?? 0.1}x${opts.logoX ?? 0.85},${opts.logoY ?? 0.05}`
+    : "nologo";
+  return hashString(`${opts.aspectRatio}|${opts.voiceoverType}|${opts.trimSilenceEnabled ? "trim" : "raw"}|${bgmKey}|${opts.resolution ?? "1080p"}|${logoKey}`);
 }
 
 function captionsHash(opts: AssembleOptions): string {
@@ -557,6 +686,8 @@ async function isStopRequested(projectId: string): Promise<boolean> {
 
 // ── Background assembly job ───────────────────────────────────────────────────
 
+type ResolutionPreset = "720p" | "1080p" | "1440p" | "2160p";
+
 interface AssembleOptions {
   userId: string; projectId: string; aspectRatio: string; voiceoverType: "cleaned" | "original";
   captionsEnabled: boolean; captionsLanguage: string; captionsStyle: string; captionsSize: string; captionsPosition: string;
@@ -565,11 +696,45 @@ interface AssembleOptions {
   // beats. Toggled on by the assemble page's dedicated "Trim silences"
   // button — the user opts in explicitly.
   trimSilenceEnabled: boolean;
+  // Optional background music. When present, the file at this URL is
+  // downloaded and mixed under the voiceover at the given volume (0–1,
+  // default 0.15). The mix duration matches the voiceover so the track
+  // never extends past the narration. Empty/undefined disables bgm.
+  backgroundMusicUrl?: string | null;
+  backgroundMusicVolume?: number;
+  // Render resolution preset. Drives the [w, h] passed to normalizeClip
+  // for every per-beat clip. Defaults to "1080p" (1920×1080 for 16:9).
+  // Picked from the assemble page; backwards compat with the old
+  // hardcoded 480p when undefined keeps existing in-flight runs sane.
+  resolution?: ResolutionPreset;
+  // Optional channel logo overlay. URL is the user-uploaded logo
+  // image; position is the top-left corner as a fraction of video
+  // dimensions (0–1); size is the logo width as a fraction of video
+  // width. All three are needed to render the overlay — null/undefined
+  // disables it.
+  logoUrl?: string | null;
+  logoX?: number;
+  logoY?: number;
+  logoSize?: number;
+}
+
+// Aspect-ratio-aware dimensions for a resolution preset. The number
+// stays the "short side" for vertical (9:16) so the user gets a
+// portrait video at the expected total pixels (e.g. 1080p portrait =
+// 1080×1920 like TikTok/Reels), and the "long side" for 16:9 so 1080p
+// horizontal = 1920×1080 like YouTube. Square keeps it on both axes.
+function dimsFor(aspect: string, preset: ResolutionPreset | undefined): [number, number] {
+  const map = { "720p": { long: 1280, short: 720 }, "1080p": { long: 1920, short: 1080 }, "1440p": { long: 2560, short: 1440 }, "2160p": { long: 3840, short: 2160 } } as const;
+  const { long, short } = map[preset ?? "1080p"];
+  if (aspect === "9:16") return [short, long];
+  if (aspect === "1:1") return [short, short];
+  return [long, short]; // 16:9 default
 }
 
 async function runAssembly(opts: AssembleOptions): Promise<void> {
-  const { userId, projectId, aspectRatio, voiceoverType, captionsEnabled, captionsLanguage, captionsStyle, captionsSize, captionsPosition, trimSilenceEnabled } = opts;
-  const [w, h] = aspectRatio === "9:16" ? [480, 854] : aspectRatio === "1:1" ? [480, 480] : [854, 480];
+  const { userId, projectId, aspectRatio, voiceoverType, captionsEnabled, captionsLanguage, captionsStyle, captionsSize, captionsPosition, trimSilenceEnabled, backgroundMusicUrl, backgroundMusicVolume, resolution, logoUrl, logoX, logoY, logoSize } = opts;
+  const [w, h] = dimsFor(aspectRatio, resolution);
+  console.log(`[assemble] ${projectId}: resolution=${resolution ?? "1080p"} dims=${w}x${h}`);
 
   const progress = (msg: string) => {
     console.log(`[assemble] ${projectId}: ${msg}`);
@@ -618,10 +783,31 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
   {
     const loaded = await loadCheckpoint(projectId);
     if (loaded && loaded.core_hash === currentCoreHash) {
-      if (loaded.captions_hash === currentCaptionsHash) {
+      const prevBaked = !!loaded.clips_baked_captions;
+      const captionsMatch = loaded.captions_hash === currentCaptionsHash && prevBaked === captionsEnabled;
+      if (captionsMatch) {
         checkpoint = loaded;
+      } else if (captionsEnabled || prevBaked) {
+        // Captions are now baked into per-beat normalizeClip passes
+        // (instead of a downstream burn). So any change to caption
+        // state — toggling on/off or restyling — invalidates every
+        // cached clip and everything downstream. Keep just the audio
+        // side: transcription_words is style-independent and
+        // expensive to redo. The new run will re-encode clips with
+        // the right (or no) caption layer.
+        console.log(`[assemble] ${projectId}: caption state changed (baked=${prevBaked}→${captionsEnabled}, hash=${loaded.captions_hash}→${currentCaptionsHash}) — discarding visuals checkpoint`);
+        checkpoint = {
+          core_hash: loaded.core_hash,
+          captions_hash: currentCaptionsHash,
+          transcription_words: loaded.transcription_words,
+        };
       } else {
-        console.log(`[assemble] ${projectId}: captions opts changed — discarding captioned_url`);
+        // captionsEnabled=false on both sides — nothing was baked in
+        // either way. Only the standalone captioned_url would have
+        // been affected, but that no longer exists on this path.
+        // Old checkpoints with a captioned_url field are tolerated
+        // (the field just goes unused).
+        console.log(`[assemble] ${projectId}: captions opts changed (off→off) — checkpoint usable as-is`);
         checkpoint = { ...loaded, captions_hash: currentCaptionsHash, captioned_url: undefined };
       }
     } else {
@@ -706,17 +892,18 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
 
     if (perBeatMode) {
       // ── PER-BEAT PATH ────────────────────────────────────────────────
-      await checkStop();
-      await progress(`Downloading ${beats.length} beat voiceovers…`);
-      const rawAudioPaths: string[] = [];
-      for (let i = 0; i < beats.length; i++) {
-        await checkStop();
-        const beat = beats[i];
-        const audioPath = path.join(tmpDir, `audio_${String(i).padStart(3, "0")}.mp3`);
-        await downloadFile(beat.voiceover_url!, audioPath);
-        rawAudioPaths.push(audioPath);
-      }
-
+      //
+      // Three previous sequential loops (download → trim → measure)
+      // collapsed into one worker pool that processes each beat
+      // end-to-end. Same admin-tunable concurrency knob the visuals
+      // pool uses (assembly_beats from product_config), so the audio
+      // and visuals stages scale together when ops dials it up.
+      //
+      // Output arrays are pre-allocated and indexed by beat position
+      // so workers can't race — `audioPaths[i]` and
+      // `measuredDurations[i]` are written exactly once each. The
+      // concat list below still reads in beat order, unchanged.
+      //
       // Optional per-beat silence trim. Off by default — only runs
       // when the user clicked "Trim silences" on the assemble page,
       // which sets trimSilenceEnabled=true. Each render normally ships
@@ -729,30 +916,61 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
       // voiceover_duration_ms is wrong (it describes untrimmed audio),
       // so re-measure via ffprobe on the trimmed file. With trim off,
       // prefer the cached value when present to save the ffprobe call.
-      const audioPaths: string[] = [];
-      const measuredDurations: number[] = [];
-      if (trimSilenceEnabled) {
+      await checkStop();
+      await progress(`Preparing ${beats.length} beat voiceovers…`);
+      const audioPaths: string[] = new Array(beats.length).fill("");
+      const measuredDurations: number[] = new Array(beats.length).fill(0);
+
+      const audioLimit = Math.max(1, Math.min(getAssemblyBeatLimit(), beats.length));
+      let nextAudioIdx = 0;
+      let audioCompleted = 0;
+      let audioFirstError: Error | null = null;
+
+      const processOneAudio = async (i: number): Promise<void> => {
         await checkStop();
-        await progress(`Trimming silence on ${rawAudioPaths.length} clips…`);
-        for (let i = 0; i < rawAudioPaths.length; i++) {
-          await checkStop();
-          const trimmed = path.join(tmpDir, `audio_trim_${String(i).padStart(3, "0")}.mp3`);
-          await trimSilence(rawAudioPaths[i], trimmed, signal);
+        const beat = beats[i];
+        const rawPath = path.join(tmpDir, `audio_raw_${String(i).padStart(3, "0")}.mp3`);
+        await downloadFile(beat.voiceover_url!, rawPath);
+        if (trimSilenceEnabled) {
+          const trimmed = path.join(tmpDir, `audio_${String(i).padStart(3, "0")}.mp3`);
+          await trimSilence(rawPath, trimmed, signal);
           const dur = await getMediaDuration(trimmed);
-          audioPaths.push(trimmed);
-          measuredDurations.push(Math.max(0.1, dur));
-          try { fs.unlinkSync(rawAudioPaths[i]); } catch { /* ignore */ }
-        }
-      } else {
-        for (let i = 0; i < rawAudioPaths.length; i++) {
-          await checkStop();
-          const beat = beats[i];
+          audioPaths[i] = trimmed;
+          measuredDurations[i] = Math.max(0.1, dur);
+          try { fs.unlinkSync(rawPath); } catch { /* ignore */ }
+        } else {
           let dur = beat.voiceover_duration_ms ? beat.voiceover_duration_ms / 1000 : 0;
-          if (!dur || dur <= 0) dur = await getMediaDuration(rawAudioPaths[i]);
-          audioPaths.push(rawAudioPaths[i]);
-          measuredDurations.push(Math.max(0.1, dur));
+          if (!dur || dur <= 0) dur = await getMediaDuration(rawPath);
+          audioPaths[i] = rawPath;
+          measuredDurations[i] = Math.max(0.1, dur);
         }
-      }
+      };
+
+      const audioWorker = async (): Promise<void> => {
+        while (true) {
+          if (audioFirstError) return;
+          const i = nextAudioIdx++;
+          if (i >= beats.length) return;
+          try {
+            await processOneAudio(i);
+          } catch (e) {
+            // Unlike the visuals pool, an audio failure can't be
+            // silently skipped — a missing beat's audio leaves the
+            // master voiceover with a gap and throws off every
+            // downstream duration. Bubble the first error and let
+            // the other workers wind down on the next iteration.
+            if (!audioFirstError) audioFirstError = e instanceof Error ? e : new Error(String(e));
+            return;
+          }
+          audioCompleted++;
+          if (beats.length > 0) {
+            await progress(`Prepared ${audioCompleted} of ${beats.length} beat voiceovers…`);
+          }
+        }
+      };
+
+      await Promise.all(Array.from({ length: audioLimit }, () => audioWorker()));
+      if (audioFirstError) throw audioFirstError;
 
       durations = measuredDurations;
       totalDuration = durations.reduce((s, d) => s + d, 0);
@@ -787,6 +1005,23 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
           if (transcriptionWords.length) {
             checkpoint.transcription_words = transcriptionWords;
             await persistCheckpoint();
+            // Log the cost — sum of characters across all returned
+            // words. ElevenLabs Scribe is the only real upstream
+            // charge in the assembler; ffmpeg work runs on our own
+            // Render box. Same approach in the legacy path below.
+            const chars = transcriptionWords.reduce(
+              (sum, w) => sum + (w.text ?? w.word ?? "").length,
+              0,
+            );
+            void logProjectCost({
+              projectId,
+              userId,
+              step: "assemble",
+              provider: "elevenlabs",
+              model: "scribe_v1",
+              units: chars,
+              unitKind: "elevenlabs_chars",
+            });
           }
         }
       }
@@ -826,6 +1061,20 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
         if (transcriptionWords.length) {
           checkpoint.transcription_words = transcriptionWords;
           await persistCheckpoint();
+          // Same cost log as the per-beat path above.
+          const chars = transcriptionWords.reduce(
+            (sum, w) => sum + (w.text ?? w.word ?? "").length,
+            0,
+          );
+          void logProjectCost({
+            projectId,
+            userId,
+            step: "assemble",
+            provider: "elevenlabs",
+            model: "scribe_v1",
+            units: chars,
+            unitKind: "elevenlabs_chars",
+          });
         }
       } else {
         console.log(`[assemble] ${projectId}: skipping STT — beats already aligned and captions disabled`);
@@ -864,6 +1113,48 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
       }
     }
 
+    // Captions: build the segment list ONCE here, then bake a per-beat
+    // slice into each clip's normalizeClip pass below. This replaces
+    // the old downstream burnSubtitles full-video re-encode — the
+    // encoder is already running per beat for scale/pad/logo, so
+    // adding the ass filter is essentially free. Translation also
+    // runs once at this point so every per-beat slice carries
+    // pre-translated text.
+    //
+    // The base segment list comes from STT word timings when
+    // available (most accurate) or proportional segmentation of each
+    // beat's script_segment as a fallback (when STT silently failed).
+    // The fallback path used to live inside the burn block; moving it
+    // up here means a missing STT no longer surfaces as a late
+    // "captions disabled" surprise.
+    let baseCaptionSegs: SrtSegment[] = [];
+    if (captionsEnabled) {
+      const raw = transcriptionWords.length > 0
+        ? buildSrtSegments(transcriptionWords)
+        : buildSrtSegmentsFromBeats(beats, durations);
+      if (!raw.length) {
+        throw new Error("No caption segments could be generated — check that beats have script text");
+      }
+      if (captionsLanguage !== "source") {
+        await checkStop();
+        await progress(`Translating captions to ${captionsLanguage}…`);
+        const anthropic = await getAnthropicClient(userId);
+        baseCaptionSegs = await translateSegments(raw, captionsLanguage, anthropic);
+      } else {
+        baseCaptionSegs = raw;
+      }
+      console.log(`[assemble] ${projectId}: prepared ${baseCaptionSegs.length} caption segments to bake into per-beat clips`);
+    }
+
+    // Cumulative start time of each beat in the master timeline,
+    // computed once from durations[] so the per-beat slicer doesn't
+    // re-sum on every loop iteration. cumulativeStarts[i] is the
+    // offset where beat i's clip begins after concat.
+    const cumulativeStarts: number[] = new Array(beats.length).fill(0);
+    for (let i = 1; i < beats.length; i++) {
+      cumulativeStarts[i] = cumulativeStarts[i - 1] + durations[i - 1];
+    }
+
     // ── Stage B: per-clip normalization → concat → joined.mp4 ───────────
     //
     // Each clip is uploaded to R2 after encoding (checkpoint.clip_urls[i])
@@ -871,25 +1162,105 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
     // re-download cached clips instead of re-encoding them.
     if (!checkpoint.joined_url) {
       checkpoint.clip_urls = checkpoint.clip_urls ?? new Array(beats.length).fill(null);
+      // Stamp the bake-in mode on the checkpoint so the loader can
+      // detect a state flip on a future Resume (e.g. user disabled
+      // captions after a Stop). Persist BEFORE the worker pool
+      // launches — clip uploads are fire-and-forget below, so the
+      // first one's checkpoint write isn't guaranteed to land before
+      // a Stop arrives. This explicit upfront persist closes that
+      // window and only costs one DB write.
+      checkpoint.clips_baked_captions = captionsEnabled;
+      await persistCheckpoint();
       const clipPaths: string[] = new Array(beats.length).fill("");
       await progress("Processing video clips…");
-      for (let i = 0; i < beats.length; i++) {
+
+      // Fire-and-forget machinery for the per-clip R2 upload + the
+      // checkpoint persist that follows it. Workers used to block on
+      // the R2 round-trip (~200-800ms each) before returning to the
+      // pool — for a 100-beat project that was 30-80s of upload
+      // latency the encoder was idle on. Hand the upload to a
+      // background promise instead, and drain any still-in-flight
+      // ones at the post-pool sync point below.
+      //
+      // persistChain serializes the checkpoint writes so two
+      // concurrent uploads can't race: without it, persist A could
+      // serialize its JSON payload (containing url-A), then persist
+      // B writes (containing both A + B), then persist A's HTTP
+      // request lands AFTER B's, clobbering B's url. The chain
+      // forces them through one at a time even when many uploads
+      // finish back-to-back.
+      const pendingClipUploads = new Set<Promise<void>>();
+      let persistChain: Promise<void> = Promise.resolve();
+      const persistSerial = (): Promise<void> => {
+        persistChain = persistChain.then(persistCheckpoint, persistCheckpoint);
+        return persistChain;
+      };
+
+      // Download the channel logo once so every clip in the worker
+      // pool can read it. Baking the overlay into the per-clip
+      // encode here replaces the old Stage D.5 full-video re-encode.
+      // The coreHash already includes logoKey, so any cached clips
+      // we restore from checkpoint were encoded with the same logo
+      // settings — no risk of mixing logoed/non-logoed clips.
+      let stageBLogoOverlay: LogoOverlay | null = null;
+      if (logoUrl) {
         await checkStop();
+        await progress("Downloading channel logo…");
+        const logoPath = path.join(tmpDir, "logo");
+        try {
+          await downloadFile(logoUrl, logoPath);
+          stageBLogoOverlay = {
+            logoPath,
+            sizePct: typeof logoSize === "number" ? logoSize : 0.1,
+            xPct:    typeof logoX === "number"    ? logoX    : 0.85,
+            yPct:    typeof logoY === "number"    ? logoY    : 0.05,
+          };
+        } catch (e) {
+          console.warn(`[assemble] logo download failed, encoding clips without overlay:`, e);
+        }
+      }
+
+      // Worker-pool over the beat list. Each worker pulls the next
+      // un-claimed index, processes it independently, then loops back
+      // for more. clipPaths[]/checkpoint.clip_urls[] are indexed by
+      // beat position so there are no inter-worker write conflicts.
+      // STOPPED_MARKER propagates via firstError so all in-flight
+      // workers bail at the next iteration.
+      const beatLimit = Math.max(1, Math.min(getAssemblyBeatLimit(), beats.length));
+      let nextIdx = 0;
+      let completed = 0;
+      let firstError: Error | null = null;
+
+      const processOne = async (i: number): Promise<void> => {
         const clipPath = path.join(tmpDir, `clip_${String(i).padStart(3, "0")}.mp4`);
-        const cached = checkpoint.clip_urls[i];
+        const cached = checkpoint.clip_urls![i];
         if (cached) {
-          await progress(`Restoring clip ${i + 1} of ${beats.length}…`);
           try {
             await downloadFile(cached, clipPath);
             clipPaths[i] = clipPath;
-            continue;
+            return;
           } catch (e) {
             console.warn(`[assemble] beat ${beats[i].beat_number}: cached clip download failed, re-encoding:`, e);
             // fall through to fresh encode
           }
         }
         const beat = beats[i];
-        await progress(`Processing clip ${i + 1} of ${beats.length}…`);
+        // Captions bake-in: slice the master segment list to this
+        // beat's [beatStart, beatStart + duration) window, shift to
+        // beat-relative timings, and write a per-beat ASS file.
+        // normalizeClip will inject `ass=<path>` into its filter
+        // chain so captions land on the clip as part of the same
+        // encoder pass that's already doing scale/pad/logo. Empty
+        // slices (no captions in this beat's window) just write an
+        // events-less ASS file — ffmpeg renders no overlay text but
+        // the filter is still invoked harmlessly.
+        let beatSubtitles: { assPath: string } | null = null;
+        if (captionsEnabled && baseCaptionSegs.length > 0) {
+          const beatSegs = sliceSegmentsForBeat(baseCaptionSegs, cumulativeStarts[i], durations[i]);
+          const assPath = path.join(tmpDir, `captions_${String(i).padStart(3, "0")}.ass`);
+          writeAss(beatSegs, buildAssStyle(captionsStyle, captionsSize, captionsPosition, h), w, h, assPath);
+          beatSubtitles = { assPath };
+        }
         try {
           if (beat.video_url) {
             const ext = beat.video_url.includes(".webm") ? "webm" : "mp4";
@@ -897,7 +1268,7 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
             console.log(`[assemble] beat ${beat.beat_number}: downloading video…`);
             await downloadFile(beat.video_url, src);
             console.log(`[assemble] beat ${beat.beat_number}: encoding clip…`);
-            await normalizeClip(src, false, durations[i], clipPath, w, h, signal);
+            await normalizeClip(src, false, durations[i], clipPath, w, h, stageBLogoOverlay, beatSubtitles, signal);
             try { fs.unlinkSync(src); } catch { /* ignore */ }
           } else if (beat.image_url) {
             const ext = beat.image_url.toLowerCase().includes(".png") ? "png" : "jpg";
@@ -905,25 +1276,86 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
             console.log(`[assemble] beat ${beat.beat_number}: downloading image…`);
             await downloadFile(beat.image_url, src);
             console.log(`[assemble] beat ${beat.beat_number}: encoding clip…`);
-            await normalizeClip(src, true, durations[i], clipPath, w, h, signal);
+            await normalizeClip(src, true, durations[i], clipPath, w, h, stageBLogoOverlay, beatSubtitles, signal);
             try { fs.unlinkSync(src); } catch { /* ignore */ }
           }
-          // Upload the normalized clip so a future Stop can resume past it.
-          try {
-            const clipUrl = await uploadFile(ckptPathFor(`clip_${String(i).padStart(3, "0")}.mp4`), clipPath, "video/mp4");
-            checkpoint.clip_urls[i] = clipUrl;
-            await persistCheckpoint();
-          } catch (uploadErr) {
-            console.warn(`[assemble] beat ${beat.beat_number}: clip checkpoint upload failed:`, uploadErr);
-            // Not fatal — we just lose the resume guarantee for this clip.
-          }
-          console.log(`[assemble] beat ${beat.beat_number}: done`);
+          if (beatSubtitles) { try { fs.unlinkSync(beatSubtitles.assPath); } catch { /* ignore */ } }
+          // Fire-and-forget the clip upload (and the serialized
+          // checkpoint persist that follows) so this worker is free
+          // to grab the next beat immediately instead of stalling on
+          // R2 latency. See pendingClipUploads block above for the
+          // design notes. The drain at the end of Stage B awaits any
+          // still-pending uploads before concat unlinks the local
+          // files.
+          const uploadPromise = (async () => {
+            try {
+              const clipUrl = await uploadFile(ckptPathFor(`clip_${String(i).padStart(3, "0")}.mp4`), clipPath, "video/mp4");
+              checkpoint.clip_urls![i] = clipUrl;
+              await persistSerial();
+            } catch (uploadErr) {
+              console.warn(`[assemble] beat ${beat.beat_number}: clip checkpoint upload failed:`, uploadErr);
+              // Not fatal — we just lose the resume guarantee for
+              // this clip. Worker has already returned by this point.
+            }
+          })();
+          pendingClipUploads.add(uploadPromise);
+          void uploadPromise.finally(() => { pendingClipUploads.delete(uploadPromise); });
+          console.log(`[assemble] beat ${beat.beat_number}: encode done (upload in flight)`);
           clipPaths[i] = clipPath;
         } catch (e) {
           if (e instanceof Error && e.message === STOPPED_MARKER) throw e;
           console.error(`[assemble] beat ${beats[i].beat_number} skipped:`, e);
           // leave clipPaths[i] as "" — filtered out of concat below
         }
+      };
+
+      const beatWorker = async (): Promise<void> => {
+        while (true) {
+          if (firstError) return;
+          const i = nextIdx++;
+          if (i >= beats.length) return;
+          try {
+            await checkStop();
+            await processOne(i);
+          } catch (e) {
+            if (e instanceof Error && (e.message === STOPPED_MARKER || /stop/i.test(e.message))) {
+              if (!firstError) firstError = e;
+              return;
+            }
+            // processOne already swallows non-stop errors per-beat;
+            // anything that bubbles here is a stop signal.
+            if (!firstError) firstError = e instanceof Error ? e : new Error(String(e));
+            return;
+          }
+          completed++;
+          if (beats.length > 0) {
+            await progress(`Processed ${completed} of ${beats.length} clips…`);
+          }
+        }
+      };
+
+      await Promise.all(Array.from({ length: beatLimit }, () => beatWorker()));
+
+      // Drain pending fire-and-forget clip uploads BEFORE either
+      // throwing (Stop case) or moving on to concat. Two reasons:
+      //   1. Checkpoint must reflect work that actually landed in
+      //      R2, otherwise a Resume re-encodes clips we paid for.
+      //   2. concat unlinks each clipPath after reading the concat
+      //      list — an upload still reading the file at that point
+      //      would fail and leave the checkpoint stale.
+      // allSettled is defensive: uploadPromise catches its own
+      // errors (so it never rejects today), but allSettled keeps
+      // the drain working if that ever changes.
+      if (pendingClipUploads.size > 0) {
+        await progress(`Finalizing ${pendingClipUploads.size} clip checkpoints…`);
+        await Promise.allSettled([...pendingClipUploads]);
+      }
+      if (firstError) throw firstError;
+
+      // Logo was baked into each clip; the source file isn't needed
+      // for any later stage.
+      if (stageBLogoOverlay) {
+        try { fs.unlinkSync(stageBLogoOverlay.logoPath); } catch { /* ignore */ }
       }
 
       await checkStop();
@@ -1023,13 +1455,42 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
         }
       }
       await checkStop();
-      await progress("Mixing voiceover…");
+      // Download the user's background music to a local temp file if
+      // one was provided. Failure here logs and disables bgm rather
+      // than failing the entire mix — the assembly still succeeds with
+      // voiceover-only audio so the user doesn't lose progress over a
+      // music-file outage.
+      let bgmPath: string | null = null;
+      let bgmVolume = backgroundMusicVolume ?? 0.15;
+      // Clamp volume to a sensible range so an accidental >1 doesn't
+      // produce a wall-of-music clip and a negative doesn't crash.
+      if (bgmVolume < 0) bgmVolume = 0;
+      if (bgmVolume > 1) bgmVolume = 1;
+      if (backgroundMusicUrl) {
+        try {
+          await progress("Downloading background music…");
+          bgmPath = path.join(tmpDir, "bgm.mp3");
+          await downloadFile(backgroundMusicUrl, bgmPath);
+        } catch (e) {
+          console.warn(`[assemble] bgm download failed, continuing without music:`, e);
+          bgmPath = null;
+        }
+      }
+      await progress(bgmPath ? "Mixing voiceover + music…" : "Mixing voiceover…");
       // Cap at totalDuration (voiceover length). The pad step above
       // ensures the video is at least totalDuration when there's
       // significant trailing silence; the cap also trims any tiny
       // encoding-rounding overshoot.
-      await mixAudio(mixSrc, voiceoverPath, outputPath, totalDuration, signal);
+      await mixAudio(
+        mixSrc,
+        voiceoverPath,
+        outputPath,
+        totalDuration,
+        signal,
+        bgmPath ? { path: bgmPath, volume: bgmVolume } : null,
+      );
       try { fs.unlinkSync(mixSrc); } catch { /* ignore */ }
+      if (bgmPath) { try { fs.unlinkSync(bgmPath); } catch { /* ignore */ } }
       try {
         const mixedUrl = await uploadFile(ckptPathFor("mixed.mp4"), outputPath, "video/mp4");
         checkpoint.mixed_url = mixedUrl;
@@ -1039,48 +1500,21 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
       }
     }
 
-    // ── Stage E: burn captions → captioned.mp4 (optional) ────────────────
-    let finalPath = outputPath;
-    if (captionsEnabled) {
-      if (checkpoint.captioned_url) {
-        await checkStop();
-        await progress("Restoring captioned video…");
-        const cached = path.join(tmpDir, "captioned.mp4");
-        await downloadFile(checkpoint.captioned_url, cached);
-        try { fs.unlinkSync(outputPath); } catch { /* ignore */ }
-        finalPath = cached;
-      } else {
-        await checkStop();
-        await progress("Generating captions…");
-        let segs = transcriptionWords.length > 0 ? buildSrtSegments(transcriptionWords) : buildSrtSegmentsFromBeats(beats, durations);
-        console.log(`[assemble] ${projectId}: ${segs.length} caption segments`);
-        if (!segs.length) throw new Error("No caption segments could be generated — check that beats have script text");
-        if (captionsLanguage !== "source") {
-          await progress(`Translating captions to ${captionsLanguage}…`);
-          const anthropic = await getAnthropicClient(userId);
-          segs = await translateSegments(segs, captionsLanguage, anthropic);
-        }
-        const assPath = path.join(tmpDir, "captions.ass");
-        writeAss(segs, buildAssStyle(captionsStyle, captionsSize, captionsPosition, h), w, h, assPath);
-        console.log(`[assemble] ${projectId}: ASS file written → ${assPath}`);
-        await checkStop();
-        await progress("Burning captions…");
-        const captionedPath = path.join(tmpDir, "captioned.mp4");
-        await burnSubtitles(outputPath, assPath, captionedPath, signal);
-        try { fs.unlinkSync(outputPath); } catch { /* ignore */ }
-        finalPath = captionedPath;
-        console.log(`[assemble] ${projectId}: captions burned`);
-        try {
-          const captionedUrl = await uploadFile(ckptPathFor("captioned.mp4"), captionedPath, "video/mp4");
-          checkpoint.captioned_url = captionedUrl;
-          await persistCheckpoint();
-        } catch (e) {
-          console.warn(`[assemble] captioned.mp4 checkpoint upload failed:`, e);
-        }
-      }
-    }
+    // Stage D.5 (full-video logo re-encode) used to live here. It was
+    // replaced by baking the logo into the per-clip Stage B encode —
+    // saves a full-video re-encode pass on every assembly.
+    //
+    // Stage E (standalone burnSubtitles full-video re-encode) used to
+    // run here too. Captions are now baked into each beat's
+    // normalizeClip pass (Stage B) so the mixAudio output already
+    // carries the burned-in caption layer. Eliminating the second
+    // whole-video re-encode saves several minutes on long captioned
+    // projects. The fallback path through buildSrtSegmentsFromBeats
+    // and the translation step were moved upstream too — see the
+    // baseCaptionSegs block above Stage B.
 
     // ── Stage F: validate + remux + upload final ────────────────────────
+    const finalPath = outputPath;
     const finalStat = fs.statSync(finalPath);
     console.log(`[assemble] ${projectId}: final file size = ${finalStat.size} bytes`);
     if (finalStat.size < 1024) throw new Error(`Assembly produced an invalid output (${finalStat.size} bytes) — ffmpeg may have failed silently`);
@@ -1137,6 +1571,7 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
         assembly_error: null,
         assembly_checkpoint: null,
         assembly_stop_requested: false,
+        assembly_finished_at: new Date().toISOString(),
         current_state: 15,
       })
       .eq("id", projectId);
@@ -1156,6 +1591,7 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
           assembly_progress: "Stopped — click Resume to continue",
           assembly_error: null,
           assembly_stop_requested: false,
+          assembly_finished_at: new Date().toISOString(),
         })
         .eq("id", projectId);
     } else {
@@ -1163,7 +1599,12 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
       previewFiles.delete(projectId);
       try { fs.unlinkSync(path.join(PREVIEW_DIR, `${projectId}.mp4`)); } catch { /* ignore */ }
       await supabase.from("projects")
-        .update({ assembly_status: "failed", assembly_error: message, assembly_progress: null })
+        .update({
+          assembly_status: "failed",
+          assembly_error: message,
+          assembly_progress: null,
+          assembly_finished_at: new Date().toISOString(),
+        })
         .eq("id", projectId);
       // Drop checkpoint on real failures so the next attempt starts clean.
       await clearCheckpoint(projectId).catch(() => {});
@@ -1177,25 +1618,83 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
 
 // ── Assembly queue poll loop ──────────────────────────────────────────────────
 
+// Admin-tunable concurrency for the assembly worker. Read from
+// product_config.batched_processes every ~30s so the dashboard can
+// raise/lower these without restarting the worker.
+//   assemblyProjectLimit  → how many whole assemblies run in parallel
+//   assemblyBeatLimit     → parallel beats per assembly (Stage B) —
+//                           consumed inside runAssembly via getAssemblyBeatLimit()
+let assemblyProjectLimit = 1;
+let assemblyBeatLimit = 1;
+
+export function getAssemblyBeatLimit(): number {
+  return assemblyBeatLimit;
+}
+
+async function refreshAssemblyConcurrency(): Promise<void> {
+  try {
+    const { data } = await supabase
+      .from("product_config")
+      .select("batched_processes")
+      .eq("service", "_global")
+      .single();
+    const cfg = (data as { batched_processes?: { assembly_projects?: unknown; assembly_beats?: unknown } } | null)?.batched_processes;
+    const projRaw = cfg?.assembly_projects;
+    const beatRaw = cfg?.assembly_beats;
+    const proj = typeof projRaw === "number" ? projRaw : Number(projRaw);
+    const beat = typeof beatRaw === "number" ? beatRaw : Number(beatRaw);
+    if (Number.isInteger(proj) && proj >= 1 && proj <= 5 && proj !== assemblyProjectLimit) {
+      console.log(`[assembly-queue] project limit changed: ${assemblyProjectLimit} → ${proj}`);
+      assemblyProjectLimit = proj;
+    }
+    if (Number.isInteger(beat) && beat >= 1 && beat <= 10 && beat !== assemblyBeatLimit) {
+      console.log(`[assembly-queue] beat limit changed: ${assemblyBeatLimit} → ${beat}`);
+      assemblyBeatLimit = beat;
+    }
+  } catch (err) {
+    console.warn("[assembly-queue] Failed to refresh concurrency from product_config:", err instanceof Error ? err.message : err);
+  }
+}
+
 async function assemblyPollLoop() {
-  console.log("[assembly-queue] poll loop started");
+  await refreshAssemblyConcurrency();
+  console.log(`[assembly-queue] poll loop started (projects=${assemblyProjectLimit}, beats=${assemblyBeatLimit})`);
+  let ticks = 0;
   while (true) {
     try {
-      if (assemblingProjects.size === 0) {
+      // Re-read admin knobs every ~30s (6 ticks × 5s) so changes propagate
+      // without a worker restart.
+      if (ticks++ % 6 === 0) await refreshAssemblyConcurrency();
+
+      const slots = assemblyProjectLimit - assemblingProjects.size;
+      if (slots > 0) {
         const { data: rows } = await supabase
           .from("projects")
           .select("id, user_id")
           .eq("assembly_status", "queued")
-          .limit(1);
+          .limit(slots);
 
         for (const row of rows ?? []) {
           const projectId = row.id as string;
           const userId = row.user_id as string;
 
-          // Atomic claim
+          // Skip if it's already in flight (race between fetch + claim).
+          if (assemblingProjects.has(projectId)) continue;
+
+          // Atomic claim. assembly_started_at is stamped here so the
+          // duration we compute later reflects wall-clock from worker
+          // pickup — not from the user's click (which sat in the
+          // queue waiting for a free slot). assembly_finished_at is
+          // cleared so a Resume after a Stop doesn't carry a stale
+          // finish stamp from the prior attempt.
           const { data: claimed } = await supabase
             .from("projects")
-            .update({ assembly_status: "processing", assembly_progress: "Starting…" })
+            .update({
+              assembly_status: "processing",
+              assembly_progress: "Starting…",
+              assembly_started_at: new Date().toISOString(),
+              assembly_finished_at: null,
+            })
             .eq("id", projectId)
             .eq("assembly_status", "queued")
             .select("id")
@@ -1204,6 +1703,7 @@ async function assemblyPollLoop() {
           if (!claimed) continue;
 
           const opts = (await redis.get(`assembly:${projectId}`) as Record<string, unknown> | null) ?? {};
+          console.log(`[assembly-queue] ${projectId}: opts from redis = bgm=${JSON.stringify(opts.backgroundMusicUrl)} vol=${JSON.stringify(opts.backgroundMusicVolume)} logo=${JSON.stringify(opts.logoUrl)} logoXY=${JSON.stringify(opts.logoX)},${JSON.stringify(opts.logoY)} logoSize=${JSON.stringify(opts.logoSize)} keys=[${Object.keys(opts).join(",")}]`);
 
           assemblingProjects.add(projectId);
           runAssembly({
@@ -1217,6 +1717,13 @@ async function assemblyPollLoop() {
             captionsSize: (opts.captionsSize as string | undefined) ?? "medium",
             captionsPosition: (opts.captionsPosition as string | undefined) ?? "bottom",
             trimSilenceEnabled: (opts.trimSilenceEnabled as boolean | undefined) ?? false,
+            backgroundMusicUrl: (opts.backgroundMusicUrl as string | undefined) ?? null,
+            backgroundMusicVolume: (opts.backgroundMusicVolume as number | undefined) ?? 0.15,
+            resolution: (opts.resolution as ResolutionPreset | undefined) ?? "1080p",
+            logoUrl: (opts.logoUrl as string | undefined) ?? null,
+            logoX: (opts.logoX as number | undefined) ?? 0.85,
+            logoY: (opts.logoY as number | undefined) ?? 0.05,
+            logoSize: (opts.logoSize as number | undefined) ?? 0.1,
           }).finally(() => {
             assemblingProjects.delete(projectId);
             redis.del(`assembly:${projectId}`).catch(() => {});
@@ -1334,11 +1841,25 @@ export function setupAssembleRoute(app: Express): void {
       captionsEnabled = false, captionsLanguage = "source",
       captionsStyle = "classic", captionsSize = "medium", captionsPosition = "bottom",
       trimSilenceEnabled = false,
+      backgroundMusicUrl = null,
+      backgroundMusicVolume = 0.15,
+      resolution = "1080p",
+      logoUrl = null,
+      logoX = 0.85,
+      logoY = 0.05,
+      logoSize = 0.1,
     } = req.body as {
       token: string; projectId: string; aspectRatio?: string; voiceoverType?: "cleaned" | "original";
       captionsEnabled?: boolean; captionsLanguage?: string;
       captionsStyle?: string; captionsSize?: string; captionsPosition?: string;
       trimSilenceEnabled?: boolean;
+      backgroundMusicUrl?: string | null;
+      backgroundMusicVolume?: number;
+      resolution?: ResolutionPreset;
+      logoUrl?: string | null;
+      logoX?: number;
+      logoY?: number;
+      logoSize?: number;
     };
 
     if (!token) { res.status(401).json({ error: "Unauthorized" }); return; }
@@ -1361,9 +1882,17 @@ export function setupAssembleRoute(app: Express): void {
       return;
     }
 
-    // Mark as processing immediately so the client sees state change on next poll
+    // Mark as processing immediately so the client sees state change on next poll.
+    // assembly_started_at / _finished_at maintained the same way as the
+    // queue claim site for consistent analytics across both entry paths.
     await supabase.from("projects")
-      .update({ assembly_status: "processing", assembly_progress: "Starting…", assembly_error: null })
+      .update({
+        assembly_status: "processing",
+        assembly_progress: "Starting…",
+        assembly_error: null,
+        assembly_started_at: new Date().toISOString(),
+        assembly_finished_at: null,
+      })
       .eq("id", projectId).eq("user_id", user.id);
 
     assemblingProjects.add(projectId);
@@ -1372,6 +1901,13 @@ export function setupAssembleRoute(app: Express): void {
     runAssembly({ userId: user.id, projectId, aspectRatio, voiceoverType: voiceoverType as "cleaned" | "original",
       captionsEnabled: Boolean(captionsEnabled), captionsLanguage, captionsStyle, captionsSize, captionsPosition,
       trimSilenceEnabled: Boolean(trimSilenceEnabled),
+      backgroundMusicUrl,
+      backgroundMusicVolume: typeof backgroundMusicVolume === "number" ? backgroundMusicVolume : 0.15,
+      resolution,
+      logoUrl,
+      logoX: typeof logoX === "number" ? logoX : 0.85,
+      logoY: typeof logoY === "number" ? logoY : 0.05,
+      logoSize: typeof logoSize === "number" ? logoSize : 0.1,
     }).catch(console.error).finally(() => assemblingProjects.delete(projectId));
 
     res.json({ started: true });

@@ -1,5 +1,5 @@
 import fs from "fs";
-import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
+import { S3Client, PutObjectCommand, DeleteObjectsCommand } from "@aws-sdk/client-s3";
 import { supabase } from "./supabase.js";
 
 // user_id → folder-name cache. The worker uploads on behalf of users
@@ -73,4 +73,24 @@ export async function uploadFromUrl(path: string, url: string, contentType: stri
   if (!res.ok) throw new Error(`Failed to download ${url}`);
   const buffer = await res.arrayBuffer();
   return uploadBuffer(path, buffer, contentType);
+}
+
+// Best-effort delete of a single object by R2 key. Mirrors the engine's
+// helper at lib/supabase/storage.ts so callers in the worker can clean
+// up the previous video file after a successful regeneration upload.
+// Quiet — a missing key is not an error.
+export async function deleteObject(key: string): Promise<void> {
+  if (!BUCKET) return;
+  await r2.send(new DeleteObjectsCommand({
+    Bucket: BUCKET,
+    Delete: { Objects: [{ Key: key }], Quiet: true },
+  }));
+}
+
+// Convert a R2 public URL back to its bucket key. Returns null when the
+// URL is unrelated to our R2 bucket so callers can skip the delete.
+export function r2KeyFromUrl(url: string): string | null {
+  if (!PUBLIC_URL) return null;
+  if (!url.startsWith(PUBLIC_URL + "/")) return null;
+  return url.slice(PUBLIC_URL.length + 1);
 }
