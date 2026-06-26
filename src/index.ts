@@ -50,7 +50,27 @@ if (ytCookies) {
 }
 
 // Clear stale "processing" assemblies BEFORE accepting connections to avoid
-// the race where the cleanup fires after a new assembly job has already started
+// the race where the cleanup fires after a new assembly job has already started.
+//
+// Two-pass cleanup: honor in-flight stops FIRST, then re-queue the rest.
+// If the worker was OOM-killed mid-encode after the user clicked Stop, the
+// graceful catch in assemble.ts never ran — assembly_status is still
+// "processing" and assembly_stop_requested is still true. Without this
+// pass, the next worker would re-queue → re-claim → honor stop → clear
+// the flag → another worker re-claims with no stop flag and runs to
+// completion (or another OOM), and the UI flaps between states forever.
+const { error: stopHonorError } = await supabase.from("projects")
+  .update({
+    assembly_status: "stopped",
+    assembly_progress: "Stopped — click Resume to continue",
+    assembly_stop_requested: false,
+    assembly_finished_at: new Date().toISOString(),
+  })
+  .eq("assembly_status", "processing")
+  .eq("assembly_stop_requested", true);
+if (stopHonorError) console.error("[server] Failed to honor stale stop requests:", stopHonorError.message);
+else console.log("[server] Honored stale stop requests on processing assemblies");
+
 const { error: cleanupError } = await supabase.from("projects")
   .update({ assembly_status: "queued", assembly_progress: "Queued…", assembly_error: null })
   .eq("assembly_status", "processing");
