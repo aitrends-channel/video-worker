@@ -741,6 +741,24 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
     return setProgress(projectId, msg);
   };
 
+  // Throttled per-beat progress writer for hot loops (audio prep,
+  // Stage B encode). Still console.logs every message for debugging,
+  // but rate-limits the Supabase update so a 137-beat loop doesn't
+  // pay 137 serialized DB write costs (~100-200ms each under load —
+  // multiple SECONDS of latency the workers were waiting on between
+  // beats). The next phase's unconditional progress() call always
+  // overtakes the final throttled write within a second, so the UI
+  // never sees a stuck count.
+  let lastProgressDbAt = 0;
+  const PROGRESS_MIN_INTERVAL_MS = 500;
+  const progressThrottled = async (msg: string) => {
+    console.log(`[assemble] ${projectId}: ${msg}`);
+    const now = Date.now();
+    if (now - lastProgressDbAt < PROGRESS_MIN_INTERVAL_MS) return;
+    lastProgressDbAt = now;
+    await setProgress(projectId, msg);
+  };
+
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "assemble-"));
 
   // Stop signal: a background poll watches projects.assembly_stop_requested
@@ -921,7 +939,13 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
       const audioPaths: string[] = new Array(beats.length).fill("");
       const measuredDurations: number[] = new Array(beats.length).fill(0);
 
-      const audioLimit = Math.max(1, Math.min(getAssemblyBeatLimit(), beats.length));
+      // Audio prep is I/O bound (R2 downloads + ffprobe duration). Even
+      // with trimSilence on, each trim is a sub-second ffmpeg op on a
+      // small mp3 — no real contention with the per-clip encode pool
+      // because that pool only starts AFTER this loop completes.
+      // Floor of 6 so a 1-vCPU host on assembly_beats=1 still saturates
+      // the network here instead of downloading 137 files serially.
+      const audioLimit = Math.min(Math.max(getAssemblyBeatLimit(), 6), beats.length);
       let nextAudioIdx = 0;
       let audioCompleted = 0;
       let audioFirstError: Error | null = null;
@@ -964,7 +988,7 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
           }
           audioCompleted++;
           if (beats.length > 0) {
-            await progress(`Prepared ${audioCompleted} of ${beats.length} beat voiceovers…`);
+            await progressThrottled(`Prepared ${audioCompleted} of ${beats.length} beat voiceovers…`);
           }
         }
       };
@@ -1329,7 +1353,7 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
           }
           completed++;
           if (beats.length > 0) {
-            await progress(`Processed ${completed} of ${beats.length} clips…`);
+            await progressThrottled(`Processed ${completed} of ${beats.length} clips…`);
           }
         }
       };
