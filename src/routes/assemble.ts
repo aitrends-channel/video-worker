@@ -124,13 +124,14 @@ function ffmpegWithTimeout(
   build: (cmd: ReturnType<typeof ffmpeg>) => ReturnType<typeof ffmpeg>,
   label: string,
   signal?: AbortSignal,
+  threadCount: number = FFMPEG_THREADS,
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) {
       reject(new Error(STOPPED_MARKER));
       return;
     }
-    const cmd = build(ffmpeg().addOption("-threads", String(FFMPEG_THREADS)).addOption("-filter_threads", String(FFMPEG_THREADS)));
+    const cmd = build(ffmpeg().addOption("-threads", String(threadCount)).addOption("-filter_threads", String(threadCount)));
     let settled = false;
     const settle = (fn: () => void) => {
       if (!settled) { settled = true; clearTimeout(timer); signal?.removeEventListener("abort", onAbort); fn(); }
@@ -241,6 +242,7 @@ function concatClips(listFile: string, output: string, signal?: AbortSignal): Pr
       .output(output),
     "concat",
     signal,
+    1,
   );
 }
 
