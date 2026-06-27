@@ -945,7 +945,7 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
 
       const canUseRemoteAudioConcat = !trimSilenceEnabled && beats.every((beat) => {
         const dur = beat.voiceover_duration_ms ?? 0;
-        return typeof dur === "number" && dur > 0;
+        return typeof dur === "number" && dur > 0 && typeof beat.voiceover_url === "string" && beat.voiceover_url.length > 0;
       });
 
       if (canUseRemoteAudioConcat) {
@@ -965,9 +965,8 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
         // with trimSilence on, each trim is a sub-second ffmpeg op on a
         // small mp3 — no real contention with the per-clip encode pool
         // because that pool only starts AFTER this loop completes.
-        // Keep this pool modest so a long project doesn't saturate the
-        // box with too many simultaneous downloads and temp-file writes.
-        const audioLimit = Math.min(Math.max(2, Math.min(getAssemblyBeatLimit(), 4)), beats.length);
+        // Keep this pool very conservative on memory-constrained hosts.
+        const audioLimit = Math.min(Math.max(1, Math.min(getAssemblyBeatLimit(), 2)), beats.length);
         let nextAudioIdx = 0;
         let audioCompleted = 0;
         let audioFirstError: Error | null = null;
@@ -1275,7 +1274,7 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
       // workers bail at the next iteration.
       // Keep this conservative so long-form projects don't overload the
       // worker with too many simultaneous ffmpeg encodes and temp-file writes.
-      const beatLimit = Math.max(1, Math.min(Math.max(1, Math.ceil(getAssemblyBeatLimit() / 2)), beats.length));
+      const beatLimit = Math.min(2, Math.max(1, Math.min(Math.max(1, Math.ceil(getAssemblyBeatLimit() / 2)), beats.length)));
       let nextIdx = 0;
       let completed = 0;
       let firstError: Error | null = null;
