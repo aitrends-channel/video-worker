@@ -109,7 +109,10 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 // ffmpeg steps (normalizeClip, concat, mixAudio) finish in seconds-minutes
 // so a higher ceiling here doesn't add real latency on the fast path.
 const FFMPEG_TIMEOUT_MS = 30 * 60_000;
-const FFMPEG_THREADS = Math.max(1, Number.parseInt(process.env.FFMPEG_THREADS ?? "1", 10) || 1);
+const ASSEMBLY_SAFE_MODE = process.env.ASSEMBLY_SAFE_MODE === "1";
+const FFMPEG_THREADS = ASSEMBLY_SAFE_MODE
+  ? 1
+  : Math.max(1, Number.parseInt(process.env.FFMPEG_THREADS ?? "1", 10) || 1);
 
 // Unique marker so the catch path in runAssembly can distinguish a
 // user-requested stop from a real error and persist the checkpoint
@@ -764,8 +767,9 @@ interface AssembleOptions {
 // 1080×1920 like TikTok/Reels), and the "long side" for 16:9 so 1080p
 // horizontal = 1920×1080 like YouTube. Square keeps it on both axes.
 function dimsFor(aspect: string, preset: ResolutionPreset | undefined): [number, number] {
+  const effectivePreset = ASSEMBLY_SAFE_MODE ? "720p" : (preset ?? "1080p");
   const map = { "720p": { long: 1280, short: 720 }, "1080p": { long: 1920, short: 1080 }, "1440p": { long: 2560, short: 1440 }, "2160p": { long: 3840, short: 2160 } } as const;
-  const { long, short } = map[preset ?? "1080p"];
+  const { long, short } = map[effectivePreset];
   if (aspect === "9:16") return [short, long];
   if (aspect === "1:1") return [short, short];
   return [long, short]; // 16:9 default
@@ -1009,7 +1013,7 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
         // small mp3 — no real contention with the per-clip encode pool
         // because that pool only starts AFTER this loop completes.
         // Keep this pool very conservative on memory-constrained hosts.
-        const audioLimit = Math.min(Math.max(1, Math.min(getAssemblyBeatLimit(), 2)), beats.length);
+        const audioLimit = ASSEMBLY_SAFE_MODE ? 1 : Math.min(Math.max(1, Math.min(getAssemblyBeatLimit(), 2)), beats.length);
         let nextAudioIdx = 0;
         let audioCompleted = 0;
         let audioFirstError: Error | null = null;
@@ -1317,7 +1321,7 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
       // workers bail at the next iteration.
       // Keep this conservative so long-form projects don't overload the
       // worker with too many simultaneous ffmpeg encodes and temp-file writes.
-      const beatLimit = Math.min(2, Math.max(1, Math.min(Math.max(1, Math.ceil(getAssemblyBeatLimit() / 2)), beats.length)));
+      const beatLimit = ASSEMBLY_SAFE_MODE ? 1 : Math.min(2, Math.max(1, Math.min(Math.max(1, Math.ceil(getAssemblyBeatLimit() / 2)), beats.length)));
       let nextIdx = 0;
       let completed = 0;
       let firstError: Error | null = null;
