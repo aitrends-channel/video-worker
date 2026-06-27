@@ -110,9 +110,10 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 // so a higher ceiling here doesn't add real latency on the fast path.
 const FFMPEG_TIMEOUT_MS = 30 * 60_000;
 const ASSEMBLY_SAFE_MODE = process.env.ASSEMBLY_SAFE_MODE === "1";
+const DEFAULT_FFMPEG_THREADS = Math.max(1, Math.min(4, Math.floor(os.cpus().length / 2)));
 const FFMPEG_THREADS = ASSEMBLY_SAFE_MODE
   ? 1
-  : Math.max(1, Number.parseInt(process.env.FFMPEG_THREADS ?? "1", 10) || 1);
+  : Math.max(1, Number.parseInt(process.env.FFMPEG_THREADS ?? String(DEFAULT_FFMPEG_THREADS), 10) || 1);
 
 // Unique marker so the catch path in runAssembly can distinguish a
 // user-requested stop from a real error and persist the checkpoint
@@ -1012,8 +1013,9 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
         // with trimSilence on, each trim is a sub-second ffmpeg op on a
         // small mp3 — no real contention with the per-clip encode pool
         // because that pool only starts AFTER this loop completes.
-        // Keep this pool very conservative on memory-constrained hosts.
-        const audioLimit = ASSEMBLY_SAFE_MODE ? 1 : Math.min(Math.max(1, Math.min(getAssemblyBeatLimit(), 2)), beats.length);
+        // Keep this pool conservative to avoid too many concurrent I/O
+        // downloads while still making reasonable progress.
+        const audioLimit = ASSEMBLY_SAFE_MODE ? 1 : Math.min(Math.max(1, getAssemblyBeatLimit()), beats.length, 3);
         let nextAudioIdx = 0;
         let audioCompleted = 0;
         let audioFirstError: Error | null = null;
@@ -1321,7 +1323,9 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
       // workers bail at the next iteration.
       // Keep this conservative so long-form projects don't overload the
       // worker with too many simultaneous ffmpeg encodes and temp-file writes.
-      const beatLimit = ASSEMBLY_SAFE_MODE ? 1 : Math.min(2, Math.max(1, Math.min(Math.max(1, Math.ceil(getAssemblyBeatLimit() / 2)), beats.length)));
+      const beatLimit = ASSEMBLY_SAFE_MODE
+        ? 1
+        : Math.min(Math.max(1, getAssemblyBeatLimit()), beats.length, 4);
       let nextIdx = 0;
       let completed = 0;
       let firstError: Error | null = null;
