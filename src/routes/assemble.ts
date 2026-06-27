@@ -80,6 +80,7 @@ function getMediaDuration(filePath: string): Promise<number> {
 // ffmpeg steps (normalizeClip, concat, mixAudio) finish in seconds-minutes
 // so a higher ceiling here doesn't add real latency on the fast path.
 const FFMPEG_TIMEOUT_MS = 30 * 60_000;
+const FFMPEG_THREADS = Math.max(1, Number.parseInt(process.env.FFMPEG_THREADS ?? "1", 10) || 1);
 
 // Unique marker so the catch path in runAssembly can distinguish a
 // user-requested stop from a real error and persist the checkpoint
@@ -96,7 +97,7 @@ function ffmpegWithTimeout(
       reject(new Error(STOPPED_MARKER));
       return;
     }
-    const cmd = build(ffmpeg());
+    const cmd = build(ffmpeg().addOption("-threads", String(FFMPEG_THREADS)).addOption("-filter_threads", String(FFMPEG_THREADS)));
     let settled = false;
     const settle = (fn: () => void) => {
       if (!settled) { settled = true; clearTimeout(timer); signal?.removeEventListener("abort", onAbort); fn(); }
@@ -908,8 +909,8 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
     console.log(`[assemble] ${projectId}: mode=${perBeatMode ? "per-beat" : "legacy single-voiceover"}, assembling ${beats.length}/${allBeats.length} beats (${videoCount} video, ${beats.length - videoCount} image${droppedNoVoiceover > 0 ? `, ${droppedNoVoiceover} dropped: no voiceover` : ""})`);
 
     const voiceoverPath = path.join(tmpDir, "voiceover.mp3");
-    let totalDuration: number;
-    let durations: number[];
+    let totalDuration = 0;
+    let durations: number[] = [];
     let transcriptionWords: TranscriptionWord[] = [];
 
     if (perBeatMode) {
@@ -948,6 +949,7 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
         return typeof dur === "number" && dur > 0 && typeof beat.voiceover_url === "string" && beat.voiceover_url.length > 0;
       });
 
+      let didRemoteAudioConcat = false;
       if (canUseRemoteAudioConcat) {
         await checkStop();
         await progress("Preparing beat audio timeline…");
@@ -959,8 +961,14 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
         await progress("Joining per-beat audio…");
         const audioListPath = path.join(tmpDir, "audio_concat.txt");
         fs.writeFileSync(audioListPath, beats.map((beat) => escapeConcatListEntry(beat.voiceover_url!)).join("\n"));
-        await concatClips(audioListPath, voiceoverPath, signal);
-      } else {
+        try {
+          await concatClips(audioListPath, voiceoverPath, signal);
+          didRemoteAudioConcat = true;
+        } catch (e) {
+          console.warn(`[assemble] ${projectId}: remote audio concat failed, falling back to local download/concat:`, e instanceof Error ? e.message : e);
+        }
+      }
+      if (!didRemoteAudioConcat) {
         // Audio prep is I/O bound (R2 downloads + ffprobe duration). Even
         // with trimSilence on, each trim is a sub-second ffmpeg op on a
         // small mp3 — no real contention with the per-clip encode pool
