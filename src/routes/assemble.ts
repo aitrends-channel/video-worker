@@ -139,6 +139,12 @@ const FFMPEG_THREADS = ASSEMBLY_SAFE_MODE
 // instead of clearing it.
 const STOPPED_MARKER = "ASSEMBLY_STOPPED_BY_USER";
 
+// When a project has many beats, prefer a single final-stage burn
+// of captions/logo instead of baking them into every per-beat clip.
+// This reduces the number of concurrent ffmpeg re-encodes at the
+// cost of one sequential full-video re-encode.
+const FINAL_BURN_THRESHOLD = 80;
+
 function ffmpegWithTimeout(
   build: (cmd: ReturnType<typeof ffmpeg>) => ReturnType<typeof ffmpeg>,
   label: string,
@@ -1278,6 +1284,13 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
       cumulativeStarts[i] = cumulativeStarts[i - 1] + durations[i - 1];
     }
 
+    // Decide whether to do a single final-stage burn of captions/logo
+    // instead of baking them into every per-beat clip. Prefer final
+    // burn for very large projects or when running in safe mode.
+    const preferFinalBurn = beats.length > FINAL_BURN_THRESHOLD || ASSEMBLY_SAFE_MODE;
+    const useFinalBurn = preferFinalBurn && (captionsEnabled || !!logoUrl);
+    let finalLogoPath: string | null = null;
+
     // ── Stage B: per-clip normalization → concat → joined.mp4 ───────────
     //
     // Each clip is uploaded to R2 after encoding (checkpoint.clip_urls[i])
@@ -1292,7 +1305,7 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
       // first one's checkpoint write isn't guaranteed to land before
       // a Stop arrives. This explicit upfront persist closes that
       // window and only costs one DB write.
-      checkpoint.clips_baked_captions = captionsEnabled;
+      checkpoint.clips_baked_captions = captionsEnabled && !useFinalBurn;
       await persistCheckpoint();
       const clipPaths: string[] = new Array(beats.length).fill("");
       await progress("Processing video clips…");
@@ -1319,12 +1332,11 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
         return persistChain;
       };
 
-      // Download the channel logo once so every clip in the worker
-      // pool can read it. Baking the overlay into the per-clip
-      // encode here replaces the old Stage D.5 full-video re-encode.
-      // The coreHash already includes logoKey, so any cached clips
-      // we restore from checkpoint were encoded with the same logo
-      // settings — no risk of mixing logoed/non-logoed clips.
+      // Download the channel logo. If we're doing a final-stage burn
+      // we still need the logo locally later, but we don't bake it
+      // into per-beat clips: that would recreate the heavy parallel
+      // encode pattern. Store either a per-clip overlay or a final
+      // logo path depending on `useFinalBurn`.
       let stageBLogoOverlay: LogoOverlay | null = null;
       if (logoUrl) {
         await checkStop();
@@ -1332,12 +1344,16 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
         const logoPath = path.join(tmpDir, "logo");
         try {
           await downloadFile(logoUrl, logoPath, signal);
-          stageBLogoOverlay = {
-            logoPath,
-            sizePct: typeof logoSize === "number" ? logoSize : 0.1,
-            xPct:    typeof logoX === "number"    ? logoX    : 0.85,
-            yPct:    typeof logoY === "number"    ? logoY    : 0.05,
-          };
+          if (useFinalBurn) {
+            finalLogoPath = logoPath;
+          } else {
+            stageBLogoOverlay = {
+              logoPath,
+              sizePct: typeof logoSize === "number" ? logoSize : 0.1,
+              xPct:    typeof logoX === "number"    ? logoX    : 0.85,
+              yPct:    typeof logoY === "number"    ? logoY    : 0.05,
+            };
+          }
         } catch (e) {
           console.warn(`[assemble] logo download failed, encoding clips without overlay:`, e);
         }
@@ -1381,7 +1397,7 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
         // events-less ASS file — ffmpeg renders no overlay text but
         // the filter is still invoked harmlessly.
         let beatSubtitles: { assPath: string } | null = null;
-        if (captionsEnabled && baseCaptionSegs.length > 0) {
+        if (!useFinalBurn && captionsEnabled && baseCaptionSegs.length > 0) {
           const beatSegs = sliceSegmentsForBeat(baseCaptionSegs, cumulativeStarts[i], durations[i]);
           const assPath = path.join(tmpDir, `captions_${String(i).padStart(3, "0")}.ass`);
           writeAss(beatSegs, buildAssStyle(captionsStyle, captionsSize, captionsPosition, h), w, h, assPath);
@@ -1640,7 +1656,49 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
     // baseCaptionSegs block above Stage B.
 
     // ── Stage F: validate + remux + upload final ────────────────────────
-    const finalPath = outputPath;
+    // Allow a post-mix final burn step (captions/logo) for large jobs.
+    let finalPath = outputPath;
+    if (useFinalBurn && (captionsEnabled || finalLogoPath)) {
+      await checkStop();
+      await progress("Applying final burn (captions/logo)…");
+      // Write a single timeline ASS if captions are enabled.
+      const assPath = path.join(tmpDir, "final_captions.ass");
+      if (captionsEnabled && baseCaptionSegs.length > 0) {
+        writeAss(baseCaptionSegs, buildAssStyle(captionsStyle, captionsSize, captionsPosition, h), w, h, assPath);
+      }
+      let interimSrc = outputPath;
+      // First pass: burn subtitles (if any).
+      if (captionsEnabled && baseCaptionSegs.length > 0) {
+        const withSubs = path.join(tmpDir, "with_subs.mp4");
+        await ffmpegWithTimeout((cmd) =>
+          cmd
+            .input(outputPath)
+            .outputOptions(["-vf", `subtitles=${escapeAssPath(assPath)}`, "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "copy"])
+            .output(withSubs),
+          "finalBurnSubtitles",
+          signal,
+        );
+        interimSrc = withSubs;
+      }
+      // Second pass: overlay logo (if any).
+      if (finalLogoPath) {
+        const withLogo = path.join(tmpDir, "with_logo.mp4");
+        const posX = Math.round(w * (logoX ?? 0.85));
+        const posY = Math.round(h * (logoY ?? 0.05));
+        await ffmpegWithTimeout((cmd) =>
+          cmd
+            .input(interimSrc)
+            .input(finalLogoPath)
+            .outputOptions(["-filter_complex", `overlay=${posX}:${posY}`, "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "copy"])
+            .output(withLogo),
+          "finalBurnLogo",
+          signal,
+        );
+        finalPath = withLogo;
+      } else {
+        finalPath = interimSrc;
+      }
+    }
     const finalStat = fs.statSync(finalPath);
     console.log(`[assemble] ${projectId}: final file size = ${finalStat.size} bytes`);
     if (finalStat.size < 1024) throw new Error(`Assembly produced an invalid output (${finalStat.size} bytes) — ffmpeg may have failed silently`);
