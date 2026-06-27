@@ -61,6 +61,10 @@ async function downloadFile(url: string, dest: string): Promise<void> {
   await pipeline(nodeStream, fs.createWriteStream(dest));
 }
 
+function escapeConcatListEntry(value: string): string {
+  return `file '${value.replace(/\\/g, "/").replace(/'/g, "'\\''")}'`;
+}
+
 function getMediaDuration(filePath: string): Promise<number> {
   return new Promise((resolve, reject) => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -939,77 +943,96 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
       const audioPaths: string[] = new Array(beats.length).fill("");
       const measuredDurations: number[] = new Array(beats.length).fill(0);
 
-      // Audio prep is I/O bound (R2 downloads + ffprobe duration). Even
-      // with trimSilence on, each trim is a sub-second ffmpeg op on a
-      // small mp3 — no real contention with the per-clip encode pool
-      // because that pool only starts AFTER this loop completes.
-      // Floor of 6 so a 1-vCPU host on assembly_beats=1 still saturates
-      // the network here instead of downloading 137 files serially.
-      const audioLimit = Math.min(Math.max(getAssemblyBeatLimit(), 6), beats.length);
-      let nextAudioIdx = 0;
-      let audioCompleted = 0;
-      let audioFirstError: Error | null = null;
+      const canUseRemoteAudioConcat = !trimSilenceEnabled && beats.every((beat) => {
+        const dur = beat.voiceover_duration_ms ?? 0;
+        return typeof dur === "number" && dur > 0;
+      });
 
-      const processOneAudio = async (i: number): Promise<void> => {
+      if (canUseRemoteAudioConcat) {
         await checkStop();
-        const beat = beats[i];
-        const rawPath = path.join(tmpDir, `audio_raw_${String(i).padStart(3, "0")}.mp3`);
-        await downloadFile(beat.voiceover_url!, rawPath);
-        if (trimSilenceEnabled) {
-          const trimmed = path.join(tmpDir, `audio_${String(i).padStart(3, "0")}.mp3`);
-          await trimSilence(rawPath, trimmed, signal);
-          const dur = await getMediaDuration(trimmed);
-          audioPaths[i] = trimmed;
-          measuredDurations[i] = Math.max(0.1, dur);
-          try { fs.unlinkSync(rawPath); } catch { /* ignore */ }
-        } else {
-          let dur = beat.voiceover_duration_ms ? beat.voiceover_duration_ms / 1000 : 0;
-          if (!dur || dur <= 0) dur = await getMediaDuration(rawPath);
-          audioPaths[i] = rawPath;
-          measuredDurations[i] = Math.max(0.1, dur);
-        }
-      };
+        await progress("Preparing beat audio timeline…");
+        durations = beats.map((beat) => Math.max(0.1, (beat.voiceover_duration_ms ?? 0) / 1000));
+        totalDuration = durations.reduce((sum, d) => sum + d, 0);
+        console.log(`[assemble] ${projectId}: using remote beat URLs for audio concat (sum=${totalDuration.toFixed(2)}s, trim=off)`);
 
-      const audioWorker = async (): Promise<void> => {
-        while (true) {
-          if (audioFirstError) return;
-          const i = nextAudioIdx++;
-          if (i >= beats.length) return;
-          try {
-            await processOneAudio(i);
-          } catch (e) {
-            // Unlike the visuals pool, an audio failure can't be
-            // silently skipped — a missing beat's audio leaves the
-            // master voiceover with a gap and throws off every
-            // downstream duration. Bubble the first error and let
-            // the other workers wind down on the next iteration.
-            if (!audioFirstError) audioFirstError = e instanceof Error ? e : new Error(String(e));
-            return;
+        await checkStop();
+        await progress("Joining per-beat audio…");
+        const audioListPath = path.join(tmpDir, "audio_concat.txt");
+        fs.writeFileSync(audioListPath, beats.map((beat) => escapeConcatListEntry(beat.voiceover_url!)).join("\n"));
+        await concatClips(audioListPath, voiceoverPath, signal);
+      } else {
+        // Audio prep is I/O bound (R2 downloads + ffprobe duration). Even
+        // with trimSilence on, each trim is a sub-second ffmpeg op on a
+        // small mp3 — no real contention with the per-clip encode pool
+        // because that pool only starts AFTER this loop completes.
+        // Keep this pool modest so a long project doesn't saturate the
+        // box with too many simultaneous downloads and temp-file writes.
+        const audioLimit = Math.min(Math.max(2, Math.min(getAssemblyBeatLimit(), 4)), beats.length);
+        let nextAudioIdx = 0;
+        let audioCompleted = 0;
+        let audioFirstError: Error | null = null;
+
+        const processOneAudio = async (i: number): Promise<void> => {
+          await checkStop();
+          const beat = beats[i];
+          const rawPath = path.join(tmpDir, `audio_raw_${String(i).padStart(3, "0")}.mp3`);
+          await downloadFile(beat.voiceover_url!, rawPath);
+          if (trimSilenceEnabled) {
+            const trimmed = path.join(tmpDir, `audio_${String(i).padStart(3, "0")}.mp3`);
+            await trimSilence(rawPath, trimmed, signal);
+            const dur = await getMediaDuration(trimmed);
+            audioPaths[i] = trimmed;
+            measuredDurations[i] = Math.max(0.1, dur);
+            try { fs.unlinkSync(rawPath); } catch { /* ignore */ }
+          } else {
+            let dur = beat.voiceover_duration_ms ? beat.voiceover_duration_ms / 1000 : 0;
+            if (!dur || dur <= 0) dur = await getMediaDuration(rawPath);
+            audioPaths[i] = rawPath;
+            measuredDurations[i] = Math.max(0.1, dur);
           }
-          audioCompleted++;
-          if (beats.length > 0) {
-            await progressThrottled(`Prepared ${audioCompleted} of ${beats.length} beat voiceovers…`);
+        };
+
+        const audioWorker = async (): Promise<void> => {
+          while (true) {
+            if (audioFirstError) return;
+            const i = nextAudioIdx++;
+            if (i >= beats.length) return;
+            try {
+              await processOneAudio(i);
+            } catch (e) {
+              // Unlike the visuals pool, an audio failure can't be
+              // silently skipped — a missing beat's audio leaves the
+              // master voiceover with a gap and throws off every
+              // downstream duration. Bubble the first error and let
+              // the other workers wind down on the next iteration.
+              if (!audioFirstError) audioFirstError = e instanceof Error ? e : new Error(String(e));
+              return;
+            }
+            audioCompleted++;
+            if (beats.length > 0) {
+              await progressThrottled(`Prepared ${audioCompleted} of ${beats.length} beat voiceovers…`);
+            }
           }
-        }
-      };
+        };
 
-      await Promise.all(Array.from({ length: audioLimit }, () => audioWorker()));
-      if (audioFirstError) throw audioFirstError;
+        await Promise.all(Array.from({ length: audioLimit }, () => audioWorker()));
+        if (audioFirstError) throw audioFirstError;
 
-      durations = measuredDurations;
-      totalDuration = durations.reduce((s, d) => s + d, 0);
-      console.log(`[assemble] ${projectId}: per-beat durations sum=${totalDuration.toFixed(2)}s (${durations.length} beats, trim=${trimSilenceEnabled ? "on" : "off"})`);
+        durations = measuredDurations;
+        totalDuration = durations.reduce((sum, d) => sum + d, 0);
+        console.log(`[assemble] ${projectId}: per-beat durations sum=${totalDuration.toFixed(2)}s (${durations.length} beats, trim=${trimSilenceEnabled ? "on" : "off"})`);
 
-      // Concatenate per-beat audio into one track for the mix step.
-      // All trimmed files share codec/sample rate (mp3 128k 44.1kHz
-      // from trimSilence), so `-c copy` works cleanly — no re-encode at
-      // the join step means no audible artifacts at boundaries.
-      await checkStop();
-      await progress("Joining per-beat audio…");
-      const audioListPath = path.join(tmpDir, "audio_concat.txt");
-      fs.writeFileSync(audioListPath, audioPaths.map((p) => `file '${p.replace(/\\/g, "/")}'`).join("\n"));
-      await concatClips(audioListPath, voiceoverPath, signal);
-      for (const p of audioPaths) { try { fs.unlinkSync(p); } catch { /* ignore */ } }
+        // Concatenate per-beat audio into one track for the mix step.
+        // All trimmed files share codec/sample rate (mp3 128k 44.1kHz
+        // from trimSilence), so `-c copy` works cleanly — no re-encode at
+        // the join step means no audible artifacts at boundaries.
+        await checkStop();
+        await progress("Joining per-beat audio…");
+        const audioListPath = path.join(tmpDir, "audio_concat.txt");
+        fs.writeFileSync(audioListPath, audioPaths.map((p) => escapeConcatListEntry(p)).join("\n"));
+        await concatClips(audioListPath, voiceoverPath, signal);
+        for (const p of audioPaths) { try { fs.unlinkSync(p); } catch { /* ignore */ } }
+      }
 
       // Captions need word-level timestamps even in per-beat mode.
       // Run STT on the concatenated audio so caption timings line up
@@ -1250,7 +1273,9 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
       // beat position so there are no inter-worker write conflicts.
       // STOPPED_MARKER propagates via firstError so all in-flight
       // workers bail at the next iteration.
-      const beatLimit = Math.max(1, Math.min(getAssemblyBeatLimit(), beats.length));
+      // Keep this conservative so long-form projects don't overload the
+      // worker with too many simultaneous ffmpeg encodes and temp-file writes.
+      const beatLimit = Math.max(1, Math.min(Math.max(1, Math.ceil(getAssemblyBeatLimit() / 2)), beats.length));
       let nextIdx = 0;
       let completed = 0;
       let firstError: Error | null = null;
