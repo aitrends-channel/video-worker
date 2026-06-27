@@ -54,25 +54,44 @@ async function getSettings(userId: string): Promise<{ elevenlabs_api_key: string
 // ── ffmpeg helpers ────────────────────────────────────────────────────────────
 
 async function downloadFile(url: string, dest: string, signal?: AbortSignal): Promise<void> {
-  const timeoutSignal = AbortSignal.timeout(60_000);
-  const controller = new AbortController();
-  const onAbort = () => controller.abort();
-  signal?.addEventListener("abort", onAbort, { once: true });
-  timeoutSignal.addEventListener("abort", onAbort, { once: true });
-  try {
-    const res = await fetch(url, { signal: controller.signal });
-    if (!res.ok) throw new Error(`Failed to download ${url}: ${res.status}`);
-    if (!res.body) throw new Error(`No response body for ${url}`);
-    const nodeStream = Readable.fromWeb(res.body as import("stream/web").ReadableStream);
-    await pipeline(nodeStream, fs.createWriteStream(dest));
-  } catch (err) {
-    if (signal?.aborted) throw new Error(STOPPED_MARKER);
-    if (timeoutSignal.aborted) throw new Error(`Download timed out: ${url}`);
-    throw err instanceof Error ? err : new Error(String(err));
-  } finally {
-    signal?.removeEventListener("abort", onAbort);
-    timeoutSignal.removeEventListener("abort", onAbort);
+  const maxAttempts = 3;
+  let lastError: Error | null = null;
+
+  const attemptFetch = async (): Promise<{ ok: boolean; status: number; body: import("stream/web").ReadableStream | null }> => {
+    const timeoutSignal = AbortSignal.timeout(60_000);
+    const controller = new AbortController();
+    const onAbort = () => controller.abort();
+    signal?.addEventListener("abort", onAbort, { once: true });
+    timeoutSignal.addEventListener("abort", onAbort, { once: true });
+    try {
+      return await fetch(url, { signal: controller.signal }) as unknown as { ok: boolean; status: number; body: import("stream/web").ReadableStream | null };
+    } finally {
+      signal?.removeEventListener("abort", onAbort);
+      timeoutSignal.removeEventListener("abort", onAbort);
+    }
+  };
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const res = await attemptFetch();
+      if (!res.ok) throw new Error(`Failed to download ${url}: ${res.status}`);
+      if (!res.body) throw new Error(`No response body for ${url}`);
+      const nodeStream = Readable.fromWeb(res.body);
+      await pipeline(nodeStream, fs.createWriteStream(dest));
+      return;
+    } catch (err) {
+      if (signal?.aborted) throw new Error(STOPPED_MARKER);
+      const error = err instanceof Error ? err : new Error(String(err));
+      lastError = error;
+      const shouldRetry = attempt < maxAttempts && /fetch failed|Download timed out|Failed to download .*:( 5\d\d| 429)/i.test(error.message);
+      if (!shouldRetry) throw error;
+      const backoffMs = 500 * attempt;
+      console.warn(`[assemble] download attempt ${attempt} failed for ${url}: ${error.message}; retrying in ${backoffMs}ms`);
+      await sleep(backoffMs, signal);
+    }
   }
+
+  throw lastError ?? new Error(`Failed to download ${url}`);
 }
 
 function escapeConcatListEntry(value: string): string {
@@ -110,7 +129,7 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 // so a higher ceiling here doesn't add real latency on the fast path.
 const FFMPEG_TIMEOUT_MS = 30 * 60_000;
 const ASSEMBLY_SAFE_MODE = process.env.ASSEMBLY_SAFE_MODE === "1";
-const DEFAULT_FFMPEG_THREADS = Math.max(1, Math.min(2, Math.floor(os.cpus().length / 2)));
+const DEFAULT_FFMPEG_THREADS = 1;
 const FFMPEG_THREADS = ASSEMBLY_SAFE_MODE
   ? 1
   : Math.max(1, Math.min(2, Number.parseInt(process.env.FFMPEG_THREADS ?? String(DEFAULT_FFMPEG_THREADS), 10) || 1));
@@ -781,8 +800,8 @@ function dimsFor(aspect: string, preset: ResolutionPreset | undefined): [number,
 function getAssemblyConcurrency(beatCount: number): number {
   if (ASSEMBLY_SAFE_MODE) return 1;
   const requested = Math.max(1, getAssemblyBeatLimit());
-  if (beatCount > 80) return Math.min(2, requested);
-  return Math.min(3, requested);
+  if (beatCount > 80) return 1;
+  return Math.min(2, requested);
 }
 
 async function runAssembly(opts: AssembleOptions): Promise<void> {
