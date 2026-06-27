@@ -110,10 +110,10 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 // so a higher ceiling here doesn't add real latency on the fast path.
 const FFMPEG_TIMEOUT_MS = 30 * 60_000;
 const ASSEMBLY_SAFE_MODE = process.env.ASSEMBLY_SAFE_MODE === "1";
-const DEFAULT_FFMPEG_THREADS = Math.max(1, Math.min(4, Math.floor(os.cpus().length / 2)));
+const DEFAULT_FFMPEG_THREADS = Math.max(1, Math.min(2, Math.floor(os.cpus().length / 2)));
 const FFMPEG_THREADS = ASSEMBLY_SAFE_MODE
   ? 1
-  : Math.max(1, Number.parseInt(process.env.FFMPEG_THREADS ?? String(DEFAULT_FFMPEG_THREADS), 10) || 1);
+  : Math.max(1, Math.min(2, Number.parseInt(process.env.FFMPEG_THREADS ?? String(DEFAULT_FFMPEG_THREADS), 10) || 1));
 
 // Unique marker so the catch path in runAssembly can distinguish a
 // user-requested stop from a real error and persist the checkpoint
@@ -778,6 +778,13 @@ function dimsFor(aspect: string, preset: ResolutionPreset | undefined): [number,
   return [long, short]; // 16:9 default
 }
 
+function getAssemblyConcurrency(beatCount: number): number {
+  if (ASSEMBLY_SAFE_MODE) return 1;
+  const requested = Math.max(1, getAssemblyBeatLimit());
+  if (beatCount > 80) return Math.min(2, requested);
+  return Math.min(3, requested);
+}
+
 async function runAssembly(opts: AssembleOptions): Promise<void> {
   const { userId, projectId, aspectRatio, voiceoverType, captionsEnabled, captionsLanguage, captionsStyle, captionsSize, captionsPosition, trimSilenceEnabled, backgroundMusicUrl, backgroundMusicVolume, resolution, logoUrl, logoX, logoY, logoSize } = opts;
   const [w, h] = dimsFor(aspectRatio, resolution);
@@ -1017,7 +1024,7 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
         // because that pool only starts AFTER this loop completes.
         // Keep this pool conservative to avoid too many concurrent I/O
         // downloads while still making reasonable progress.
-        const audioLimit = ASSEMBLY_SAFE_MODE ? 1 : Math.min(Math.max(1, getAssemblyBeatLimit()), beats.length, 3);
+        const audioLimit = ASSEMBLY_SAFE_MODE ? 1 : Math.min(Math.max(1, getAssemblyConcurrency(beats.length)), beats.length, 2);
         let nextAudioIdx = 0;
         let audioCompleted = 0;
         let audioFirstError: Error | null = null;
@@ -1325,9 +1332,8 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
       // workers bail at the next iteration.
       // Keep this conservative so long-form projects don't overload the
       // worker with too many simultaneous ffmpeg encodes and temp-file writes.
-      const beatLimit = ASSEMBLY_SAFE_MODE
-        ? 1
-        : Math.min(Math.max(1, getAssemblyBeatLimit()), beats.length, 4);
+      const beatLimit = getAssemblyConcurrency(beats.length);
+      console.log(`[assemble] ${projectId}: beat concurrency=${beatLimit} (requested=${getAssemblyBeatLimit()}, beats=${beats.length})`);
       let nextIdx = 0;
       let completed = 0;
       let firstError: Error | null = null;
