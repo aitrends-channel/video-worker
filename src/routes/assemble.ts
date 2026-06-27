@@ -53,12 +53,26 @@ async function getSettings(userId: string): Promise<{ elevenlabs_api_key: string
 
 // ── ffmpeg helpers ────────────────────────────────────────────────────────────
 
-async function downloadFile(url: string, dest: string): Promise<void> {
-  const res = await fetch(url, { signal: AbortSignal.timeout(60_000) });
-  if (!res.ok) throw new Error(`Failed to download ${url}: ${res.status}`);
-  if (!res.body) throw new Error(`No response body for ${url}`);
-  const nodeStream = Readable.fromWeb(res.body as import("stream/web").ReadableStream);
-  await pipeline(nodeStream, fs.createWriteStream(dest));
+async function downloadFile(url: string, dest: string, signal?: AbortSignal): Promise<void> {
+  const timeoutSignal = AbortSignal.timeout(60_000);
+  const controller = new AbortController();
+  const onAbort = () => controller.abort();
+  signal?.addEventListener("abort", onAbort, { once: true });
+  timeoutSignal.addEventListener("abort", onAbort, { once: true });
+  try {
+    const res = await fetch(url, { signal: controller.signal });
+    if (!res.ok) throw new Error(`Failed to download ${url}: ${res.status}`);
+    if (!res.body) throw new Error(`No response body for ${url}`);
+    const nodeStream = Readable.fromWeb(res.body as import("stream/web").ReadableStream);
+    await pipeline(nodeStream, fs.createWriteStream(dest));
+  } catch (err) {
+    if (signal?.aborted) throw new Error(STOPPED_MARKER);
+    if (timeoutSignal.aborted) throw new Error(`Download timed out: ${url}`);
+    throw err instanceof Error ? err : new Error(String(err));
+  } finally {
+    signal?.removeEventListener("abort", onAbort);
+    timeoutSignal.removeEventListener("abort", onAbort);
+  }
 }
 
 function escapeConcatListEntry(value: string): string {
@@ -72,6 +86,21 @@ function getMediaDuration(filePath: string): Promise<number> {
       if (err) reject(new Error(`ffprobe failed: ${err.message}`));
       else resolve((meta?.format?.duration as number) ?? 0);
     });
+  });
+}
+
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(new Error(STOPPED_MARKER));
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new Error(STOPPED_MARKER));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
   });
 }
 
@@ -295,26 +324,32 @@ interface TranscriptionWord {
   type?: string;
 }
 
-async function transcribeAudio(audioPath: string, apiKey: string): Promise<TranscriptionWord[]> {
+async function transcribeAudio(audioPath: string, apiKey: string, signal?: AbortSignal): Promise<TranscriptionWord[]> {
   const audioBytes = fs.readFileSync(audioPath);
   const MAX_ATTEMPTS = 4;
   let lastError = "";
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    const formData = new FormData();
-    formData.append("file", new Blob([audioBytes], { type: "audio/mpeg" }), "voiceover.mp3");
-    formData.append("model_id", "scribe_v1");
-    formData.append("timestamps_granularity", "word");
-    formData.append("tag_audio_events", "false");
-    const res = await fetch("https://api.elevenlabs.io/v1/speech-to-text", {
-      method: "POST", headers: { "xi-api-key": apiKey }, body: formData,
-    });
-    if (res.ok) {
-      const data = await res.json() as { words?: TranscriptionWord[] };
-      return (data.words ?? []).filter((w) => (w.type ?? "word") === "word");
+  try {
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      if (signal?.aborted) throw new Error(STOPPED_MARKER);
+      const formData = new FormData();
+      formData.append("file", new Blob([audioBytes], { type: "audio/mpeg" }), "voiceover.mp3");
+      formData.append("model_id", "scribe_v1");
+      formData.append("timestamps_granularity", "word");
+      formData.append("tag_audio_events", "false");
+      const res = await fetch("https://api.elevenlabs.io/v1/speech-to-text", {
+        method: "POST", headers: { "xi-api-key": apiKey }, body: formData, signal,
+      });
+      if (res.ok) {
+        const data = await res.json() as { words?: TranscriptionWord[] };
+        return (data.words ?? []).filter((w) => (w.type ?? "word") === "word");
+      }
+      lastError = `ElevenLabs STT ${res.status}: ${await res.text()}`;
+      if (res.status !== 429 || attempt === MAX_ATTEMPTS) break;
+      await sleep(2000 * Math.pow(2, attempt - 1), signal);
     }
-    lastError = `ElevenLabs STT ${res.status}: ${await res.text()}`;
-    if (res.status !== 429 || attempt === MAX_ATTEMPTS) break;
-    await new Promise((r) => setTimeout(r, 2000 * Math.pow(2, attempt - 1)));
+  } catch (err) {
+    if (signal?.aborted) throw new Error(STOPPED_MARKER);
+    throw err instanceof Error ? err : new Error(String(err));
   }
   throw new Error(lastError);
 }
@@ -983,7 +1018,7 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
           await checkStop();
           const beat = beats[i];
           const rawPath = path.join(tmpDir, `audio_raw_${String(i).padStart(3, "0")}.mp3`);
-          await downloadFile(beat.voiceover_url!, rawPath);
+          await downloadFile(beat.voiceover_url!, rawPath, signal);
           if (trimSilenceEnabled) {
             const trimmed = path.join(tmpDir, `audio_${String(i).padStart(3, "0")}.mp3`);
             await trimSilence(rawPath, trimmed, signal);
@@ -1052,7 +1087,7 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
           try {
             const { elevenlabs_api_key } = await getSettings(userId);
             if (!elevenlabs_api_key) throw new Error("ElevenLabs API key not configured.");
-            transcriptionWords = await transcribeAudio(voiceoverPath, elevenlabs_api_key);
+            transcriptionWords = await transcribeAudio(voiceoverPath, elevenlabs_api_key, signal);
           } catch (e) {
             console.warn("[assemble] per-beat caption transcription failed:", e);
           }
@@ -1086,7 +1121,7 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
 
       await checkStop();
       await progress("Downloading voiceover…");
-      await downloadFile(legacyVoiceoverUrl, voiceoverPath);
+      await downloadFile(legacyVoiceoverUrl, voiceoverPath, signal);
       totalDuration = await getMediaDuration(voiceoverPath);
       if (totalDuration <= 0) throw new Error("Could not determine voiceover duration");
       console.log(`[assemble] ${projectId}: voiceover duration = ${totalDuration.toFixed(2)}s`);
@@ -1108,7 +1143,7 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
         try {
           const { elevenlabs_api_key } = await getSettings(userId);
           if (!elevenlabs_api_key) throw new Error("ElevenLabs API key not configured.");
-          transcriptionWords = await transcribeAudio(voiceoverPath, elevenlabs_api_key);
+          transcriptionWords = await transcribeAudio(voiceoverPath, elevenlabs_api_key, signal);
         } catch (e) {
           console.warn("[assemble] transcription failed, using proportional fallback:", e);
         }
@@ -1262,7 +1297,7 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
         await progress("Downloading channel logo…");
         const logoPath = path.join(tmpDir, "logo");
         try {
-          await downloadFile(logoUrl, logoPath);
+          await downloadFile(logoUrl, logoPath, signal);
           stageBLogoOverlay = {
             logoPath,
             sizePct: typeof logoSize === "number" ? logoSize : 0.1,
@@ -1292,7 +1327,7 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
         const cached = checkpoint.clip_urls![i];
         if (cached) {
           try {
-            await downloadFile(cached, clipPath);
+            await downloadFile(cached, clipPath, signal);
             clipPaths[i] = clipPath;
             return;
           } catch (e) {
@@ -1322,7 +1357,7 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
             const ext = beat.video_url.includes(".webm") ? "webm" : "mp4";
             const src = path.join(tmpDir, `src_${i}.${ext}`);
             console.log(`[assemble] beat ${beat.beat_number}: downloading video…`);
-            await downloadFile(beat.video_url, src);
+            await downloadFile(beat.video_url, src, signal);
             console.log(`[assemble] beat ${beat.beat_number}: encoding clip…`);
             await normalizeClip(src, false, durations[i], clipPath, w, h, stageBLogoOverlay, beatSubtitles, signal);
             try { fs.unlinkSync(src); } catch { /* ignore */ }
@@ -1330,7 +1365,7 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
             const ext = beat.image_url.toLowerCase().includes(".png") ? "png" : "jpg";
             const src = path.join(tmpDir, `src_${i}.${ext}`);
             console.log(`[assemble] beat ${beat.beat_number}: downloading image…`);
-            await downloadFile(beat.image_url, src);
+            await downloadFile(beat.image_url, src, signal);
             console.log(`[assemble] beat ${beat.beat_number}: encoding clip…`);
             await normalizeClip(src, true, durations[i], clipPath, w, h, stageBLogoOverlay, beatSubtitles, signal);
             try { fs.unlinkSync(src); } catch { /* ignore */ }
@@ -1451,7 +1486,7 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
       if (!fs.existsSync(joinedDisk)) {
         await checkStop();
         await progress("Restoring joined video…");
-        await downloadFile(checkpoint.joined_url!, joinedDisk);
+        await downloadFile(checkpoint.joined_url!, joinedDisk, signal);
       }
       const joinedDuration = await getMediaDuration(joinedDisk).catch(() => 0);
       console.log(`[assemble] ${projectId}: joined duration = ${joinedDuration.toFixed(2)}s`);
@@ -1490,7 +1525,7 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
     if (checkpoint.mixed_url) {
       await checkStop();
       await progress("Restoring mixed video…");
-      await downloadFile(checkpoint.mixed_url, outputPath);
+      await downloadFile(checkpoint.mixed_url, outputPath, signal);
     } else {
       // Decide which source to mix from: padded.mp4 if we made one,
       // else joined.mp4.
@@ -1500,14 +1535,14 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
         if (!fs.existsSync(mixSrc)) {
           await checkStop();
           await progress("Restoring padded video…");
-          await downloadFile(checkpoint.padded_url, mixSrc);
+          await downloadFile(checkpoint.padded_url, mixSrc, signal);
         }
       } else {
         mixSrc = path.join(tmpDir, "joined.mp4");
         if (!fs.existsSync(mixSrc)) {
           await checkStop();
           await progress("Restoring joined video…");
-          await downloadFile(checkpoint.joined_url!, mixSrc);
+          await downloadFile(checkpoint.joined_url!, mixSrc, signal);
         }
       }
       await checkStop();
@@ -1526,7 +1561,7 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
         try {
           await progress("Downloading background music…");
           bgmPath = path.join(tmpDir, "bgm.mp3");
-          await downloadFile(backgroundMusicUrl, bgmPath);
+          await downloadFile(backgroundMusicUrl, bgmPath, signal);
         } catch (e) {
           console.warn(`[assemble] bgm download failed, continuing without music:`, e);
           bgmPath = null;
