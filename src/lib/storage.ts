@@ -58,13 +58,24 @@ export async function uploadBuffer(path: string, buffer: ArrayBuffer, contentTyp
 
 export async function uploadFile(storagePath: string, filePath: string, contentType: string): Promise<string> {
   assertConfigured();
-  const body = fs.readFileSync(filePath);
-  await r2.send(new PutObjectCommand({
-    Bucket: BUCKET,
-    Key: storagePath,
-    Body: body,
-    ContentType: contentType,
-  }));
+  // Stream the body instead of fs.readFileSync to avoid loading the
+  // full file into the JS heap. For an assembled 1080p video that can
+  // easily be 100+ MB — a single uploadFile call held that much in
+  // memory the moment it ran. PutObjectCommand requires a known
+  // ContentLength when given a stream body, so we stat first.
+  const { size } = fs.statSync(filePath);
+  const body = fs.createReadStream(filePath);
+  try {
+    await r2.send(new PutObjectCommand({
+      Bucket: BUCKET,
+      Key: storagePath,
+      Body: body,
+      ContentType: contentType,
+      ContentLength: size,
+    }));
+  } finally {
+    body.destroy();
+  }
   return `${PUBLIC_URL}/${storagePath}`;
 }
 
