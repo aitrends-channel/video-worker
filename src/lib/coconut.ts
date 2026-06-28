@@ -137,7 +137,7 @@ export async function submitJob(opts: CoconutFinalizeOptions): Promise<CoconutJo
   const res = await fetch(`${API_BASE}/jobs`, {
     method: "POST",
     headers: {
-      "Authorization": `Bearer ${process.env.COCONUT_API_KEY}`,
+      "Authorization": `Basic ${Buffer.from(`${process.env.COCONUT_API_KEY}:`).toString("base64")}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify(spec),
@@ -151,7 +151,9 @@ export async function submitJob(opts: CoconutFinalizeOptions): Promise<CoconutJo
 
 export async function getJob(jobId: string): Promise<CoconutJob> {
   const res = await fetch(`${API_BASE}/jobs/${jobId}`, {
-    headers: { "Authorization": `Bearer ${process.env.COCONUT_API_KEY}` },
+    headers: {
+      "Authorization": `Basic ${Buffer.from(`${process.env.COCONUT_API_KEY}:`).toString("base64")}`,
+    },
   });
   if (!res.ok) throw new Error(`Coconut getJob failed: HTTP ${res.status}`);
   return await res.json() as CoconutJob;
