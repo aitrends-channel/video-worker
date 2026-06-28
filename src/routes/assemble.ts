@@ -401,7 +401,7 @@ function mixAudio(
   output: string,
   videoDuration: number,
   signal?: AbortSignal,
-  bgm?: { path: string; volume: number } | null,
+  bgm?: { path: string; volume: number; loops: number } | null,
 ): Promise<void> {
   return ffmpegWithTimeout((cmd) => {
     // probesize + analyzeduration cap how much of each input ffmpeg
@@ -413,23 +413,25 @@ function mixAudio(
     cmd.input(video).inputOptions([...lightInput, "-fflags", "+genpts"]);
     cmd.input(audio).inputOptions(lightInput);
     if (bgm) {
-      // Three inputs: video, voiceover (1), bgm (2). -stream_loop -1
-      // is applied to bgm because it's a LOCAL FILE — looping a
-      // local file is a free seek-to-byte-0, no HTTP refetch, no
-      // file-buffer rebuild. Earlier we tried URL-based looping
-      // (HTTP isn't seekable so ffmpeg refetched per loop, ~hundreds
-      // of requests for a long voiceover) and a separate prerender
-      // step (paid a full re-encode pass). Local + stream_loop is
-      // both cheaper and more reliable.
+      // Three inputs: video, voiceover (1), bgm (2). bgm.loops is a
+      // FINITE count computed from ffprobe of the bgm + voiceover
+      // duration, NOT -1. The previous version used -stream_loop -1
+      // and would hang the entire mix step: amix with duration=first
+      // is supposed to drain when the voiceover (input 1) ends, but
+      // the infinite-loop input 2 keeps producing packets and the
+      // muxer can deadlock waiting for both demuxer threads to reach
+      // EOF. -t at the output should propagate back through the
+      // filter graph but doesn't reliably in all ffmpeg builds with
+      // complex_filter. A finite stream_loop value gives input 2 a
+      // natural EOF, amix drains cleanly, the mux finalizes.
       //
-      // -t at the output bounds the duration so amix doesn't pull
-      // beyond the voiceover length; combined with duration=first
-      // that means amix stops as soon as the voiceover ends and the
-      // loop never decodes past what it serves.
+      // -shortest is layered on top as belt-and-braces: stop the
+      // whole output as soon as any stream ends. Combined with
+      // duration=first, the voiceover length wins.
       //
       // volume=`bgm.volume` keeps music under the dialog (default
       // 0.15 ≈ -16 dB, classic "podcast bed" level).
-      cmd.input(bgm.path).inputOptions([...lightInput, "-stream_loop", "-1"]);
+      cmd.input(bgm.path).inputOptions([...lightInput, "-stream_loop", String(bgm.loops)]);
       cmd.complexFilter([
         `[2:a]volume=${bgm.volume}[bgmDucked]`,
         `[1:a][bgmDucked]amix=inputs=2:duration=first:dropout_transition=0[mix]`,
@@ -437,6 +439,7 @@ function mixAudio(
       cmd.outputOptions([
         "-map", "0:v", "-map", "[mix]", "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
         "-t", String(videoDuration),
+        "-shortest",
         "-max_muxing_queue_size", "1024",
       ]);
     } else {
@@ -1829,33 +1832,41 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
       if (bgmVolume < 0) bgmVolume = 0;
       if (bgmVolume > 1) bgmVolume = 1;
 
-      // Download BGM to local disk ONCE. We previously tried two
-      // approaches that both failed:
-      //   1. Stream the URL directly into mixAudio with -stream_loop -1.
-      //      HTTP inputs aren't seekable, so ffmpeg re-fetched the
-      //      URL on every loop iteration — a 5s loop into a 30min
-      //      voiceover meant ~360 R2 requests, which was slow and
-      //      hit rate limits.
-      //   2. Pre-render a finite-length looped mp3 from the URL.
-      //      Same problem under the hood: the prerender's own
-      //      -stream_loop -1 was reading from HTTP and triggering
-      //      the same refetch storm, just one step earlier.
-      // The reliable fix is a single download then loop the local
-      // file in the mix step — local-file -stream_loop is a
-      // seek-to-byte-0 with no network or buffer rebuild.
+      // Download BGM to local disk ONCE, then ffprobe it to compute
+      // a FINITE stream_loop count for the mix step. The previous
+      // -stream_loop -1 was the source of the "mix step never
+      // proceeds" hang: amix with duration=first should drain when
+      // the voiceover input ends, but an infinite-loop second input
+      // can hold the demuxer pipeline open and deadlock the muxer.
+      // A finite loop count gives both audio inputs a natural EOF.
       //
-      // Failure here disables BGM and falls back to voiceover-only,
-      // so a flaky music URL never blocks the assembly.
-      let bgmLocalPath: string | null = null;
+      // loops = ceil(voiceover / bgm) + 1 (the +1 is a safety frame
+      // so any sub-second rounding doesn't end the bgm one millisecond
+      // before amix wants the last sample). Clamped to [1, 10_000]
+      // so a degenerate sub-second bgm doesn't request millions of
+      // loops and a probe failure doesn't pass a NaN downstream.
+      //
+      // Failure at any step (download, probe, bad duration) disables
+      // BGM and falls through to voiceover-only — the user still
+      // gets a finished video instead of a permanently stuck mix.
+      let bgmConfig: { path: string; volume: number; loops: number } | null = null;
       if (backgroundMusicUrl) {
         await progress("Downloading background music…");
+        const bgmLocalPath = path.join(tmpDir, "bgm.mp3");
         try {
-          bgmLocalPath = path.join(tmpDir, "bgm.mp3");
           await downloadFile(backgroundMusicUrl, bgmLocalPath, signal);
+          const bgmDuration = await getMediaDuration(bgmLocalPath);
+          if (!isFinite(bgmDuration) || bgmDuration <= 0.5) {
+            throw new Error(`bgm duration unreasonable: ${bgmDuration}`);
+          }
+          const rawLoops = Math.ceil(totalDuration / bgmDuration) + 1;
+          const loops = Math.min(10_000, Math.max(1, rawLoops));
+          console.log(`[assemble] ${projectId}: bgm duration=${bgmDuration.toFixed(2)}s, voiceover=${totalDuration.toFixed(2)}s → ${loops} loops`);
+          bgmConfig = { path: bgmLocalPath, volume: bgmVolume, loops };
         } catch (e) {
           if (signal.aborted) throw e;
-          console.warn(`[assemble] bgm download failed, continuing without music:`, e instanceof Error ? e.message : e);
-          bgmLocalPath = null;
+          console.warn(`[assemble] bgm setup failed, continuing without music:`, e instanceof Error ? e.message : e);
+          bgmConfig = null;
         }
       }
 
@@ -1873,27 +1884,20 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
         try { global.gc(); } catch { /* ignore — only available with --expose-gc */ }
       }
 
-      await progress(bgmLocalPath ? "Mixing voiceover + music…" : "Mixing voiceover…");
+      await progress(bgmConfig ? "Mixing voiceover + music…" : "Mixing voiceover…");
       // Cap at totalDuration (voiceover length). The pad step above
       // ensures the video is at least totalDuration when there's
       // significant trailing silence; the cap also trims any tiny
       // encoding-rounding overshoot.
       try {
-        await mixAudio(
-          mixSrc,
-          voiceoverPath,
-          outputPath,
-          totalDuration,
-          signal,
-          bgmLocalPath ? { path: bgmLocalPath, volume: bgmVolume } : null,
-        );
+        await mixAudio(mixSrc, voiceoverPath, outputPath, totalDuration, signal, bgmConfig);
       } catch (e) {
         if (signal.aborted) throw e;
         // If the mix failed with bgm enabled, retry once without it
         // — same fault-tolerance as the old "download failed → no
         // music" branch, just shifted to the mix step. The user
         // still gets a finished video with voiceover only.
-        if (bgmLocalPath) {
+        if (bgmConfig) {
           console.warn(`[assemble] mix with bgm failed, retrying without music:`, e instanceof Error ? e.message : e);
           await mixAudio(mixSrc, voiceoverPath, outputPath, totalDuration, signal, null);
         } else {
@@ -1901,7 +1905,7 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
         }
       }
       try { fs.unlinkSync(mixSrc); } catch { /* ignore */ }
-      if (bgmLocalPath) { try { fs.unlinkSync(bgmLocalPath); } catch { /* ignore */ } }
+      if (bgmConfig) { try { fs.unlinkSync(bgmConfig.path); } catch { /* ignore */ } }
       try {
         const mixedUrl = await uploadFile(ckptPathFor("mixed.mp4"), outputPath, "video/mp4");
         checkpoint.mixed_url = mixedUrl;
