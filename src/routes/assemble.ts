@@ -395,37 +395,6 @@ async function buildFreezeTail(
   return tailPath;
 }
 
-// Pre-render the looping BGM to a finite-length mp3 matching the
-// voiceover duration. Memory-intensive amix configs come from feeding
-// it an indefinitely-looping input (`-stream_loop -1`) — the filter
-// has to buffer enough decoded PCM to keep the mix fed for the full
-// output, which on a 30-min video is hundreds of MB held in ffmpeg
-// native memory. By materializing the looped track to disk first,
-// the mix step gets two FINITE inputs of known length and amix can
-// stream packet-by-packet without buffering ahead. Disk cost is
-// ~2-5 MB per minute of looped mp3 (cheap); memory cost during mix
-// drops dramatically. Encodes mono 96kbps 44.1kHz — adequate for
-// background music ducked to -16 dB under the voiceover.
-function prerenderLoopedBgm(
-  src: string,
-  output: string,
-  durationSec: number,
-  signal?: AbortSignal,
-): Promise<void> {
-  return ffmpegWithTimeout((cmd) =>
-    cmd
-      .input(src).inputOptions(["-stream_loop", "-1", "-thread_queue_size", "512"])
-      .outputOptions([
-        "-t", String(durationSec),
-        "-vn",
-        "-c:a", "libmp3lame", "-b:a", "96k", "-ar", "44100", "-ac", "2",
-      ])
-      .output(output),
-    "prerenderBgm",
-    signal,
-  );
-}
-
 function mixAudio(
   video: string,
   audio: string,
@@ -437,23 +406,30 @@ function mixAudio(
   return ffmpegWithTimeout((cmd) => {
     // probesize + analyzeduration cap how much of each input ffmpeg
     // pre-reads to detect codec/timing. Mixed.mp4 and the trimmed
-    // voiceover/bgm are all known-format outputs from upstream
-    // ffmpeg passes — the default 5MB / 5s probe is overkill and
-    // its read-ahead buffer is real native memory. Cap aggressively.
+    // voiceover are all known-format outputs from upstream ffmpeg
+    // passes — the default 5MB / 5s probe is overhead. Cap aggressively
+    // so the input pipeline doesn't sit on big read-ahead buffers.
     const lightInput = ["-thread_queue_size", "512", "-probesize", "1000000", "-analyzeduration", "0"];
     cmd.input(video).inputOptions([...lightInput, "-fflags", "+genpts"]);
     cmd.input(audio).inputOptions(lightInput);
     if (bgm) {
-      // Three inputs: video, voiceover (1), bgm (2). The BGM input
-      // here is a pre-rendered finite-length mp3 (see
-      // prerenderLoopedBgm above), so amix doesn't have to buffer
-      // an indefinite stream — both audio inputs end at known
-      // sample counts and the filter can drain packets as fast as
-      // the muxer consumes them.
+      // Three inputs: video, voiceover (1), bgm (2). -stream_loop -1
+      // is applied to bgm because it's a LOCAL FILE — looping a
+      // local file is a free seek-to-byte-0, no HTTP refetch, no
+      // file-buffer rebuild. Earlier we tried URL-based looping
+      // (HTTP isn't seekable so ffmpeg refetched per loop, ~hundreds
+      // of requests for a long voiceover) and a separate prerender
+      // step (paid a full re-encode pass). Local + stream_loop is
+      // both cheaper and more reliable.
       //
-      // volume=`bgm.volume` keeps music well under the dialog
-      // (default 0.15 ≈ -16 dB, classic "podcast bed" level).
-      cmd.input(bgm.path).inputOptions(lightInput);
+      // -t at the output bounds the duration so amix doesn't pull
+      // beyond the voiceover length; combined with duration=first
+      // that means amix stops as soon as the voiceover ends and the
+      // loop never decodes past what it serves.
+      //
+      // volume=`bgm.volume` keeps music under the dialog (default
+      // 0.15 ≈ -16 dB, classic "podcast bed" level).
+      cmd.input(bgm.path).inputOptions([...lightInput, "-stream_loop", "-1"]);
       cmd.complexFilter([
         `[2:a]volume=${bgm.volume}[bgmDucked]`,
         `[1:a][bgmDucked]amix=inputs=2:duration=first:dropout_transition=0[mix]`,
@@ -1853,28 +1829,32 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
       if (bgmVolume < 0) bgmVolume = 0;
       if (bgmVolume > 1) bgmVolume = 1;
 
-      // Pre-render the looping BGM to a finite-length local mp3
-      // BEFORE the mix step. Feeding amix an indefinitely-looping
-      // input (-stream_loop -1) was the memory sink — the filter
-      // buffered hundreds of MB of decoded PCM to keep the mix fed
-      // across a 30-min voiceover. Materializing the looped track
-      // to disk (~5 MB) and then mixing two finite known-length
-      // tracks means amix can stream samples instead of buffering.
-      // The prerender pass itself uses stream_loop but writes
-      // directly to disk, so its memory footprint is the mp3
-      // encoder's frame buffer (small) rather than amix's lookahead.
+      // Download BGM to local disk ONCE. We previously tried two
+      // approaches that both failed:
+      //   1. Stream the URL directly into mixAudio with -stream_loop -1.
+      //      HTTP inputs aren't seekable, so ffmpeg re-fetched the
+      //      URL on every loop iteration — a 5s loop into a 30min
+      //      voiceover meant ~360 R2 requests, which was slow and
+      //      hit rate limits.
+      //   2. Pre-render a finite-length looped mp3 from the URL.
+      //      Same problem under the hood: the prerender's own
+      //      -stream_loop -1 was reading from HTTP and triggering
+      //      the same refetch storm, just one step earlier.
+      // The reliable fix is a single download then loop the local
+      // file in the mix step — local-file -stream_loop is a
+      // seek-to-byte-0 with no network or buffer rebuild.
       //
       // Failure here disables BGM and falls back to voiceover-only,
-      // same fault-tolerance the old URL-streamed bgm had.
+      // so a flaky music URL never blocks the assembly.
       let bgmLocalPath: string | null = null;
       if (backgroundMusicUrl) {
-        await progress("Preparing background music…");
+        await progress("Downloading background music…");
         try {
-          bgmLocalPath = path.join(tmpDir, "bgm_looped.mp3");
-          await prerenderLoopedBgm(backgroundMusicUrl, bgmLocalPath, totalDuration, signal);
+          bgmLocalPath = path.join(tmpDir, "bgm.mp3");
+          await downloadFile(backgroundMusicUrl, bgmLocalPath, signal);
         } catch (e) {
           if (signal.aborted) throw e;
-          console.warn(`[assemble] bgm prerender failed, continuing without music:`, e instanceof Error ? e.message : e);
+          console.warn(`[assemble] bgm download failed, continuing without music:`, e instanceof Error ? e.message : e);
           bgmLocalPath = null;
         }
       }
