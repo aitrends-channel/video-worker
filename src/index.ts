@@ -72,7 +72,16 @@ if (stopHonorError) console.error("[server] Failed to honor stale stop requests:
 else console.log("[server] Honored stale stop requests on processing assemblies");
 
 const { error: cleanupError } = await supabase.from("projects")
-  .update({ assembly_status: "queued", assembly_progress: "Queued…", assembly_error: null })
+  .update({
+    assembly_status: "queued",
+    assembly_progress: "Queued…",
+    assembly_error: null,
+    // Defensively clear the finalize-preview flag too. If a worker
+    // died mid-finalize-preview transition, leaving the flag true
+    // would cause the next worker to immediately re-abort on first
+    // poll — re-queueing without clearing creates a livelock.
+    assembly_finalize_preview_requested: false,
+  })
   .eq("assembly_status", "processing");
 if (cleanupError) console.error("[server] Failed to re-queue stale assemblies:", cleanupError.message);
 else console.log("[server] Re-queued stale processing assemblies");

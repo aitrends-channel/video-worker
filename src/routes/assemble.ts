@@ -171,6 +171,11 @@ const FFMPEG_THREADS = ASSEMBLY_SAFE_MODE
 // user-requested stop from a real error and persist the checkpoint
 // instead of clearing it.
 const STOPPED_MARKER = "ASSEMBLY_STOPPED_BY_USER";
+// Distinct marker for the "skip the final burn, ship the preview"
+// path. Surfaces in the catch handler so the terminal-state writer
+// knows to promote assembly_preview_url → assembled_url with
+// status=done, rather than the usual stopped/failed transitions.
+const FINALIZE_PREVIEW_MARKER = "ASSEMBLY_FINALIZE_WITH_PREVIEW";
 
 // When a project has many beats, prefer a single final-stage burn
 // of captions/logo instead of baking them into every per-beat clip.
@@ -858,9 +863,25 @@ async function clearCheckpoint(projectId: string): Promise<void> {
   await supabase.from("projects").update({ assembly_checkpoint: null }).eq("id", projectId);
 }
 
-async function isStopRequested(projectId: string): Promise<boolean> {
-  const { data } = await supabase.from("projects").select("assembly_stop_requested").eq("id", projectId).single();
-  return !!(data?.assembly_stop_requested as boolean | undefined);
+// Combined signal poll: returns whichever interrupt the user has
+// requested (stop OR finalize-with-preview), or null if neither is
+// set. Combining the two flags into one query keeps the polling
+// cost flat — the existing stopPoll fires every 3s and used to do
+// exactly one Supabase select; now it still does exactly one.
+type InterruptSignal = "stop" | "finalize-preview" | null;
+async function readInterruptSignal(projectId: string): Promise<InterruptSignal> {
+  const { data } = await supabase
+    .from("projects")
+    .select("assembly_stop_requested, assembly_finalize_preview_requested")
+    .eq("id", projectId)
+    .single();
+  if (!data) return null;
+  // finalize-preview wins if both are somehow set — it's the
+  // "happy path" terminal outcome (user gets a done video) where
+  // stop just halts the run.
+  if ((data as { assembly_finalize_preview_requested?: boolean }).assembly_finalize_preview_requested) return "finalize-preview";
+  if ((data as { assembly_stop_requested?: boolean }).assembly_stop_requested) return "stop";
+  return null;
 }
 
 // ── Background assembly job ───────────────────────────────────────────────────
@@ -977,33 +998,47 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
 
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "assemble-"));
 
-  // Stop signal: a background poll watches projects.assembly_stop_requested
-  // every 3s. When set, we abort any running ffmpeg via the shared
-  // AbortController; the catch path below sees STOPPED_MARKER and
-  // transitions the project to assembly_status="stopped" with the
-  // checkpoint intact for Resume. Explicit checkStop() calls between
-  // stages mean we don't have to wait up to 3s for the poll to notice
-  // when an awaited stage finishes.
+  // Interrupt signal: a background poll watches two flags every 3s —
+  // assembly_stop_requested (Stop button) and
+  // assembly_finalize_preview_requested (Use this version button).
+  // Either flips abortReason and aborts via the shared
+  // AbortController. The catch path below reads abortReason to
+  // decide between the "stopped" and "finalize with preview"
+  // terminal transitions. Explicit checkStop() calls between stages
+  // mean we don't have to wait up to 3s for the poll to notice when
+  // an awaited stage finishes.
   const aborter = new AbortController();
   const signal = aborter.signal;
+  let abortReason: "stop" | "finalize-preview" | null = null;
+  const triggerInterrupt = (which: "stop" | "finalize-preview") => {
+    abortReason = which;
+    const marker = which === "stop" ? STOPPED_MARKER : FINALIZE_PREVIEW_MARKER;
+    aborter.abort(new Error(marker));
+  };
   const stopPoll = setInterval(async () => {
     if (signal.aborted) return;
     try {
-      if (await isStopRequested(projectId)) {
-        console.log(`[assemble] ${projectId}: stop requested — aborting`);
-        aborter.abort(new Error(STOPPED_MARKER));
+      const sig = await readInterruptSignal(projectId);
+      if (sig) {
+        console.log(`[assemble] ${projectId}: interrupt=${sig} — aborting`);
+        triggerInterrupt(sig);
       }
     } catch {
       // poll error — swallow, will retry next tick
     }
   }, 3000);
   const checkStop = async (): Promise<void> => {
-    if (signal.aborted) throw new Error(STOPPED_MARKER);
-    // Also check directly so a Stop click between stages doesn't wait
-    // up to a poll tick.
-    if (await isStopRequested(projectId)) {
-      aborter.abort(new Error(STOPPED_MARKER));
-      throw new Error(STOPPED_MARKER);
+    if (signal.aborted) {
+      // Pick the matching marker for the already-set reason so the
+      // catch handler routes to the right terminal transition.
+      throw new Error(abortReason === "finalize-preview" ? FINALIZE_PREVIEW_MARKER : STOPPED_MARKER);
+    }
+    // Also check directly so an interrupt click between stages doesn't
+    // wait up to a poll tick.
+    const sig = await readInterruptSignal(projectId);
+    if (sig) {
+      triggerInterrupt(sig);
+      throw new Error(sig === "finalize-preview" ? FINALIZE_PREVIEW_MARKER : STOPPED_MARKER);
     }
   };
 
@@ -1910,6 +1945,18 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
         const mixedUrl = await uploadFile(ckptPathFor("mixed.mp4"), outputPath, "video/mp4");
         checkpoint.mixed_url = mixedUrl;
         await persistCheckpoint();
+        // Surface mixed.mp4 as an in-progress preview WHEN the
+        // final-burn pass is still ahead of us — the user gets a
+        // playable video while the multi-minute captions/logo/
+        // upscale re-encode runs in the background. On the
+        // non-final-burn path, mix is the last encode and the
+        // upload completes seconds later, so a preview URL would
+        // flash on and off.
+        if (useFinalBurn) {
+          await supabase.from("projects")
+            .update({ assembly_preview_url: mixedUrl })
+            .eq("id", projectId);
+        }
       } catch (e) {
         console.warn(`[assemble] mixed.mp4 checkpoint upload failed:`, e);
       }
@@ -2080,6 +2127,8 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
     // Successful completion — clear the checkpoint. (R2 _assembly/ stage
     // objects are left behind; they're small and overwritten by the
     // next run, or cleaned up by the project-delete folder sweep.)
+    // assembly_preview_url is cleared so a stale mixed.mp4 link from
+    // mid-run doesn't show alongside the finished video.
     await supabase.from("projects")
       .update({
         assembly_status: "done",
@@ -2088,6 +2137,8 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
         assembly_error: null,
         assembly_checkpoint: null,
         assembly_stop_requested: false,
+        assembly_finalize_preview_requested: false,
+        assembly_preview_url: null,
         assembly_finished_at: new Date().toISOString(),
         assembly_metrics: metricsSnapshot,
         current_state: 15,
@@ -2100,10 +2151,61 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
     // Capture metrics at the failure point too — peak RSS on a
     // crashed run is the single most useful data point for chasing
     // the next OOM. Stamp it on both stop and failure transitions.
-    metrics.record(message === STOPPED_MARKER ? "stopped" : "failed");
+    const terminalLabel = message === STOPPED_MARKER ? "stopped" : message === FINALIZE_PREVIEW_MARKER ? "finalize-preview" : "failed";
+    metrics.record(terminalLabel);
     const metricsSnapshot = metrics.snapshot();
     console.log(`[assemble] ${projectId}: metrics (terminal) peak_rss=${metricsSnapshot.peak_rss_mb}MB stages=${metricsSnapshot.stages.length}`);
-    if (message === STOPPED_MARKER) {
+    if (message === FINALIZE_PREVIEW_MARKER) {
+      // User clicked "Use this version" — promote the already-uploaded
+      // mixed.mp4 (assembly_preview_url) to the final assembled_url
+      // and transition to done. The unfinished final-burn output is
+      // abandoned in the tmp dir; nothing in R2 needs cleanup. The
+      // checkpoint IS cleared because this is a happy-path terminal
+      // state: the next assembly run starts fresh, not from a
+      // mid-burn checkpoint that would re-trigger the burn the user
+      // just opted out of.
+      const { data: row } = await supabase.from("projects")
+        .select("assembly_preview_url")
+        .eq("id", projectId)
+        .single();
+      const previewUrlRow = (row?.assembly_preview_url as string | null) ?? null;
+      if (!previewUrlRow) {
+        // Shouldn't happen — the front-end only shows the button when
+        // assembly_preview_url is set, and that field only gets set
+        // after a successful mixed.mp4 upload. But if some race
+        // erased it, fall through to a normal stopped state so the
+        // user can Resume.
+        console.warn(`[assemble] ${projectId}: finalize-preview requested but no assembly_preview_url — falling back to stopped`);
+        await supabase.from("projects")
+          .update({
+            assembly_status: "stopped",
+            assembly_progress: "Stopped — click Resume to continue",
+            assembly_error: null,
+            assembly_stop_requested: false,
+            assembly_finalize_preview_requested: false,
+            assembly_finished_at: new Date().toISOString(),
+            assembly_metrics: metricsSnapshot,
+          })
+          .eq("id", projectId);
+      } else {
+        console.log(`[assemble] ${projectId}: finalize-with-preview → ${previewUrlRow}`);
+        await supabase.from("projects")
+          .update({
+            assembly_status: "done",
+            assembled_url: previewUrlRow,
+            assembly_progress: null,
+            assembly_error: null,
+            assembly_checkpoint: null,
+            assembly_stop_requested: false,
+            assembly_finalize_preview_requested: false,
+            assembly_preview_url: null,
+            assembly_finished_at: new Date().toISOString(),
+            assembly_metrics: metricsSnapshot,
+            current_state: 15,
+          })
+          .eq("id", projectId);
+      }
+    } else if (message === STOPPED_MARKER) {
       // User-requested stop — keep the checkpoint so Resume picks up
       // from the last completed stage. Clear stop_requested so the next
       // Resume → claim cycle doesn't trip the abort the moment the new
@@ -2115,6 +2217,8 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
           assembly_progress: "Stopped — click Resume to continue",
           assembly_error: null,
           assembly_stop_requested: false,
+          assembly_finalize_preview_requested: false,
+          assembly_preview_url: null,
           assembly_finished_at: new Date().toISOString(),
           assembly_metrics: metricsSnapshot,
         })
@@ -2128,6 +2232,8 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
           assembly_status: "failed",
           assembly_error: message,
           assembly_progress: null,
+          assembly_finalize_preview_requested: false,
+          assembly_preview_url: null,
           assembly_finished_at: new Date().toISOString(),
           assembly_metrics: metricsSnapshot,
         })
