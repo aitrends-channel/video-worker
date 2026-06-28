@@ -2160,55 +2160,31 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
     const metricsSnapshot = metrics.snapshot();
     console.log(`[assemble] ${projectId}: metrics (terminal) peak_rss=${metricsSnapshot.peak_rss_mb}MB stages=${metricsSnapshot.stages.length}`);
     if (message === FINALIZE_PREVIEW_MARKER) {
-      // User clicked "Use this version" — promote the already-uploaded
-      // mixed.mp4 (assembly_preview_url) to the final assembled_url
-      // and transition to done. The unfinished final-burn output is
-      // abandoned in the tmp dir; nothing in R2 needs cleanup. The
-      // checkpoint IS cleared because this is a happy-path terminal
-      // state: the next assembly run starts fresh, not from a
-      // mid-burn checkpoint that would re-trigger the burn the user
-      // just opted out of.
-      const { data: row } = await supabase.from("projects")
-        .select("assembly_preview_url")
-        .eq("id", projectId)
-        .single();
-      const previewUrlRow = (row?.assembly_preview_url as string | null) ?? null;
-      if (!previewUrlRow) {
-        // Shouldn't happen — the front-end only shows the button when
-        // assembly_preview_url is set, and that field only gets set
-        // after a successful mixed.mp4 upload. But if some race
-        // erased it, fall through to a normal stopped state so the
-        // user can Resume.
-        console.warn(`[assemble] ${projectId}: finalize-preview requested but no assembly_preview_url — falling back to stopped`);
-        await supabase.from("projects")
-          .update({
-            assembly_status: "stopped",
-            assembly_progress: "Stopped — click Resume to continue",
-            assembly_error: null,
-            assembly_stop_requested: false,
-            assembly_finalize_preview_requested: false,
-            assembly_finished_at: new Date().toISOString(),
-            assembly_metrics: metricsSnapshot,
-          })
-          .eq("id", projectId);
-      } else {
-        console.log(`[assemble] ${projectId}: finalize-with-preview → ${previewUrlRow}`);
-        await supabase.from("projects")
-          .update({
-            assembly_status: "done",
-            assembled_url: previewUrlRow,
-            assembly_progress: null,
-            assembly_error: null,
-            assembly_checkpoint: null,
-            assembly_stop_requested: false,
-            assembly_finalize_preview_requested: false,
-            assembly_preview_url: null,
-            assembly_finished_at: new Date().toISOString(),
-            assembly_metrics: metricsSnapshot,
-            current_state: 15,
-          })
-          .eq("id", projectId);
-      }
+      // User clicked "Use this version" — the worker just STOPS here.
+      // The actual promotion of assembly_preview_url → assembled_url
+      // happens client-side via PATCH {commit_preview: true} when the
+      // user clicks Continue. Two-step confirm gives them a moment to
+      // verify the preview is what they want before locking it in.
+      //
+      // What's preserved (vs. a normal Stop):
+      //   - assembly_finalize_preview_requested stays TRUE so the UI
+      //     can show Continue (instead of Resume) on the stopped
+      //     panel. The flag IS the signal to the front-end.
+      //   - assembly_preview_url stays set — Continue needs it.
+      //   - assembly_checkpoint preserved in case the user changes
+      //     their mind and Cancels: cancel_assembly does its own
+      //     cleanup of the _assembly/ R2 folder including mixed.mp4.
+      console.log(`[assemble] ${projectId}: finalize-preview requested — stopping for user confirmation`);
+      await supabase.from("projects")
+        .update({
+          assembly_status: "stopped",
+          assembly_progress: "Stopped — preview ready, click Continue to use it",
+          assembly_error: null,
+          assembly_stop_requested: false,
+          assembly_finished_at: new Date().toISOString(),
+          assembly_metrics: metricsSnapshot,
+        })
+        .eq("id", projectId);
     } else if (message === STOPPED_MARKER) {
       // User-requested stop — keep the checkpoint so Resume picks up
       // from the last completed stage. Clear stop_requested so the next
