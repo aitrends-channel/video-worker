@@ -96,12 +96,15 @@ function buildJobSpec(opts: CoconutFinalizeOptions) {
     });
   }
 
-  return {
+  // Build the spec piecemeal so the `notification` and `filters`
+  // keys ONLY appear when we have values for them. JSON.stringify
+  // strips `undefined` from objects, but Coconut's API has been
+  // observed to reject the spec with a confusing
+  // "notification not valid" error in some cases — safer to never
+  // include the key at all when there's no webhook.
+  const spec: Record<string, unknown> = {
     input: { url: opts.inputUrl },
     storage: r2Service,
-    notification: opts.notificationUrl
-      ? { type: "http", url: opts.notificationUrl, events: true }
-      : undefined,
     outputs: {
       // Single mp4 output at the user's chosen resolution.
       "video:mp4": {
@@ -121,10 +124,18 @@ function buildJobSpec(opts: CoconutFinalizeOptions) {
           sample_rate: 44100,
           channels: 2,
         },
-        filters: filters.length > 0 ? filters : undefined,
+        ...(filters.length > 0 ? { filters } : {}),
       },
     },
   };
+  // Webhook URL is only attached when the caller supplied one.
+  // Coconut errors on a missing/empty notification object with a
+  // confusing "notification not valid" message, so omitting the
+  // key entirely is the safe shape.
+  if (opts.notificationUrl) {
+    spec.notification = { type: "http", url: opts.notificationUrl, events: true };
+  }
+  return spec;
 }
 
 const API_BASE = (process.env.COCONUT_API_BASE ?? "https://api.coconut.co/v2").replace(/\/$/, "");
