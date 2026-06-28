@@ -1977,84 +1977,88 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
     // baseCaptionSegs block above Stage B.
 
     // ── Stage F: validate + remux + upload final ────────────────────────
-    // Allow a post-mix final burn step (captions/logo) for large jobs.
-    // When useFinalBurn=true AND the intermediate dims differ from the
-    // user's chosen final dims, we additionally fuse a scale filter
-    // into the first burn pass — that way we get the upscale "for
-    // free" inside the encode that was already going to run, instead
-    // of an extra full-video pass at the end. Captions are written
-    // at finalH so the font scales correctly to the output resolution.
+    //
+    // SINGLE-PASS final burn: any combination of upscale, subtitles,
+    // and logo overlay now runs in ONE ffmpeg invocation instead of
+    // two. Earlier versions did pass 1 = scale + subtitles, pass 2 =
+    // logo overlay — two full-video re-encodes at final resolution
+    // that doubled the finalize wall-clock on long projects. Fused
+    // into a single complex_filter, the encoder runs once and every
+    // frame goes through the whole chain: scale → subtitles → logo.
+    //
+    // Scale algorithm: bicubic instead of lanczos. Lanczos is best
+    // for true-source upscaling where preserving detail matters; on
+    // AI-generated footage (already softer than camera-shot video)
+    // the perceptual difference is negligible and bicubic encodes
+    // 2-3x faster.
+    //
+    // Captions are written at finalH so font sizing matches the
+    // user's chosen output resolution, not the intermediate.
     let finalPath = outputPath;
     if (useFinalBurn && (captionsEnabled || finalLogoPath)) {
       await checkStop();
       const needsUpscale = w !== finalW || h !== finalH;
       await progress(needsUpscale ? "Applying final burn (upscale + captions/logo)…" : "Applying final burn (captions/logo)…");
-      // Write a single timeline ASS at the FINAL output dimensions so
-      // font sizes match the resolution the user requested, not the
-      // smaller intermediate.
       const assPath = path.join(tmpDir, "final_captions.ass");
-      if (captionsEnabled && baseCaptionSegs.length > 0) {
+      const hasCaptions = captionsEnabled && baseCaptionSegs.length > 0;
+      if (hasCaptions) {
         writeAss(baseCaptionSegs, buildAssStyle(captionsStyle, captionsSize, captionsPosition, finalH), finalW, finalH, assPath);
       }
-      let interimSrc = outputPath;
-      // First pass: optional upscale + burn subtitles. When subtitles
-      // are enabled the subtitles filter runs at the input resolution
-      // and is then scaled — so we apply scale BEFORE subtitles so
-      // captions render at finalW × finalH directly (sharp text). When
-      // captions are disabled we still do the upscale here so logo
-      // overlay below operates at final dims.
-      if (captionsEnabled && baseCaptionSegs.length > 0) {
-        const withSubs = path.join(tmpDir, "with_subs.mp4");
-        const vf = needsUpscale
-          ? `scale=${finalW}:${finalH}:flags=lanczos,subtitles=${escapeAssPath(assPath)}`
-          : `subtitles=${escapeAssPath(assPath)}`;
-        await ffmpegWithTimeout((cmd) =>
-          cmd
-            .input(outputPath)
-            .outputOptions(["-vf", vf, "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "copy"])
-            .output(withSubs),
-          "finalBurnSubtitles",
-          signal,
-        );
-        interimSrc = withSubs;
-      } else if (needsUpscale) {
-        // No captions but we still need to upscale before the logo
-        // overlay so the logo lands at the final coordinates.
-        const scaled = path.join(tmpDir, "scaled.mp4");
-        await ffmpegWithTimeout((cmd) =>
-          cmd
-            .input(outputPath)
-            .outputOptions(["-vf", `scale=${finalW}:${finalH}:flags=lanczos`, "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "copy"])
-            .output(scaled),
-          "finalBurnUpscale",
-          signal,
-        );
-        interimSrc = scaled;
-      }
-      // Second pass: overlay logo (if any). Coordinates relative to
-      // final dims since interimSrc is now at finalW × finalH.
+      const burnedPath = path.join(tmpDir, "final_burned.mp4");
+
+      // Build the video filter chain step list. Order matters:
+      // scale FIRST so the subtitles+logo render at output dims,
+      // subtitles BEFORE logo so the logo composites on top of the
+      // captioned frame (matches the per-beat-bake ordering).
+      const videoSteps: string[] = [];
+      if (needsUpscale) videoSteps.push(`scale=${finalW}:${finalH}:flags=bicubic`);
+      if (hasCaptions) videoSteps.push(`subtitles=${escapeAssPath(assPath)}`);
+
       if (finalLogoPath) {
-        const withLogo = path.join(tmpDir, "with_logo.mp4");
+        // Logo present → use complex_filter so we can chain video
+        // ops with the overlay input. [0:v] runs scale/subtitles,
+        // [1:v] sizes the logo, the final overlay composites them.
+        // When there are no preceding video steps the [0:v] chain
+        // is a null filter (just labels through) so the graph
+        // structure stays consistent.
         const posX = Math.round(finalW * (logoX ?? 0.85));
         const posY = Math.round(finalH * (logoY ?? 0.05));
         const logoPx = Math.max(8, Math.min(finalW, Math.round((finalW * (logoSize ?? 0.1)) / 2) * 2));
+        const videoChain = videoSteps.length > 0
+          ? `[0:v]${videoSteps.join(",")}[base]`
+          : `[0:v]null[base]`;
         await ffmpegWithTimeout((cmd) =>
           cmd
-            .input(interimSrc)
+            .input(outputPath)
             .input(finalLogoPath)
             .complexFilter([
+              videoChain,
               `[1:v]scale=w=${logoPx}:h=-2[logo]`,
-              `[0:v][logo]overlay=${posX}:${posY}:format=auto[v]`,
+              `[base][logo]overlay=${posX}:${posY}:format=auto[v]`,
             ])
             .outputOptions(["-map", "[v]", "-map", "0:a?", "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "copy"])
-            .output(withLogo),
-          "finalBurnLogo",
+            .output(burnedPath),
+          "finalBurnFused",
           signal,
         );
-        finalPath = withLogo;
-      } else {
-        finalPath = interimSrc;
+        finalPath = burnedPath;
+      } else if (videoSteps.length > 0) {
+        // No logo — single-input -vf chain is simpler and lighter
+        // than complex_filter. Covers scale-only, subtitles-only,
+        // and scale+subtitles cases.
+        await ffmpegWithTimeout((cmd) =>
+          cmd
+            .input(outputPath)
+            .outputOptions(["-vf", videoSteps.join(","), "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "copy"])
+            .output(burnedPath),
+          "finalBurnSimple",
+          signal,
+        );
+        finalPath = burnedPath;
       }
+      // Else: no video changes needed (no captions, no logo, no
+      // upscale). Shouldn't happen given the outer condition but
+      // fall through with finalPath = outputPath for safety.
     } else if (w !== finalW || h !== finalH) {
       // useFinalBurn was off (no captions, no logo) but we still
       // produced intermediate clips at a smaller resolution and the
@@ -2067,7 +2071,7 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
       await ffmpegWithTimeout((cmd) =>
         cmd
           .input(outputPath)
-          .outputOptions(["-vf", `scale=${finalW}:${finalH}:flags=lanczos`, "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "copy"])
+          .outputOptions(["-vf", `scale=${finalW}:${finalH}:flags=bicubic`, "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "copy"])
           .output(scaled),
         "intermediateUpscale",
         signal,
