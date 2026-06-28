@@ -55,11 +55,21 @@ export interface CoconutJob {
   output_url?: string;            // populated on completed
 }
 
-// Build the Coconut job spec. The shape mirrors their JSON config
-// format. R2 storage credentials are passed as a "service" so Coconut
-// can write directly to your R2 bucket via the S3-compatible API.
+// Build the Coconut job spec. Shape verified against a known-working
+// example from Coconut's dashboard. Key constraints:
+//   - `notification` is REQUIRED, must be `{ url }` (no type/events).
+//     We default to COCONUT_WEBHOOK_URL env var; if unset we still
+//     include the key with a placeholder URL — Coconut will try to
+//     POST events there and silently fail, but the job itself runs.
+//   - `outputs` is keyed by CONTAINER ("mp4", "webm", etc.) and its
+//     value is an ARRAY of outputs in that container.
+//   - Each output uses high-level `format: { width, height, quality }`
+//     instead of low-level codec/preset/crf. Quality 1-5; 4 is "high"
+//     (~veryfast crf 23 equivalent).
+//   - R2 storage is passed under `storage` using Coconut's s3other
+//     service — they support any S3-compatible target.
 function buildJobSpec(opts: CoconutFinalizeOptions) {
-  const r2Service = {
+  const storage = {
     service: "s3other",
     bucket: process.env.R2_BUCKET_NAME,
     region: "auto",
@@ -70,72 +80,52 @@ function buildJobSpec(opts: CoconutFinalizeOptions) {
     },
   };
 
-  // Filter chain: scale → subtitles → logo overlay.
-  // Each filter is expressed as a Coconut transformation block.
-  // Subtitles + image overlay are first-class operations.
-  const filters: Record<string, unknown>[] = [];
+  // Per-output transformation block — subtitles burn-in + logo
+  // watermark are first-class options here. Omit the key entirely
+  // when neither is set so the spec stays minimal.
+  const transformation: Record<string, unknown> = {};
   if (opts.captionsAssUrl) {
-    filters.push({
-      subtitles: {
-        source: opts.captionsAssUrl,
-        burn_in: true,
-      },
-    });
+    transformation.subtitles = { source: opts.captionsAssUrl };
   }
   if (opts.logoUrl) {
-    filters.push({
-      watermark: {
-        url: opts.logoUrl,
-        // Coconut expresses position as keywords + offsets. Map our
-        // pct anchors to the closest gravity. We default to top-right
-        // since that's the project's default position.
-        position: "top_right",
-        width: `${Math.round((opts.logoSizePct ?? 0.1) * 100)}%`,
-        opacity: 1,
-      },
-    });
+    transformation.watermark = {
+      url: opts.logoUrl,
+      position: "top_right",
+    };
   }
 
-  // Build the spec piecemeal so the `notification` and `filters`
-  // keys ONLY appear when we have values for them. JSON.stringify
-  // strips `undefined` from objects, but Coconut's API has been
-  // observed to reject the spec with a confusing
-  // "notification not valid" error in some cases — safer to never
-  // include the key at all when there's no webhook.
-  const spec: Record<string, unknown> = {
-    input: { url: opts.inputUrl },
-    storage: r2Service,
-    outputs: {
-      // Single mp4 output at the user's chosen resolution.
-      "video:mp4": {
-        path: opts.outputBucketKey,
-        video: {
-          codec: "h.264",
-          profile: "high",
-          preset: "veryfast",
-          crf: 23,
-          width: opts.outputWidth,
-          height: opts.outputHeight,
-          fps: 24,
-        },
-        audio: {
-          codec: "aac",
-          bitrate: 128,
-          sample_rate: 44100,
-          channels: 2,
-        },
-        ...(filters.length > 0 ? { filters } : {}),
-      },
+  const output: Record<string, unknown> = {
+    path: opts.outputBucketKey,
+    key: "mp4:final",
+    format: {
+      width: opts.outputWidth,
+      height: opts.outputHeight,
+      // 1=low, 5=highest. 4 maps roughly to veryfast/crf 23.
+      quality: 4,
     },
   };
-  // Webhook URL is only attached when the caller supplied one.
-  // Coconut errors on a missing/empty notification object with a
-  // confusing "notification not valid" message, so omitting the
-  // key entirely is the safe shape.
-  if (opts.notificationUrl) {
-    spec.notification = { type: "http", url: opts.notificationUrl, events: true };
+  if (Object.keys(transformation).length > 0) {
+    output.transformation = transformation;
   }
-  return spec;
+
+  // Notification URL: prefer caller-provided, fall back to env var.
+  // The key is required by Coconut's schema. If neither source has
+  // a URL we still need SOMETHING — supply the request endpoint
+  // path under Coconut's domain as a no-op fallback, which Coconut
+  // accepts as a syntactically valid URL and routes nowhere
+  // meaningful.
+  const notificationUrl = opts.notificationUrl
+    ?? process.env.COCONUT_WEBHOOK_URL
+    ?? "https://app.coconut.co/notifications/http/placeholder";
+
+  return {
+    input: { url: opts.inputUrl },
+    storage,
+    notification: { url: notificationUrl },
+    outputs: {
+      mp4: [output],
+    },
+  };
 }
 
 const API_BASE = (process.env.COCONUT_API_BASE ?? "https://api.coconut.co/v2").replace(/\/$/, "");
