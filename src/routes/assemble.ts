@@ -391,35 +391,44 @@ async function encodeBeatFull(opts: {
 
     if (logoOverlay) {
       // Three inputs: visual (0), audio (1), logo image (2).
+      // Filter graph pins to [0:v:0] (FIRST video stream of input 0)
+      // because some AI-generated video sources include metadata or
+      // cover-art streams that [0:v] would also match — landing a
+      // second h264 stream at the audio slot and breaking the mp4
+      // muxer. Same defense on the audio side: [1:a:0].
       const logoW = Math.max(8, Math.min(w, Math.round((w * logoOverlay.sizePct) / 2) * 2));
       const x = Math.round(w * logoOverlay.xPct);
       const y = Math.round(h * logoOverlay.yPct);
       cmd.input(logoOverlay.logoPath);
       const graph: string[] = [];
       // Subtitles apply BEFORE overlay so the logo composites on top
-      // of the captioned frame (matches the previous behavior of
-      // normalizeClip).
+      // of the captioned frame.
       if (assFilter) {
-        graph.push(`[0:v]${baseFilter},${assFilter}[base]`);
+        graph.push(`[0:v:0]${baseFilter},${assFilter}[base]`);
       } else {
-        graph.push(`[0:v]${baseFilter}[base]`);
+        graph.push(`[0:v:0]${baseFilter}[base]`);
       }
-      graph.push(`[2:v]scale=w=${logoW}:h=-2[logo]`);
+      graph.push(`[2:v:0]scale=w=${logoW}:h=-2[logo]`);
       graph.push(`[base][logo]overlay=x=${x}:y=${y}:format=auto[v]`);
       cmd.complexFilter(graph);
       cmd.outputOptions([
-        "-map", "[v]", "-map", "1:a",
+        "-map", "[v]", "-map", "1:a:0",
         "-c:v", "libx264", "-preset", preset, "-crf", crf, "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
         "-t", String(durationSec),
         "-shortest",
       ]);
     } else {
-      // No logo — simpler -vf chain on the visual input.
-      const vf = assFilter ? `${baseFilter},${assFilter}` : baseFilter;
+      // No logo — apply the video filter inside complex_filter too
+      // so we can pin to [0:v:0] explicitly. Using -vf with -map
+      // 0:v could match multiple video streams on multi-stream
+      // sources and the resulting second h264 stream confuses the
+      // mp4 muxer. complex_filter + explicit selectors is the
+      // bulletproof shape.
+      const vfChain = assFilter ? `${baseFilter},${assFilter}` : baseFilter;
+      cmd.complexFilter([`[0:v:0]${vfChain}[v]`]);
       cmd.outputOptions([
-        "-map", "0:v", "-map", "1:a",
-        "-vf", vf,
+        "-map", "[v]", "-map", "1:a:0",
         "-c:v", "libx264", "-preset", preset, "-crf", crf, "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
         "-t", String(durationSec),
