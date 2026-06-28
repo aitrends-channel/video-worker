@@ -1995,7 +1995,67 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
     // Captions are written at finalH so font sizing matches the
     // user's chosen output resolution, not the intermediate.
     let finalPath = outputPath;
-    if (useFinalBurn && (captionsEnabled || finalLogoPath)) {
+    const useCoconut = !!process.env.COCONUT_API_KEY && useFinalBurn && (captionsEnabled || finalLogoPath);
+    if (useCoconut) {
+      // ── Stage F: offload the final burn to Coconut ──────────────────
+      //
+      // Skip the local ffmpeg re-encode entirely. Coconut runs the
+      // scale/subtitles/logo on their hardware while THIS worker
+      // returns to processing the next user. Cuts ~5-25 min of CPU
+      // off the worker's wall-clock for this assembly.
+      //
+      // Pre-requisites:
+      //   - mixed.mp4 already in R2 (checkpoint.mixed_url is set
+      //     above; we re-use that URL as Coconut's input).
+      //   - ASS captions file uploaded to R2 too so Coconut can fetch
+      //     it. Logo is already at logoUrl (the user uploaded it).
+      //
+      // Output: Coconut writes the finalized mp4 directly to R2 at
+      // the same _assembly/ prefix. We then download it locally for
+      // the existing remux+upload tail to consume — keeps the moov
+      // faststart + upload-failure-retry logic intact.
+      await checkStop();
+      await progress("Submitting final-burn to Coconut…");
+      const { submitJob, pollJob } = await import("../lib/coconut.js");
+      const hasCaptions = captionsEnabled && baseCaptionSegs.length > 0;
+      let captionsAssUrl: string | null = null;
+      if (hasCaptions) {
+        // Upload the ASS file to R2 so Coconut can fetch it via HTTPS.
+        // Path mirrors the other _assembly/ artifacts.
+        const assLocal = path.join(tmpDir, "final_captions.ass");
+        writeAss(baseCaptionSegs, buildAssStyle(captionsStyle, captionsSize, captionsPosition, finalH), finalW, finalH, assLocal);
+        captionsAssUrl = await uploadFile(ckptPathFor("final_captions.ass"), assLocal, "text/x-ssa");
+      }
+      const outputKey = ckptPathFor("final_burned.mp4");
+      const job = await submitJob({
+        inputUrl: checkpoint.mixed_url!,
+        outputBucketKey: outputKey,
+        outputWidth: finalW,
+        outputHeight: finalH,
+        captionsAssUrl,
+        logoUrl: logoUrl ?? null,
+        logoXPct: logoX,
+        logoYPct: logoY,
+        logoSizePct: logoSize,
+      });
+      console.log(`[assemble] ${projectId}: coconut job ${job.id} submitted`);
+      await progress("Finalizing on Coconut…");
+      await pollJob(job.id, signal, (status) => {
+        // Throttle progress writes — pollJob may emit multiple
+        // updates as status flips queued → processing → completed.
+        void progress(`Coconut: ${status}…`);
+      });
+      console.log(`[assemble] ${projectId}: coconut job ${job.id} completed`);
+      // Coconut wrote directly to R2. Download to a local path so
+      // the remux + final-upload tail below works unchanged.
+      const burnedPath = path.join(tmpDir, "final_burned.mp4");
+      const burnedUrl = `${process.env.R2_PUBLIC_URL?.replace(/\/$/, "")}/${outputKey}`;
+      await downloadFile(burnedUrl, burnedPath, signal);
+      finalPath = burnedPath;
+    } else if (useFinalBurn && (captionsEnabled || finalLogoPath)) {
+      // Coconut not configured — fall back to local ffmpeg burn.
+      // This is the same code path as before; unchanged logic, just
+      // gated behind the "COCONUT_API_KEY missing" check above.
       await checkStop();
       const needsUpscale = w !== finalW || h !== finalH;
       await progress(needsUpscale ? "Applying final burn (upscale + captions/logo)…" : "Applying final burn (captions/logo)…");
