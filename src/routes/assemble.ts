@@ -195,6 +195,13 @@ function ffmpegWithTimeout(
       return;
     }
     const cmd = build(ffmpeg().addOption("-threads", String(threadCount)).addOption("-filter_threads", String(threadCount)));
+    // Capture the tail of ffmpeg stderr so error messages aren't
+    // just "Conversion failed!" — the real diagnostic (OOM, codec
+    // error, filter syntax) is upstream of that. We keep the last
+    // ~8 KB so the log line is bounded but useful. fluent-ffmpeg
+    // emits stderr line-by-line via its "stderr" event.
+    let stderrTail = "";
+    const STDERR_TAIL_MAX = 8192;
     let settled = false;
     const settle = (fn: () => void) => {
       if (!settled) { settled = true; clearTimeout(timer); signal?.removeEventListener("abort", onAbort); fn(); }
@@ -213,8 +220,20 @@ function ffmpegWithTimeout(
     }, FFMPEG_TIMEOUT_MS);
     signal?.addEventListener("abort", onAbort, { once: true });
     cmd
+      .on("stderr", (line: string) => {
+        stderrTail += line + "\n";
+        if (stderrTail.length > STDERR_TAIL_MAX) {
+          stderrTail = stderrTail.slice(stderrTail.length - STDERR_TAIL_MAX);
+        }
+      })
       .on("end", () => settle(resolve))
-      .on("error", (err: Error) => settle(() => reject(new Error(`${label} failed: ${err.message}`))))
+      .on("error", (err: Error) => settle(() => {
+        // Surface stderr tail alongside the generic error message so
+        // we can tell OOM apart from filter syntax errors apart from
+        // upstream codec issues in the worker logs.
+        const tail = stderrTail.trim().split("\n").slice(-12).join(" | ");
+        reject(new Error(`${label} failed: ${err.message}${tail ? ` :: ${tail}` : ""}`));
+      }))
       .run();
   });
 }
@@ -320,6 +339,25 @@ function normalizeClip(
 //   - Image: -loop 1 + -t <dur>      → still frame for the whole beat
 //   - Video: -stream_loop -1 + -t   → loops short source if needed,
 //                                     -t cuts at audio length
+// Pick libx264 params based on output resolution. At 4K (2160p+) a
+// veryfast/crf 23 encode holds enough reference frames + lookahead
+// for libx264 to push past 500 MB resident — which on a 2 GB Render
+// Standard instance triggers sporadic exit-234 failures and
+// eventual OOM-kills. ultrafast at 4K drops B-frames, CABAC,
+// lookahead, and extra refs: ~50% the memory, ~2× faster encode,
+// files ~30% larger at the same crf. Acceptable trade for AI-gen
+// footage that doesn't need maximum compression.
+type EncodeParams = { preset: string; crf: string };
+function pickEncodeParams(h: number, degraded: boolean): EncodeParams {
+  // 1440p and above: lighter encoder regardless of degraded flag.
+  // Below that, default veryfast/crf 23.
+  // degraded=true is the retry path — drop further even at 1080p.
+  if (degraded || h >= 1440) {
+    return { preset: "ultrafast", crf: "28" };
+  }
+  return { preset: "veryfast", crf: "23" };
+}
+
 async function encodeBeatFull(opts: {
   visualPath: string;
   isImage: boolean;
@@ -330,15 +368,12 @@ async function encodeBeatFull(opts: {
   h: number;
   logoOverlay: LogoOverlay | null;
   subtitles: { assPath: string } | null;
+  degraded?: boolean;
   signal?: AbortSignal;
 }): Promise<void> {
-  const { visualPath, isImage, voiceoverPath, durationSec, output, w, h, logoOverlay, subtitles, signal } = opts;
+  const { visualPath, isImage, voiceoverPath, durationSec, output, w, h, logoOverlay, subtitles, degraded, signal } = opts;
 
-  // veryfast/crf 23 to match the previous final-burn quality. Every
-  // beat is at final res, so this IS the user-visible output —
-  // ultrafast/crf 28 was acceptable when these were intermediate.
-  const preset = "veryfast";
-  const crf = "23";
+  const { preset, crf } = pickEncodeParams(h, degraded ?? false);
 
   const baseFilter = `scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2:black,fps=24`;
   const assFilter = subtitles ? `ass=${escapeAssPath(subtitles.assPath)}` : null;
@@ -1417,17 +1452,44 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
             return;
           }
 
-          await encodeBeatFull({
-            visualPath,
-            isImage,
-            voiceoverPath: voiceoverLocal,
-            durationSec: durations[i],
-            output: clipPath,
-            w, h,
-            logoOverlay,
-            subtitles: beatSubtitles,
-            signal,
-          });
+          // First attempt with the resolution-tier-default encoder
+          // params. If it fails (typically OOM/exit 234 on 4K under
+          // memory pressure), retry once with degraded=true to force
+          // ultrafast/crf 28 — meaningfully lower memory and faster,
+          // at the cost of slightly bigger files. Silent drops corrupt
+          // the audio/visual timeline, so we'd rather pay the size
+          // cost than lose a beat.
+          try {
+            await encodeBeatFull({
+              visualPath,
+              isImage,
+              voiceoverPath: voiceoverLocal,
+              durationSec: durations[i],
+              output: clipPath,
+              w, h,
+              logoOverlay,
+              subtitles: beatSubtitles,
+              signal,
+            });
+          } catch (encodeErr) {
+            if (encodeErr instanceof Error && (encodeErr.message === STOPPED_MARKER || encodeErr.message === FINALIZE_PREVIEW_MARKER)) {
+              throw encodeErr;
+            }
+            console.warn(`[assemble] beat ${beat.beat_number}: first encode failed (${encodeErr instanceof Error ? encodeErr.message : encodeErr}); retrying with degraded params`);
+            await encodeBeatFull({
+              visualPath,
+              isImage,
+              voiceoverPath: voiceoverLocal,
+              durationSec: durations[i],
+              output: clipPath,
+              w, h,
+              logoOverlay,
+              subtitles: beatSubtitles,
+              degraded: true,
+              signal,
+            });
+            console.log(`[assemble] beat ${beat.beat_number}: degraded encode succeeded`);
+          }
 
           try { fs.unlinkSync(visualPath); } catch { /* ignore */ }
           if (cleanupVoice) { try { fs.unlinkSync(voiceoverLocal); } catch { /* ignore */ } }
