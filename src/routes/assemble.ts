@@ -108,6 +108,39 @@ function getMediaDuration(filePath: string): Promise<number> {
   });
 }
 
+// ── Memory + stage metrics ────────────────────────────────────────────────────
+//
+// Track RSS (resident set size — what Render's OOM killer actually
+// watches) and elapsed wall-clock per stage so we can tell where memory
+// peaked AFTER an assembly completes, instead of guessing from logs.
+// Persisted to projects.assembly_metrics at the success path.
+interface StageMetric { stage: string; rss_mb: number; heap_mb: number; t_ms: number; }
+interface AssemblyMetrics { peak_rss_mb: number; stages: StageMetric[]; }
+
+function createMetricsTracker(): {
+  record: (stage: string) => StageMetric;
+  snapshot: () => AssemblyMetrics;
+} {
+  const stages: StageMetric[] = [];
+  let peakRssMb = 0;
+  let stageStartedAt = Date.now();
+  return {
+    record: (stage: string): StageMetric => {
+      const mem = process.memoryUsage();
+      const rss_mb = Math.round(mem.rss / 1024 / 1024);
+      const heap_mb = Math.round(mem.heapUsed / 1024 / 1024);
+      const now = Date.now();
+      const entry: StageMetric = { stage, rss_mb, heap_mb, t_ms: now - stageStartedAt };
+      stageStartedAt = now;
+      stages.push(entry);
+      if (rss_mb > peakRssMb) peakRssMb = rss_mb;
+      console.log(`[assemble:metrics] stage=${stage} rss=${rss_mb}MB heap=${heap_mb}MB elapsed=${entry.t_ms}ms`);
+      return entry;
+    },
+    snapshot: (): AssemblyMetrics => ({ peak_rss_mb: peakRssMb, stages: [...stages] }),
+  };
+}
+
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) return reject(new Error(STOPPED_MARKER));
@@ -312,13 +345,63 @@ function trimSilence(input: string, output: string, signal?: AbortSignal): Promi
   );
 }
 
+// Build a tiny still-frame mp4 from joined.mp4's last frame, encoded
+// for `durationSec` at the same resolution/fps/pixfmt as the
+// per-beat clips. Then concat-copy joined + tail → padded. This
+// replaces the old tpad full-video re-encode that ran on every
+// legacy-mode assembly whose voiceover had trailing silence (most of
+// them). A 30-minute 1080p re-encode at ultrafast is still several
+// minutes of CPU and a sustained memory spike; the still-frame
+// encode is sub-second and the concat copy is I/O-bound.
+async function buildFreezeTail(
+  joinedPath: string,
+  tmpDir: string,
+  durationSec: number,
+  w: number,
+  h: number,
+  matchPreset: { preset: string; crf: string },
+  signal?: AbortSignal,
+): Promise<string> {
+  const lastFrame = path.join(tmpDir, "lastframe.jpg");
+  await ffmpegWithTimeout((cmd) =>
+    cmd
+      .input(joinedPath)
+      .inputOptions(["-sseof", "-3"])
+      .outputOptions(["-update", "1", "-q:v", "2", "-frames:v", "1"])
+      .output(lastFrame),
+    "extractLastFrame",
+    signal,
+  );
+  const tailPath = path.join(tmpDir, "tail.mp4");
+  // Match the surrounding per-beat clip params (preset + crf) exactly
+  // so concat -c copy is bitstream-safe. ultrafast and veryfast use
+  // different entropy coders (CAVLC vs CABAC) in libx264 — mixing
+  // them in a single concatenated stream can confuse strict decoders.
+  // The caller passes the same {preset, crf} pair normalizeClip used.
+  await ffmpegWithTimeout((cmd) =>
+    cmd
+      .input(lastFrame).inputOptions(["-loop", "1"])
+      .outputOptions([
+        "-t", String(durationSec),
+        "-vf", `scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2:black,fps=24`,
+        "-c:v", "libx264", "-preset", matchPreset.preset, "-crf", matchPreset.crf,
+        "-an", "-pix_fmt", "yuv420p",
+      ])
+      .output(tailPath),
+    "encodeFreezeTail",
+    signal,
+  );
+  try { fs.unlinkSync(lastFrame); } catch { /* ignore */ }
+  return tailPath;
+}
+
 function mixAudio(
   video: string,
   audio: string,
   output: string,
   videoDuration: number,
   signal?: AbortSignal,
-  bgm?: { path: string; volume: number } | null,
+  bgm?: { src: string; volume: number } | null,
 ): Promise<void> {
   return ffmpegWithTimeout((cmd) => {
     cmd.input(video).inputOptions(["-fflags", "+genpts"]);
@@ -332,7 +415,11 @@ function mixAudio(
       // never trails past the end. volume=`bgm.volume` keeps music
       // well under the dialog (default 0.15 ≈ -16 dB, classic
       // "podcast bed" level).
-      cmd.input(bgm.path).inputOptions(["-stream_loop", "-1"]);
+      //
+      // `bgm.src` can be either a local file path or an https:// URL;
+      // ffmpeg reads both with the same input API, so the caller can
+      // skip the local download for a one-shot use of the BGM file.
+      cmd.input(bgm.src).inputOptions(["-stream_loop", "-1"]);
       cmd.complexFilter([
         `[2:a]volume=${bgm.volume}[bgmDucked]`,
         `[1:a][bgmDucked]amix=inputs=2:duration=first:dropout_transition=0[mix]`,
@@ -803,6 +890,28 @@ function dimsFor(aspect: string, preset: ResolutionPreset | undefined): [number,
   return [long, short]; // 16:9 default
 }
 
+// Intermediate resolution for the per-beat encode pool when we know a
+// final-burn upscale pass is coming anyway. Cap at 720p so 1080p+
+// projects pay 720p-sized memory per clip — the final-burn pass
+// already re-encodes the whole video at the target resolution, so the
+// per-clip resolution only affects how much intermediate disk + RAM
+// each Stage B clip costs. ASSEMBLY_SAFE_MODE was already pulling the
+// final output down to 720p, so the cap is harmless there. Lower
+// resolutions (≤720p) pass through unchanged. Captions/logo bake into
+// the final-burn pass at the user's chosen resolution, so the intermediate
+// downscale doesn't blur text.
+function intermediateDimsFor(
+  aspect: string,
+  preset: ResolutionPreset | undefined,
+  useFinalBurn: boolean,
+): [number, number] {
+  if (!useFinalBurn) return dimsFor(aspect, preset);
+  const cap: ResolutionPreset = "720p";
+  const rank: Record<ResolutionPreset, number> = { "720p": 0, "1080p": 1, "1440p": 2, "2160p": 3 };
+  const effective = preset && rank[preset] > rank[cap] ? cap : (preset ?? cap);
+  return dimsFor(aspect, effective);
+}
+
 function getAssemblyConcurrency(beatCount: number): number {
   if (ASSEMBLY_SAFE_MODE) return 1;
   const requested = Math.max(1, getAssemblyBeatLimit());
@@ -812,8 +921,15 @@ function getAssemblyConcurrency(beatCount: number): number {
 
 async function runAssembly(opts: AssembleOptions): Promise<void> {
   const { userId, projectId, aspectRatio, voiceoverType, captionsEnabled, captionsLanguage, captionsStyle, captionsSize, captionsPosition, trimSilenceEnabled, backgroundMusicUrl, backgroundMusicVolume, resolution, logoUrl, logoX, logoY, logoSize } = opts;
-  const [w, h] = dimsFor(aspectRatio, resolution);
-  console.log(`[assemble] ${projectId}: resolution=${resolution ?? "1080p"} dims=${w}x${h}`);
+  const [finalW, finalH] = dimsFor(aspectRatio, resolution);
+  console.log(`[assemble] ${projectId}: resolution=${resolution ?? "1080p"} dims=${finalW}x${finalH}`);
+
+  // Memory + per-stage wall-clock tracker. Stamped at every stage
+  // boundary below. Final snapshot is written to projects.assembly_metrics
+  // on success so we can see where memory peaked after the fact instead
+  // of guessing from server logs.
+  const metrics = createMetricsTracker();
+  metrics.record("start");
 
   const progress = (msg: string) => {
     console.log(`[assemble] ${projectId}: ${msg}`);
@@ -981,6 +1097,21 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
       ? allBeats.filter((b) => (b.video_url || b.image_url) && !b.voiceover_url).length
       : 0;
     console.log(`[assemble] ${projectId}: mode=${perBeatMode ? "per-beat" : "legacy single-voiceover"}, assembling ${beats.length}/${allBeats.length} beats (${videoCount} video, ${beats.length - videoCount} image${droppedNoVoiceover > 0 ? `, ${droppedNoVoiceover} dropped: no voiceover` : ""})`);
+
+    // Decide intermediate vs final resolution and whether the captions/logo
+    // burn pass runs at the end. Done HERE (right after beats are loaded)
+    // so the per-beat encode pool can downscale intermediate clips when
+    // we know a final-burn upscale will happen anyway — saves ~2.25× per
+    // 1080p clip on the >80 beat path. For the per-beat-bake path
+    // (default), intermediate dims === final dims so quality is unchanged.
+    const preferFinalBurn = beats.length > FINAL_BURN_THRESHOLD || ASSEMBLY_SAFE_MODE;
+    const useFinalBurn = preferFinalBurn && (captionsEnabled || !!logoUrl);
+    const [w, h] = intermediateDimsFor(aspectRatio, resolution, useFinalBurn);
+    if (w !== finalW || h !== finalH) {
+      console.log(`[assemble] ${projectId}: intermediate dims=${w}x${h} (final ${finalW}x${finalH}); final-burn pass will upscale`);
+    }
+
+    metrics.record("load-project");
 
     const voiceoverPath = path.join(tmpDir, "voiceover.mp3");
     let totalDuration = 0;
@@ -1154,6 +1285,7 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
           }
         }
       }
+      metrics.record("per-beat-audio");
     } else {
       // ── LEGACY SINGLE-VOICEOVER PATH ─────────────────────────────────
       const legacyVoiceoverUrl = voiceoverType === "original" ? (proj.tts_url ?? proj.tts_cleaned_url) : (proj.tts_cleaned_url ?? proj.tts_url);
@@ -1240,6 +1372,7 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
           console.warn(`[assemble] ${projectId}: failed to persist beat timings — next assembly will re-measure:`, e);
         }
       }
+      metrics.record("legacy-audio-stt");
     }
 
     // Captions: build the segment list ONCE here, then bake a per-beat
@@ -1284,11 +1417,9 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
       cumulativeStarts[i] = cumulativeStarts[i - 1] + durations[i - 1];
     }
 
-    // Decide whether to do a single final-stage burn of captions/logo
-    // instead of baking them into every per-beat clip. Prefer final
-    // burn for very large projects or when running in safe mode.
-    const preferFinalBurn = beats.length > FINAL_BURN_THRESHOLD || ASSEMBLY_SAFE_MODE;
-    const useFinalBurn = preferFinalBurn && (captionsEnabled || !!logoUrl);
+    // useFinalBurn was decided up front (right after beats were loaded)
+    // so the per-beat encode pool could pick intermediate dims. The
+    // logo download path below still depends on the same flag.
     let finalLogoPath: string | null = null;
 
     // ── Stage B: per-clip normalization → concat → joined.mp4 ───────────
@@ -1311,26 +1442,49 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
       await progress("Processing video clips…");
 
       // Fire-and-forget machinery for the per-clip R2 upload + the
-      // checkpoint persist that follows it. Workers used to block on
-      // the R2 round-trip (~200-800ms each) before returning to the
-      // pool — for a 100-beat project that was 30-80s of upload
-      // latency the encoder was idle on. Hand the upload to a
+      // BATCHED checkpoint persist that follows it. Workers used to
+      // block on the R2 round-trip (~200-800ms each) before returning
+      // to the pool — for a 100-beat project that was 30-80s of
+      // upload latency the encoder was idle on. Hand the upload to a
       // background promise instead, and drain any still-in-flight
       // ones at the post-pool sync point below.
       //
-      // persistChain serializes the checkpoint writes so two
-      // concurrent uploads can't race: without it, persist A could
-      // serialize its JSON payload (containing url-A), then persist
-      // B writes (containing both A + B), then persist A's HTTP
-      // request lands AFTER B's, clobbering B's url. The chain
-      // forces them through one at a time even when many uploads
-      // finish back-to-back.
+      // Batched persist: each completed upload marks the checkpoint
+      // dirty but DOES NOT immediately write to Supabase. A debounced
+      // flusher coalesces all dirty marks within a 2s window into a
+      // single DB write, and also force-flushes every 30s so a Stop
+      // arriving mid-batch still has a fresh-ish checkpoint. Cuts the
+      // 100-clip project's persist count from ~100 round-trips down
+      // to ~3-5. Stage B's end calls flushPersist() to drain.
       const pendingClipUploads = new Set<Promise<void>>();
-      let persistChain: Promise<void> = Promise.resolve();
-      const persistSerial = (): Promise<void> => {
-        persistChain = persistChain.then(persistCheckpoint, persistCheckpoint);
-        return persistChain;
+      let persistDirty = false;
+      let persistInFlight: Promise<void> = Promise.resolve();
+      let persistDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+      let persistHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
+      const PERSIST_DEBOUNCE_MS = 2_000;
+      const PERSIST_HEARTBEAT_MS = 30_000;
+      const flushPersist = async (): Promise<void> => {
+        if (persistDebounceTimer) { clearTimeout(persistDebounceTimer); persistDebounceTimer = null; }
+        if (!persistDirty) { await persistInFlight; return; }
+        persistDirty = false;
+        // Chain on persistInFlight so two concurrent flushes serialize
+        // — without this, a debounce flush and a heartbeat flush could
+        // overlap and the later HTTP request could land before the
+        // earlier one, clobbering its payload with stale state.
+        persistInFlight = persistInFlight.then(persistCheckpoint, persistCheckpoint);
+        await persistInFlight;
       };
+      const markPersistDirty = (): void => {
+        persistDirty = true;
+        if (persistDebounceTimer) return;
+        persistDebounceTimer = setTimeout(() => {
+          persistDebounceTimer = null;
+          // Fire and forget — the flush itself never throws (catches
+          // are inside persistCheckpoint via supabase's chained call).
+          void flushPersist();
+        }, PERSIST_DEBOUNCE_MS);
+      };
+      persistHeartbeatTimer = setInterval(() => { void flushPersist(); }, PERSIST_HEARTBEAT_MS);
 
       // Download the channel logo. If we're doing a final-stage burn
       // we still need the logo locally later, but we don't bake it
@@ -1433,7 +1587,12 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
             try {
               const clipUrl = await uploadFile(ckptPathFor(`clip_${String(i).padStart(3, "0")}.mp4`), clipPath, "video/mp4");
               checkpoint.clip_urls![i] = clipUrl;
-              await persistSerial();
+              // Mark the checkpoint dirty instead of persisting now.
+              // A debounced flush within PERSIST_DEBOUNCE_MS will
+              // coalesce this with other clip-completion writes into
+              // one DB round-trip. See the persist machinery above
+              // Stage B for design notes.
+              markPersistDirty();
             } catch (uploadErr) {
               console.warn(`[assemble] beat ${beat.beat_number}: clip checkpoint upload failed:`, uploadErr);
               // Not fatal — we just lose the resume guarantee for
@@ -1492,7 +1651,14 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
         await progress(`Finalizing ${pendingClipUploads.size} clip checkpoints…`);
         await Promise.allSettled([...pendingClipUploads]);
       }
+      // Drain the batched persist so the final flush lands BEFORE we
+      // tear down the heartbeat timer and BEFORE concat unlinks the
+      // local clip files. After this point checkpoint.clip_urls
+      // matches what's actually in R2.
+      if (persistHeartbeatTimer) { clearInterval(persistHeartbeatTimer); persistHeartbeatTimer = null; }
+      await flushPersist();
       if (firstError) throw firstError;
+      metrics.record("stage-b-encode");
 
       // Logo was baked into each clip; the source file isn't needed
       // for any later stage.
@@ -1504,11 +1670,21 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
       await progress("Joining clips…");
       const validClipPaths = clipPaths.filter((p) => p !== "");
       if (!validClipPaths.length) throw new Error("All clips failed to encode — nothing to assemble.");
+      if (validClipPaths.length < clipPaths.length) {
+        // Silent partial-failure regression guard: surface dropped beats
+        // so the user can tell their finished video is shorter than
+        // intended instead of getting a quietly truncated render.
+        const dropped = clipPaths
+          .map((p, idx) => p === "" ? beats[idx].beat_number : null)
+          .filter((n): n is number => n !== null);
+        console.warn(`[assemble] ${projectId}: ${dropped.length} clip(s) failed to encode — dropping beats ${dropped.join(",")}`);
+      }
       const listPath = path.join(tmpDir, "concat.txt");
       fs.writeFileSync(listPath, validClipPaths.map((p) => `file '${p.replace(/\\/g, "/")}'`).join("\n"));
       const joinedLocal = path.join(tmpDir, "joined.mp4");
       await concatClips(listPath, joinedLocal, signal);
       for (const p of validClipPaths) { try { fs.unlinkSync(p); } catch { /* ignore */ } }
+      metrics.record("stage-b-concat");
       try {
         const joinedUrl = await uploadFile(ckptPathFor("joined.mp4"), joinedLocal, "video/mp4");
         checkpoint.joined_url = joinedUrl;
@@ -1548,18 +1724,49 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
         await progress(`Padding video to voiceover length (+${tailDuration.toFixed(1)}s freeze)…`);
         const paddedPath = path.join(tmpDir, "padded.mp4");
         console.log(`[assemble] ${projectId}: freezing last frame for ${tailDuration.toFixed(2)}s (joined=${joinedDuration.toFixed(2)}s → target=${totalDuration.toFixed(2)}s)`);
-        await ffmpegWithTimeout((cmd) =>
-          cmd
-            .input(joinedDisk)
-            .outputOptions([
-              "-vf", `tpad=stop_mode=clone:stop_duration=${tailDuration}`,
-              "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
-              "-an", "-pix_fmt", "yuv420p",
-            ])
-            .output(paddedPath),
-          "padToVoiceover",
-          signal,
-        );
+        // Old path here re-encoded the ENTIRE joined video just to
+        // glue trailing frozen frames onto the tail. On a 30 min 1080p
+        // assembly that was several minutes of libx264 + a sustained
+        // memory spike for zero new visual content. The replacement:
+        // grab the last frame, encode a tiny still-frame .mp4 of
+        // duration = tailDuration with the same codec params we
+        // already use for per-beat clips, then concat -c copy joined
+        // + tail. The encode is sub-second (one frame at 24fps for a
+        // few seconds), the concat is I/O-only. If concat-copy fails
+        // due to bitstream mismatch we fall back to the old tpad
+        // re-encode — never seen in practice, but cheap insurance.
+        try {
+          // Pick encoder params that match the per-beat clips inside
+          // joined.mp4. When captions were baked into per-beat clips,
+          // normalizeClip used veryfast/crf 23; otherwise ultrafast/crf 28.
+          // Mismatch here would cross CABAC/CAVLC boundaries inside one
+          // concatenated stream, which is technically valid H.264 but
+          // upsets stricter players.
+          const subsBaked = captionsEnabled && !useFinalBurn;
+          const tailEnc = subsBaked
+            ? { preset: "veryfast", crf: "23" }
+            : { preset: "ultrafast", crf: "28" };
+          const tailPath = await buildFreezeTail(joinedDisk, tmpDir, tailDuration, w, h, tailEnc, signal);
+          const concatListPath = path.join(tmpDir, "pad_concat.txt");
+          fs.writeFileSync(concatListPath, [joinedDisk, tailPath].map((p) => escapeConcatListEntry(p)).join("\n"));
+          await concatClips(concatListPath, paddedPath, signal);
+          try { fs.unlinkSync(tailPath); } catch { /* ignore */ }
+        } catch (e) {
+          if (signal.aborted) throw e;
+          console.warn(`[assemble] freeze-tail concat-copy failed (${e instanceof Error ? e.message : e}), falling back to tpad re-encode`);
+          await ffmpegWithTimeout((cmd) =>
+            cmd
+              .input(joinedDisk)
+              .outputOptions([
+                "-vf", `tpad=stop_mode=clone:stop_duration=${tailDuration}`,
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
+                "-an", "-pix_fmt", "yuv420p",
+              ])
+              .output(paddedPath),
+            "padToVoiceover",
+            signal,
+          );
+        }
         try { fs.unlinkSync(joinedDisk); } catch { /* ignore */ }
         try {
           const paddedUrl = await uploadFile(ckptPathFor("padded.mp4"), paddedPath, "video/mp4");
@@ -1568,6 +1775,7 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
         } catch (e) {
           console.warn(`[assemble] padded.mp4 checkpoint upload failed:`, e);
         }
+        metrics.record("freeze-pad");
       }
     }
 
@@ -1597,42 +1805,47 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
         }
       }
       await checkStop();
-      // Download the user's background music to a local temp file if
-      // one was provided. Failure here logs and disables bgm rather
-      // than failing the entire mix — the assembly still succeeds with
-      // voiceover-only audio so the user doesn't lose progress over a
-      // music-file outage.
-      let bgmPath: string | null = null;
+      // BGM is a one-shot input for the mix step — pass the URL
+      // straight to ffmpeg instead of downloading first. Saves the
+      // disk round-trip (1-30 MB depending on track length) and the
+      // tmp-space cost. ffmpeg's HTTPS reader handles redirects and
+      // range requests on its own; if it can't reach the file we
+      // catch the mix error below and retry without music.
       let bgmVolume = backgroundMusicVolume ?? 0.15;
       // Clamp volume to a sensible range so an accidental >1 doesn't
       // produce a wall-of-music clip and a negative doesn't crash.
       if (bgmVolume < 0) bgmVolume = 0;
       if (bgmVolume > 1) bgmVolume = 1;
-      if (backgroundMusicUrl) {
-        try {
-          await progress("Downloading background music…");
-          bgmPath = path.join(tmpDir, "bgm.mp3");
-          await downloadFile(backgroundMusicUrl, bgmPath, signal);
-        } catch (e) {
-          console.warn(`[assemble] bgm download failed, continuing without music:`, e);
-          bgmPath = null;
-        }
-      }
-      await progress(bgmPath ? "Mixing voiceover + music…" : "Mixing voiceover…");
+      const bgmSrc: string | null = backgroundMusicUrl ?? null;
+
+      await progress(bgmSrc ? "Mixing voiceover + music…" : "Mixing voiceover…");
       // Cap at totalDuration (voiceover length). The pad step above
       // ensures the video is at least totalDuration when there's
       // significant trailing silence; the cap also trims any tiny
       // encoding-rounding overshoot.
-      await mixAudio(
-        mixSrc,
-        voiceoverPath,
-        outputPath,
-        totalDuration,
-        signal,
-        bgmPath ? { path: bgmPath, volume: bgmVolume } : null,
-      );
+      try {
+        await mixAudio(
+          mixSrc,
+          voiceoverPath,
+          outputPath,
+          totalDuration,
+          signal,
+          bgmSrc ? { src: bgmSrc, volume: bgmVolume } : null,
+        );
+      } catch (e) {
+        if (signal.aborted) throw e;
+        // If the mix failed with bgm enabled, retry once without it
+        // — same fault-tolerance as the old "download failed → no
+        // music" branch, just shifted to the mix step. The user
+        // still gets a finished video with voiceover only.
+        if (bgmSrc) {
+          console.warn(`[assemble] mix with bgm failed, retrying without music:`, e instanceof Error ? e.message : e);
+          await mixAudio(mixSrc, voiceoverPath, outputPath, totalDuration, signal, null);
+        } else {
+          throw e;
+        }
+      }
       try { fs.unlinkSync(mixSrc); } catch { /* ignore */ }
-      if (bgmPath) { try { fs.unlinkSync(bgmPath); } catch { /* ignore */ } }
       try {
         const mixedUrl = await uploadFile(ckptPathFor("mixed.mp4"), outputPath, "video/mp4");
         checkpoint.mixed_url = mixedUrl;
@@ -1640,6 +1853,7 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
       } catch (e) {
         console.warn(`[assemble] mixed.mp4 checkpoint upload failed:`, e);
       }
+      metrics.record("mix");
     }
 
     // Stage D.5 (full-video logo re-encode) used to live here. It was
@@ -1657,39 +1871,75 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
 
     // ── Stage F: validate + remux + upload final ────────────────────────
     // Allow a post-mix final burn step (captions/logo) for large jobs.
+    // When useFinalBurn=true AND the intermediate dims differ from the
+    // user's chosen final dims, we additionally fuse a scale filter
+    // into the first burn pass — that way we get the upscale "for
+    // free" inside the encode that was already going to run, instead
+    // of an extra full-video pass at the end. Captions are written
+    // at finalH so the font scales correctly to the output resolution.
     let finalPath = outputPath;
     if (useFinalBurn && (captionsEnabled || finalLogoPath)) {
       await checkStop();
-      await progress("Applying final burn (captions/logo)…");
-      // Write a single timeline ASS if captions are enabled.
+      const needsUpscale = w !== finalW || h !== finalH;
+      await progress(needsUpscale ? "Applying final burn (upscale + captions/logo)…" : "Applying final burn (captions/logo)…");
+      // Write a single timeline ASS at the FINAL output dimensions so
+      // font sizes match the resolution the user requested, not the
+      // smaller intermediate.
       const assPath = path.join(tmpDir, "final_captions.ass");
       if (captionsEnabled && baseCaptionSegs.length > 0) {
-        writeAss(baseCaptionSegs, buildAssStyle(captionsStyle, captionsSize, captionsPosition, h), w, h, assPath);
+        writeAss(baseCaptionSegs, buildAssStyle(captionsStyle, captionsSize, captionsPosition, finalH), finalW, finalH, assPath);
       }
       let interimSrc = outputPath;
-      // First pass: burn subtitles (if any).
+      // First pass: optional upscale + burn subtitles. When subtitles
+      // are enabled the subtitles filter runs at the input resolution
+      // and is then scaled — so we apply scale BEFORE subtitles so
+      // captions render at finalW × finalH directly (sharp text). When
+      // captions are disabled we still do the upscale here so logo
+      // overlay below operates at final dims.
       if (captionsEnabled && baseCaptionSegs.length > 0) {
         const withSubs = path.join(tmpDir, "with_subs.mp4");
+        const vf = needsUpscale
+          ? `scale=${finalW}:${finalH}:flags=lanczos,subtitles=${escapeAssPath(assPath)}`
+          : `subtitles=${escapeAssPath(assPath)}`;
         await ffmpegWithTimeout((cmd) =>
           cmd
             .input(outputPath)
-            .outputOptions(["-vf", `subtitles=${escapeAssPath(assPath)}`, "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "copy"])
+            .outputOptions(["-vf", vf, "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "copy"])
             .output(withSubs),
           "finalBurnSubtitles",
           signal,
         );
         interimSrc = withSubs;
+      } else if (needsUpscale) {
+        // No captions but we still need to upscale before the logo
+        // overlay so the logo lands at the final coordinates.
+        const scaled = path.join(tmpDir, "scaled.mp4");
+        await ffmpegWithTimeout((cmd) =>
+          cmd
+            .input(outputPath)
+            .outputOptions(["-vf", `scale=${finalW}:${finalH}:flags=lanczos`, "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "copy"])
+            .output(scaled),
+          "finalBurnUpscale",
+          signal,
+        );
+        interimSrc = scaled;
       }
-      // Second pass: overlay logo (if any).
+      // Second pass: overlay logo (if any). Coordinates relative to
+      // final dims since interimSrc is now at finalW × finalH.
       if (finalLogoPath) {
         const withLogo = path.join(tmpDir, "with_logo.mp4");
-        const posX = Math.round(w * (logoX ?? 0.85));
-        const posY = Math.round(h * (logoY ?? 0.05));
+        const posX = Math.round(finalW * (logoX ?? 0.85));
+        const posY = Math.round(finalH * (logoY ?? 0.05));
+        const logoPx = Math.max(8, Math.min(finalW, Math.round((finalW * (logoSize ?? 0.1)) / 2) * 2));
         await ffmpegWithTimeout((cmd) =>
           cmd
             .input(interimSrc)
             .input(finalLogoPath)
-            .outputOptions(["-filter_complex", `overlay=${posX}:${posY}`, "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "copy"])
+            .complexFilter([
+              `[1:v]scale=w=${logoPx}:h=-2[logo]`,
+              `[0:v][logo]overlay=${posX}:${posY}:format=auto[v]`,
+            ])
+            .outputOptions(["-map", "[v]", "-map", "0:a?", "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "copy"])
             .output(withLogo),
           "finalBurnLogo",
           signal,
@@ -1698,7 +1948,26 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
       } else {
         finalPath = interimSrc;
       }
+    } else if (w !== finalW || h !== finalH) {
+      // useFinalBurn was off (no captions, no logo) but we still
+      // produced intermediate clips at a smaller resolution and the
+      // user wants something larger. Single upscale pass before
+      // remux. Same encode params as the burn passes above so output
+      // quality is consistent across modes.
+      await checkStop();
+      await progress(`Upscaling to ${finalW}x${finalH}…`);
+      const scaled = path.join(tmpDir, "scaled.mp4");
+      await ffmpegWithTimeout((cmd) =>
+        cmd
+          .input(outputPath)
+          .outputOptions(["-vf", `scale=${finalW}:${finalH}:flags=lanczos`, "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "copy"])
+          .output(scaled),
+        "intermediateUpscale",
+        signal,
+      );
+      finalPath = scaled;
     }
+    metrics.record("final-burn");
     const finalStat = fs.statSync(finalPath);
     console.log(`[assemble] ${projectId}: final file size = ${finalStat.size} bytes`);
     if (finalStat.size < 1024) throw new Error(`Assembly produced an invalid output (${finalStat.size} bytes) — ffmpeg may have failed silently`);
@@ -1744,6 +2013,10 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
     previewFiles.delete(projectId);
     try { fs.unlinkSync(persistentPath); } catch { /* ignore */ }
 
+    metrics.record("upload-done");
+    const metricsSnapshot = metrics.snapshot();
+    console.log(`[assemble] ${projectId}: metrics peak_rss=${metricsSnapshot.peak_rss_mb}MB stages=${metricsSnapshot.stages.length}`);
+
     // Successful completion — clear the checkpoint. (R2 _assembly/ stage
     // objects are left behind; they're small and overwritten by the
     // next run, or cleaned up by the project-delete folder sweep.)
@@ -1756,6 +2029,7 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
         assembly_checkpoint: null,
         assembly_stop_requested: false,
         assembly_finished_at: new Date().toISOString(),
+        assembly_metrics: metricsSnapshot,
         current_state: 15,
       })
       .eq("id", projectId);
@@ -1763,6 +2037,12 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
     console.log(`[assemble] ${projectId}: done → ${publicUrl}`);
   } catch (err) {
     const message = err instanceof Error ? err.message : "Assembly failed";
+    // Capture metrics at the failure point too — peak RSS on a
+    // crashed run is the single most useful data point for chasing
+    // the next OOM. Stamp it on both stop and failure transitions.
+    metrics.record(message === STOPPED_MARKER ? "stopped" : "failed");
+    const metricsSnapshot = metrics.snapshot();
+    console.log(`[assemble] ${projectId}: metrics (terminal) peak_rss=${metricsSnapshot.peak_rss_mb}MB stages=${metricsSnapshot.stages.length}`);
     if (message === STOPPED_MARKER) {
       // User-requested stop — keep the checkpoint so Resume picks up
       // from the last completed stage. Clear stop_requested so the next
@@ -1776,6 +2056,7 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
           assembly_error: null,
           assembly_stop_requested: false,
           assembly_finished_at: new Date().toISOString(),
+          assembly_metrics: metricsSnapshot,
         })
         .eq("id", projectId);
     } else {
@@ -1788,6 +2069,7 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
           assembly_error: message,
           assembly_progress: null,
           assembly_finished_at: new Date().toISOString(),
+          assembly_metrics: metricsSnapshot,
         })
         .eq("id", projectId);
       // Drop checkpoint on real failures so the next attempt starts clean.
