@@ -957,8 +957,17 @@ function intermediateDimsFor(
 function getAssemblyConcurrency(beatCount: number): number {
   if (ASSEMBLY_SAFE_MODE) return 1;
   const requested = Math.max(1, getAssemblyBeatLimit());
-  if (beatCount > 80) return 1;
-  return Math.min(2, requested);
+  // For very long projects (>80 beats) keep the strict cap of 2 —
+  // file-descriptor and disk-IO pressure compounds over hundreds of
+  // beats and a runaway concurrency choice can hard-fail late in
+  // the run. Still respects requested when admin dials it lower.
+  if (beatCount > 80) return Math.min(2, requested);
+  // Shorter projects can safely use up to 4 parallel. Each Stage B
+  // encode at intermediate 720p holds ~150-200 MB; 4 in flight on
+  // Render Standard (2 GB) leaves comfortable headroom. The cap
+  // here is now meaningful — admin can dial 1..4 and feel the
+  // difference. Above 4 returns 4 (the safety ceiling stays).
+  return Math.min(4, requested);
 }
 
 async function runAssembly(opts: AssembleOptions): Promise<void> {
