@@ -145,6 +145,16 @@ export async function submitJob(opts: CoconutFinalizeOptions): Promise<CoconutJo
     throw new Error("COCONUT_API_KEY not set — Coconut finalize unavailable");
   }
   const spec = buildJobSpec(opts);
+  // Log the exact spec we're submitting (redacted credentials) so
+  // when Coconut returns a 400 the worker logs show the payload
+  // that triggered it. Pair the printed JSON with the error
+  // message to calibrate field names without guessing.
+  const redactedSpec = JSON.parse(JSON.stringify(spec)) as Record<string, unknown>;
+  const redactedStorage = redactedSpec.storage as Record<string, unknown> | undefined;
+  if (redactedStorage?.credentials) {
+    redactedStorage.credentials = "[redacted]";
+  }
+  console.log(`[coconut] submitting job spec: ${JSON.stringify(redactedSpec)}`);
   const res = await fetch(`${API_BASE}/jobs`, {
     method: "POST",
     headers: {
