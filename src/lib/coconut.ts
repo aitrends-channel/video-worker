@@ -80,20 +80,6 @@ function buildJobSpec(opts: CoconutFinalizeOptions) {
     },
   };
 
-  // Per-output transformation block — subtitles burn-in + logo
-  // watermark are first-class options here. Omit the key entirely
-  // when neither is set so the spec stays minimal.
-  const transformation: Record<string, unknown> = {};
-  if (opts.captionsAssUrl) {
-    transformation.subtitles = { source: opts.captionsAssUrl };
-  }
-  if (opts.logoUrl) {
-    transformation.watermark = {
-      url: opts.logoUrl,
-      position: "top_right",
-    };
-  }
-
   // Coconut's format block takes a `resolution` PRESET string,
   // not raw width/height. Map our dimensions to the closest preset
   // based on the short side — that's the standard interpretation
@@ -109,6 +95,10 @@ function buildJobSpec(opts: CoconutFinalizeOptions) {
     shortSide >= 720 ? "720p" :
     shortSide >= 480 ? "480p" : "360p";
 
+  // Subtitle burn-in and watermark sit DIRECTLY on the output
+  // object as top-level params. The earlier "transformation"
+  // wrapper isn't a Coconut concept — each transform is its own
+  // first-class output key.
   const output: Record<string, unknown> = {
     path: opts.outputBucketKey,
     key: "mp4:final",
@@ -118,8 +108,14 @@ function buildJobSpec(opts: CoconutFinalizeOptions) {
       quality: 4,
     },
   };
-  if (Object.keys(transformation).length > 0) {
-    output.transformation = transformation;
+  if (opts.captionsAssUrl) {
+    output.subtitles = { source: opts.captionsAssUrl };
+  }
+  if (opts.logoUrl) {
+    output.watermark = {
+      url: opts.logoUrl,
+      position: "top_right",
+    };
   }
 
   // Notification URL: prefer caller-provided, fall back to env var.
@@ -149,6 +145,16 @@ export async function submitJob(opts: CoconutFinalizeOptions): Promise<CoconutJo
     throw new Error("COCONUT_API_KEY not set — Coconut finalize unavailable");
   }
   const spec = buildJobSpec(opts);
+  // Log the exact spec we're submitting (redacted credentials) so
+  // when Coconut returns a 400 the worker logs show the payload
+  // that triggered it. Pair the printed JSON with the error
+  // message to calibrate field names without guessing.
+  const redactedSpec = JSON.parse(JSON.stringify(spec)) as Record<string, unknown>;
+  const redactedStorage = redactedSpec.storage as Record<string, unknown> | undefined;
+  if (redactedStorage?.credentials) {
+    redactedStorage.credentials = "[redacted]";
+  }
+  console.log(`[coconut] submitting job spec: ${JSON.stringify(redactedSpec)}`);
   const res = await fetch(`${API_BASE}/jobs`, {
     method: "POST",
     headers: {
