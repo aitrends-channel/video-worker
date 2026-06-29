@@ -113,8 +113,17 @@ function buildJobSpec(opts: CoconutFinalizeOptions) {
   // — adding them as output-level keys triggered the same
   // "Output param key not valid" error pattern that "transformation"
   // hit. Move them up to the job root.
+  // Coconut's canonical examples all show paths starting with "/".
+  // Without the leading slash their path parser fell over on our
+  // email-style folder names ("user@gmail.com/...") — extracting
+  // an empty extension and erroring on "format mp4 doesn't match".
+  // Adding the leading slash should anchor the parser correctly
+  // without us having to URL-encode the '@' (which would change
+  // the R2 storage key and break our own download URL).
+  const sanitizedPath = "/" + opts.outputBucketKey.replace(/^\/+/, "");
+
   const output: Record<string, unknown> = {
-    path: opts.outputBucketKey,
+    path: sanitizedPath,
     key: "mp4:final",
     format: {
       resolution,
