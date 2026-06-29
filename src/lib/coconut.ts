@@ -69,11 +69,11 @@ export interface CoconutJob {
 //   - R2 storage is passed under `storage` using Coconut's s3other
 //     service — they support any S3-compatible target.
 function buildJobSpec(opts: CoconutFinalizeOptions) {
-  // Coconut's error code `s3_access_key_id_not_found` suggests the
-  // expected credential field name is `s3_access_key_id` (prefixed),
-  // not the AWS-style `access_key_id`. Same pattern for the secret.
-  // Try the prefixed object form before falling back to URL or
-  // contacting Coconut support.
+  // Confirmed by Coconut error: credential field names are
+  // `access_key_id` and `secret_access_key` (no s3_ prefix). The
+  // earlier `s3_access_key_id_not_found` error was actually AWS's
+  // error (the request was reaching AWS S3, not R2) — not a hint
+  // about Coconut's schema.
   const r2Endpoint = process.env.R2_ACCOUNT_ID
     ? `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`
     : undefined;
@@ -83,8 +83,8 @@ function buildJobSpec(opts: CoconutFinalizeOptions) {
     region: "us-east-1",
     endpoint: r2Endpoint,
     credentials: {
-      s3_access_key_id: process.env.R2_ACCESS_KEY_ID,
-      s3_secret_access_key: process.env.R2_SECRET_ACCESS_KEY,
+      access_key_id: process.env.R2_ACCESS_KEY_ID,
+      secret_access_key: process.env.R2_SECRET_ACCESS_KEY,
     },
     force_path_style: true,
   };
