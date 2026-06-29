@@ -69,27 +69,24 @@ export interface CoconutJob {
 //   - R2 storage is passed under `storage` using Coconut's s3other
 //     service — they support any S3-compatible target.
 function buildJobSpec(opts: CoconutFinalizeOptions) {
-  // URL-format storage config. The previous "object" form with
-  // service: "s3other" + endpoint field was visible in the spec
-  // but Coconut's debugger URL showed the endpoint was NOT being
-  // applied to the actual upload request — the credentials hit AWS
-  // S3 default ("Access Key Id does not exist"). Switching to the
-  // URL format encodes endpoint + region + path-style directly in
-  // a single connection string Coconut can't drop.
-  //
-  // Pattern: s3://ACCESS:SECRET@bucket?endpoint=URL&region=R&force_path_style=true
-  // Both access_key and secret are URL-encoded so chars like '/' '+'
-  // in R2 secrets don't break parsing.
+  // Coconut's error code `s3_access_key_id_not_found` suggests the
+  // expected credential field name is `s3_access_key_id` (prefixed),
+  // not the AWS-style `access_key_id`. Same pattern for the secret.
+  // Try the prefixed object form before falling back to URL or
+  // contacting Coconut support.
   const r2Endpoint = process.env.R2_ACCOUNT_ID
     ? `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`
-    : "";
-  const access = encodeURIComponent(process.env.R2_ACCESS_KEY_ID ?? "");
-  const secret = encodeURIComponent(process.env.R2_SECRET_ACCESS_KEY ?? "");
-  const bucket = process.env.R2_BUCKET_NAME ?? "";
-  const storageUrl = `s3://${access}:${secret}@${bucket}?endpoint=${encodeURIComponent(r2Endpoint)}&region=us-east-1&force_path_style=true`;
+    : undefined;
   const storage = {
     service: "s3other",
-    url: storageUrl,
+    bucket: process.env.R2_BUCKET_NAME,
+    region: "us-east-1",
+    endpoint: r2Endpoint,
+    credentials: {
+      s3_access_key_id: process.env.R2_ACCESS_KEY_ID,
+      s3_secret_access_key: process.env.R2_SECRET_ACCESS_KEY,
+    },
+    force_path_style: true,
   };
 
   // Coconut's format block takes a `resolution` PRESET string,
