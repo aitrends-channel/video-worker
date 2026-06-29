@@ -39,9 +39,6 @@ export interface CoconutFinalizeOptions {
   // Optional overlays.
   captionsAssUrl?: string | null;  // public URL of an ASS subtitle file
   logoUrl?: string | null;
-  logoXPct?: number;
-  logoYPct?: number;
-  logoSizePct?: number;
 
   // Optional callback URL — Coconut POSTs job events here so you can
   // skip polling. Omit to use pollJob() instead.

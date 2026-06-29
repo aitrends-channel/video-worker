@@ -2036,9 +2036,6 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
         outputHeight: finalH,
         captionsAssUrl,
         logoUrl: logoUrl ?? null,
-        logoXPct: logoX,
-        logoYPct: logoY,
-        logoSizePct: logoSize,
       });
       console.log(`[assemble] ${projectId}: coconut job ${job.id} submitted`);
       await progress("Finalizing on Coconut…");
