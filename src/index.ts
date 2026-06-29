@@ -35,7 +35,7 @@ setupHealthRoutes(app);
 setupAssembleRoute(app);
 setupTranscriptRoute(app);
 
-app.get("/api/worker/status", (req, res) => {
+app.get("/api/worker/status", (_req, res) => {
   res.json({ worker: "video-generation", running: true, timestamp: new Date().toISOString() });
 });
 
