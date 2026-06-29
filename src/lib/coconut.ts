@@ -69,29 +69,27 @@ export interface CoconutJob {
 //   - R2 storage is passed under `storage` using Coconut's s3other
 //     service — they support any S3-compatible target.
 function buildJobSpec(opts: CoconutFinalizeOptions) {
-  // Use the same env var the rest of the worker uses for R2
-  // (storage.ts builds the endpoint URL from R2_ACCOUNT_ID inline).
-  // The user already has R2_ACCOUNT_ID set; adding a new
-  // R2_S3_ENDPOINT var would have been redundant.
+  // URL-format storage config. The previous "object" form with
+  // service: "s3other" + endpoint field was visible in the spec
+  // but Coconut's debugger URL showed the endpoint was NOT being
+  // applied to the actual upload request — the credentials hit AWS
+  // S3 default ("Access Key Id does not exist"). Switching to the
+  // URL format encodes endpoint + region + path-style directly in
+  // a single connection string Coconut can't drop.
+  //
+  // Pattern: s3://ACCESS:SECRET@bucket?endpoint=URL&region=R&force_path_style=true
+  // Both access_key and secret are URL-encoded so chars like '/' '+'
+  // in R2 secrets don't break parsing.
   const r2Endpoint = process.env.R2_ACCOUNT_ID
     ? `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`
-    : undefined;
+    : "";
+  const access = encodeURIComponent(process.env.R2_ACCESS_KEY_ID ?? "");
+  const secret = encodeURIComponent(process.env.R2_SECRET_ACCESS_KEY ?? "");
+  const bucket = process.env.R2_BUCKET_NAME ?? "";
+  const storageUrl = `s3://${access}:${secret}@${bucket}?endpoint=${encodeURIComponent(r2Endpoint)}&region=us-east-1&force_path_style=true`;
   const storage = {
     service: "s3other",
-    bucket: process.env.R2_BUCKET_NAME,
-    // R2 nominally uses "auto" but Coconut's S3 client may want a
-    // real region for sigv4 signing. us-east-1 is the safe default
-    // and R2 accepts it.
-    region: "us-east-1",
-    endpoint: r2Endpoint,
-    credentials: {
-      access_key_id: process.env.R2_ACCESS_KEY_ID,
-      secret_access_key: process.env.R2_SECRET_ACCESS_KEY,
-    },
-    // R2 only accepts path-style addressing (bucket in URL path,
-    // not as a subdomain). Without this Coconut tries to PUT to
-    // bucket-name.<endpoint> which R2 rejects.
-    force_path_style: true,
+    url: storageUrl,
   };
 
   // Coconut's format block takes a `resolution` PRESET string,
@@ -178,6 +176,11 @@ export async function submitJob(opts: CoconutFinalizeOptions): Promise<CoconutJo
   const redactedStorage = redactedSpec.storage as Record<string, unknown> | undefined;
   if (redactedStorage?.credentials) {
     redactedStorage.credentials = "[redacted]";
+  }
+  // URL-format storage embeds secrets in the URL string — scrub
+  // those too so they don't leak to logs.
+  if (typeof redactedStorage?.url === "string") {
+    redactedStorage.url = redactedStorage.url.replace(/s3:\/\/[^@]+@/, "s3://[redacted]@");
   }
   console.log(`[coconut] submitting job spec: ${JSON.stringify(redactedSpec)}`);
   const res = await fetch(`${API_BASE}/jobs`, {
