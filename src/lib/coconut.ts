@@ -72,12 +72,19 @@ function buildJobSpec(opts: CoconutFinalizeOptions) {
   const storage = {
     service: "s3other",
     bucket: process.env.R2_BUCKET_NAME,
-    region: "auto",
+    // R2 nominally uses "auto" but Coconut's S3 client may want a
+    // real region for sigv4 signing. us-east-1 is the safe default
+    // and R2 accepts it.
+    region: "us-east-1",
     endpoint: process.env.R2_S3_ENDPOINT,
     credentials: {
       access_key_id: process.env.R2_ACCESS_KEY_ID,
       secret_access_key: process.env.R2_SECRET_ACCESS_KEY,
     },
+    // R2 only accepts path-style addressing (bucket in URL path,
+    // not as a subdomain). Without this Coconut tries to PUT to
+    // bucket-name.<endpoint> which R2 rejects.
+    force_path_style: true,
   };
 
   // Coconut's format block takes a `resolution` PRESET string,
@@ -111,15 +118,18 @@ function buildJobSpec(opts: CoconutFinalizeOptions) {
     },
   };
 
-  // Notification URL: prefer caller-provided, fall back to env var.
-  // The key is required by Coconut's schema. If neither source has
-  // a URL we still need SOMETHING — supply the request endpoint
-  // path under Coconut's domain as a no-op fallback, which Coconut
-  // accepts as a syntactically valid URL and routes nowhere
-  // meaningful.
-  const notificationUrl = opts.notificationUrl
-    ?? process.env.COCONUT_WEBHOOK_URL
-    ?? "https://app.coconut.co/notifications/http/placeholder";
+  // Notification URL is required by Coconut's schema. We previously
+  // tried a "placeholder" fallback URL but Coconut still tries to
+  // POST to it and surfaces "notification error" on every job. Fail
+  // fast instead — the user gets a clear error pointing at the env
+  // var to set, rather than silent dashboard noise.
+  //
+  // Get a test webhook URL from app.coconut.co → Notifications,
+  // copy it into Render's COCONUT_WEBHOOK_URL env var.
+  const notificationUrl = opts.notificationUrl ?? process.env.COCONUT_WEBHOOK_URL;
+  if (!notificationUrl) {
+    throw new Error("COCONUT_WEBHOOK_URL not set — grab a test webhook URL from app.coconut.co → Notifications and set it as an env var.");
+  }
 
   const spec: Record<string, unknown> = {
     input: { url: opts.inputUrl },
