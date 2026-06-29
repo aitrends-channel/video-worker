@@ -1230,13 +1230,15 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
         }
       }
       if (!didRemoteAudioConcat) {
-        // Audio prep is I/O bound (R2 downloads + ffprobe duration). Even
-        // with trimSilence on, each trim is a sub-second ffmpeg op on a
-        // small mp3 — no real contention with the per-clip encode pool
-        // because that pool only starts AFTER this loop completes.
-        // Keep this pool conservative to avoid too many concurrent I/O
-        // downloads while still making reasonable progress.
-        const audioLimit = ASSEMBLY_SAFE_MODE ? 1 : Math.min(Math.max(1, getAssemblyConcurrency(beats.length)), beats.length, 2);
+        // Audio prep is light per-process — small mp3 download +
+        // optional silenceremove ffmpeg + ffprobe duration. Each
+        // ffmpeg holds maybe 50-100 MB resident. Decouple from the
+        // visual encode pool (which had to cap at 1 for >80 beats
+        // because of 4K frame buffers), and run up to 6 audio
+        // workers in parallel. For a 200-beat trim-on project this
+        // drops audio prep from ~7-10 min sequential down to ~1-2
+        // min while staying well under the 2 GB Standard ceiling.
+        const audioLimit = ASSEMBLY_SAFE_MODE ? 1 : Math.min(beats.length, 6);
         let nextAudioIdx = 0;
         let audioCompleted = 0;
         let audioFirstError: Error | null = null;
