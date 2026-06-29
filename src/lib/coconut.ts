@@ -95,10 +95,12 @@ function buildJobSpec(opts: CoconutFinalizeOptions) {
     shortSide >= 720 ? "720p" :
     shortSide >= 480 ? "480p" : "360p";
 
-  // Subtitle burn-in and watermark sit DIRECTLY on the output
-  // object as top-level params. The earlier "transformation"
-  // wrapper isn't a Coconut concept — each transform is its own
-  // first-class output key.
+  // Output-level params Coconut accepts are narrow (path, key,
+  // format, and a few format-internal options). Subtitle and
+  // watermark transforms appear to live at the JOB level instead
+  // — adding them as output-level keys triggered the same
+  // "Output param key not valid" error pattern that "transformation"
+  // hit. Move them up to the job root.
   const output: Record<string, unknown> = {
     path: opts.outputBucketKey,
     key: "mp4:final",
@@ -108,15 +110,6 @@ function buildJobSpec(opts: CoconutFinalizeOptions) {
       quality: 4,
     },
   };
-  if (opts.captionsAssUrl) {
-    output.subtitles = { source: opts.captionsAssUrl };
-  }
-  if (opts.logoUrl) {
-    output.watermark = {
-      url: opts.logoUrl,
-      position: "top_right",
-    };
-  }
 
   // Notification URL: prefer caller-provided, fall back to env var.
   // The key is required by Coconut's schema. If neither source has
@@ -128,7 +121,7 @@ function buildJobSpec(opts: CoconutFinalizeOptions) {
     ?? process.env.COCONUT_WEBHOOK_URL
     ?? "https://app.coconut.co/notifications/http/placeholder";
 
-  return {
+  const spec: Record<string, unknown> = {
     input: { url: opts.inputUrl },
     storage,
     notification: { url: notificationUrl },
@@ -136,6 +129,21 @@ function buildJobSpec(opts: CoconutFinalizeOptions) {
       mp4: [output],
     },
   };
+  // Captions + logo as job-level transforms — applies to all
+  // outputs in the job. If Coconut still complains the key names
+  // might be slightly different (e.g. "watermark" vs "image_watermark");
+  // the debug log printed before the request shows the exact JSON
+  // for the next 400 to point at.
+  if (opts.captionsAssUrl) {
+    spec.subtitles = { source: opts.captionsAssUrl };
+  }
+  if (opts.logoUrl) {
+    spec.watermark = {
+      url: opts.logoUrl,
+      position: "top_right",
+    };
+  }
+  return spec;
 }
 
 const API_BASE = (process.env.COCONUT_API_BASE ?? "https://api.coconut.co/v2").replace(/\/$/, "");
