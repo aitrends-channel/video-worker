@@ -69,6 +69,13 @@ export interface CoconutJob {
 //   - R2 storage is passed under `storage` using Coconut's s3other
 //     service — they support any S3-compatible target.
 function buildJobSpec(opts: CoconutFinalizeOptions) {
+  // Use the same env var the rest of the worker uses for R2
+  // (storage.ts builds the endpoint URL from R2_ACCOUNT_ID inline).
+  // The user already has R2_ACCOUNT_ID set; adding a new
+  // R2_S3_ENDPOINT var would have been redundant.
+  const r2Endpoint = process.env.R2_ACCOUNT_ID
+    ? `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`
+    : undefined;
   const storage = {
     service: "s3other",
     bucket: process.env.R2_BUCKET_NAME,
@@ -76,7 +83,7 @@ function buildJobSpec(opts: CoconutFinalizeOptions) {
     // real region for sigv4 signing. us-east-1 is the safe default
     // and R2 accepts it.
     region: "us-east-1",
-    endpoint: process.env.R2_S3_ENDPOINT,
+    endpoint: r2Endpoint,
     credentials: {
       access_key_id: process.env.R2_ACCESS_KEY_ID,
       secret_access_key: process.env.R2_SECRET_ACCESS_KEY,
