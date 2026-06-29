@@ -255,7 +255,13 @@ export async function pollJob(
     }
     if (normalized === "completed") return job;
     if (normalized === "failed" || normalized === "canceled") {
-      const errMsg = job.errors?.[0]?.message ?? `job ended in ${job.status}`;
+      // Log the FULL response on failure so we can see whatever
+      // fields Coconut actually populated (their `errors` array
+      // is sometimes empty even on real failures — the reason may
+      // live under `outputs[i].error`, `events`, or only on the
+      // dashboard). The dump gives us everything to debug from.
+      console.error(`[coconut] job ${jobId} failed; full response:`, JSON.stringify(job, null, 2));
+      const errMsg = job.errors?.[0]?.message ?? `job ended in ${job.status} — check Coconut dashboard for details`;
       const errCode = job.errors?.[0]?.code ? ` [${job.errors[0].code}]` : "";
       throw new Error(`Coconut job ${jobId} ${job.status}${errCode}: ${errMsg}`);
     }
