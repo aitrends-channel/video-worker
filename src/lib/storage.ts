@@ -35,6 +35,19 @@ const r2 = new S3Client({
     accessKeyId: process.env.R2_ACCESS_KEY_ID ?? "",
     secretAccessKey: process.env.R2_SECRET_ACCESS_KEY ?? "",
   },
+  // Newer aws-sdk-js versions (3.7xx+) default to streaming chunked
+  // uploads with CRC32 trailer checksums (`STREAMING-UNSIGNED-PAYLOAD-TRAILER`),
+  // which R2 doesn't fully honor for PutObject. The signature R2
+  // calculates differs from what the SDK signed, producing a
+  // SignatureDoesNotMatch error. Opt out of flexible-checksum
+  // streaming so uploads use the simpler signed-payload mode R2
+  // handles correctly.
+  requestChecksumCalculation: "WHEN_REQUIRED",
+  responseChecksumValidation: "WHEN_REQUIRED",
+  // R2 accepts virtual-hosted style today but path-style is the
+  // documented-stable contract — pinning to path-style avoids
+  // future-SDK-default-change regressions.
+  forcePathStyle: true,
 });
 
 const BUCKET = process.env.R2_BUCKET_NAME;
