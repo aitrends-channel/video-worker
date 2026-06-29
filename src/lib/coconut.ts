@@ -48,9 +48,22 @@ export interface CoconutFinalizeOptions {
   notificationUrl?: string;
 }
 
+// Coconut's actual API returns status with a `job.` prefix:
+// `job.starting`, `job.processing`, `job.completed`, `job.failed`,
+// `job.canceled`. The dashboard sometimes shows them uppercase
+// (JOB.FAILED) but the wire format is lowercase + prefixed.
+export type CoconutJobStatus =
+  | "job.starting"
+  | "job.processing"
+  | "job.completed"
+  | "job.failed"
+  | "job.canceled"
+  | "job.queued"
+  | string; // tolerate other strings rather than blow up
+
 export interface CoconutJob {
   id: string;
-  status: "queued" | "processing" | "completed" | "failed" | "canceled";
+  status: CoconutJobStatus;
   errors?: { code: string; message: string }[];
   output_url?: string;            // populated on completed
 }
@@ -217,6 +230,13 @@ export async function getJob(jobId: string): Promise<CoconutJob> {
 // Poll a job to completion. Backoff: starts at 3s, doubles up to 30s.
 // Aborts cleanly if the shared signal triggers (Stop button). Timeout
 // at the caller's discretion — typically wrap with an outer timer.
+//
+// Status strings come back with a `job.` prefix (`job.completed`,
+// `job.failed`, etc.) — earlier match against bare "failed" silently
+// failed and the loop ran forever, spamming the same status line. Now
+// we strip the prefix before comparing AND match against the prefixed
+// forms defensively. onUpdate is throttled to fire only when the
+// status actually changes.
 export async function pollJob(
   jobId: string,
   signal?: AbortSignal,
@@ -224,14 +244,23 @@ export async function pollJob(
 ): Promise<CoconutJob> {
   let delay = 3000;
   const MAX_DELAY = 30_000;
+  let lastStatus: string | null = null;
   while (true) {
     if (signal?.aborted) throw new Error("ASSEMBLY_STOPPED_BY_USER");
     const job = await getJob(jobId);
-    if (onUpdate) onUpdate(job.status);
-    if (job.status === "completed") return job;
-    if (job.status === "failed" || job.status === "canceled") {
-      const msg = job.errors?.[0]?.message ?? `job ended in ${job.status}`;
-      throw new Error(`Coconut job ${jobId} ${job.status}: ${msg}`);
+    // Strip the `job.` prefix so terminal-state checks work against
+    // both prefixed and bare forms (some Coconut endpoints/versions
+    // differ).
+    const normalized = (job.status ?? "").replace(/^job\./, "");
+    if (onUpdate && job.status !== lastStatus) {
+      onUpdate(job.status);
+      lastStatus = job.status;
+    }
+    if (normalized === "completed") return job;
+    if (normalized === "failed" || normalized === "canceled") {
+      const errMsg = job.errors?.[0]?.message ?? `job ended in ${job.status}`;
+      const errCode = job.errors?.[0]?.code ? ` [${job.errors[0].code}]` : "";
+      throw new Error(`Coconut job ${jobId} ${job.status}${errCode}: ${errMsg}`);
     }
     await new Promise((r) => setTimeout(r, delay));
     delay = Math.min(MAX_DELAY, delay * 2);
