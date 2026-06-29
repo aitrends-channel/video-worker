@@ -94,12 +94,26 @@ function buildJobSpec(opts: CoconutFinalizeOptions) {
     };
   }
 
+  // Coconut's format block takes a `resolution` PRESET string,
+  // not raw width/height. Map our dimensions to the closest preset
+  // based on the short side — that's the standard interpretation
+  // (e.g. 1920x1080 and 1080x1920 are both "1080p"). Coconut
+  // preserves the input's aspect ratio when given a resolution
+  // preset, so vertical/square outputs come through naturally as
+  // long as the worker's intermediate is already the right aspect.
+  const shortSide = Math.min(opts.outputWidth, opts.outputHeight);
+  const resolution =
+    shortSide >= 2160 ? "2160p" :
+    shortSide >= 1440 ? "1440p" :
+    shortSide >= 1080 ? "1080p" :
+    shortSide >= 720 ? "720p" :
+    shortSide >= 480 ? "480p" : "360p";
+
   const output: Record<string, unknown> = {
     path: opts.outputBucketKey,
     key: "mp4:final",
     format: {
-      width: opts.outputWidth,
-      height: opts.outputHeight,
+      resolution,
       // 1=low, 5=highest. 4 maps roughly to veryfast/crf 23.
       quality: 4,
     },
