@@ -2156,7 +2156,18 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
           writeAss(baseCaptionSegs, buildAssStyle(captionsStyle, captionsSize, captionsPosition, finalH), finalW, finalH, assLocal);
           captionsAssUrl = await uploadFile(ckptPathFor("final_captions.ass"), assLocal, "text/x-ssa");
         }
-        const outputKey = ckptPathFor("final_burned.mp4");
+        // Coconut's output path can't go through the userFolder
+        // (which is the user's email) because their path parser
+        // mangles paths containing "@" and "." chars (we hit
+        // output_filename_not_valid even with the @ URL-encoded —
+        // gmail.com's dot is what their parser is reading as a
+        // filename extension). Use a flat coconut-out/<projectId>/
+        // prefix in the same R2 bucket, scoped per-project. The
+        // worker downloads the result from the same path right
+        // after Coconut completes, so this prefix never appears
+        // in the final assembled_url stored on the project row —
+        // that comes from the worker's own re-upload below.
+        const outputKey = `coconut-out/${projectId}/final_burned.mp4`;
         const job = await submitJob({
           inputUrl: checkpoint.mixed_url!,
           outputBucketKey: outputKey,
