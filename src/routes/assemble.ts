@@ -446,8 +446,11 @@ function mixAudio(
   audio: string,
   output: string,
   videoDuration: number,
+  videoWidth: number,
+  videoHeight: number,
   signal?: AbortSignal,
   bgm?: { path: string; volume: number; loops: number } | null,
+  logo?: LogoOverlay | null,
 ): Promise<void> {
   return ffmpegWithTimeout((cmd) => {
     // probesize + analyzeduration cap how much of each input ffmpeg
@@ -458,43 +461,60 @@ function mixAudio(
     const lightInput = ["-thread_queue_size", "512", "-probesize", "1000000", "-analyzeduration", "0"];
     cmd.input(video).inputOptions([...lightInput, "-fflags", "+genpts"]);
     cmd.input(audio).inputOptions(lightInput);
+
+    // Audio graph — unchanged from before. amix when BGM present,
+    // straight passthrough otherwise.
+    const audioFilters: string[] = [];
+    let audioMap: string;
     if (bgm) {
-      // Three inputs: video, voiceover (1), bgm (2). bgm.loops is a
-      // FINITE count computed from ffprobe of the bgm + voiceover
-      // duration, NOT -1. The previous version used -stream_loop -1
-      // and would hang the entire mix step: amix with duration=first
-      // is supposed to drain when the voiceover (input 1) ends, but
-      // the infinite-loop input 2 keeps producing packets and the
-      // muxer can deadlock waiting for both demuxer threads to reach
-      // EOF. -t at the output should propagate back through the
-      // filter graph but doesn't reliably in all ffmpeg builds with
-      // complex_filter. A finite stream_loop value gives input 2 a
-      // natural EOF, amix drains cleanly, the mux finalizes.
-      //
-      // -shortest is layered on top as belt-and-braces: stop the
-      // whole output as soon as any stream ends. Combined with
-      // duration=first, the voiceover length wins.
-      //
-      // volume=`bgm.volume` keeps music under the dialog (default
-      // 0.15 ≈ -16 dB, classic "podcast bed" level).
-      cmd.input(bgm.path).inputOptions([...lightInput, "-stream_loop", String(bgm.loops)]);
-      cmd.complexFilter([
-        `[2:a]volume=${bgm.volume}[bgmDucked]`,
-        `[1:a][bgmDucked]amix=inputs=2:duration=first:dropout_transition=0[mix]`,
-      ]);
-      cmd.outputOptions([
-        "-map", "0:v", "-map", "[mix]", "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
-        "-t", String(videoDuration),
-        "-shortest",
-        "-max_muxing_queue_size", "1024",
-      ]);
+      audioFilters.push(`[2:a]volume=${bgm.volume}[bgmDucked]`);
+      audioFilters.push(`[1:a][bgmDucked]amix=inputs=2:duration=first:dropout_transition=0[mix]`);
+      audioMap = "[mix]";
     } else {
-      cmd.outputOptions([
-        "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
-        "-t", String(videoDuration),
-        "-max_muxing_queue_size", "1024",
-      ]);
+      audioMap = "1:a";
     }
+    if (bgm) {
+      cmd.input(bgm.path).inputOptions([...lightInput, "-stream_loop", String(bgm.loops)]);
+    }
+
+    // Logo overlay (when present) shifts the video stream from
+    // -c:v copy to a libx264 re-encode. We accept the wall-clock
+    // cost because it's the only consistent place to apply the
+    // overlay regardless of useFinalBurn / useCoconut /
+    // assembly_beats_at_final_res — keeping logo handling in one
+    // stage matters more than the per-run CPU saving from the
+    // copy path. The logo input index depends on whether BGM is
+    // present (BGM is 2, logo follows it; without BGM, logo is 2).
+    let videoMap: string;
+    if (logo) {
+      const logoInputIdx = bgm ? 3 : 2;
+      cmd.input(logo.logoPath);
+      const logoW = Math.max(8, Math.min(videoWidth, Math.round((videoWidth * logo.sizePct) / 2) * 2));
+      const x = Math.round(videoWidth * logo.xPct);
+      const y = Math.round(videoHeight * logo.yPct);
+      const videoFilters = [
+        `[${logoInputIdx}:v]scale=w=${logoW}:h=-2[logo]`,
+        `[0:v:0][logo]overlay=x=${x}:y=${y}:format=auto[v]`,
+      ];
+      cmd.complexFilter([...audioFilters, ...videoFilters]);
+      videoMap = "[v]";
+    } else {
+      if (audioFilters.length > 0) cmd.complexFilter(audioFilters);
+      videoMap = "0:v";
+    }
+
+    const videoEncodeFlags = logo
+      ? ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p"]
+      : ["-c:v", "copy"];
+
+    cmd.outputOptions([
+      "-map", videoMap, "-map", audioMap,
+      ...videoEncodeFlags,
+      "-c:a", "aac", "-b:a", "128k",
+      "-t", String(videoDuration),
+      ...(bgm ? ["-shortest"] : []),
+      "-max_muxing_queue_size", "1024",
+    ]);
     // +faststart skipped: on constrained disk it can corrupt the moov atom; range-request serving handles moov-at-end fine
     return cmd.output(output);
   }, "audio mix", signal);
@@ -1605,40 +1625,15 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
       };
       persistHeartbeatTimer = setInterval(() => { void flushPersist(); }, PERSIST_HEARTBEAT_MS);
 
-      // Download the channel logo. If we're doing a final-stage burn
-      // we still need the logo locally later, but we don't bake it
-      // into per-beat clips: that would recreate the heavy parallel
-      // encode pattern. Store either a per-clip overlay or a final
-      // logo path depending on `useFinalBurn`.
-      let stageBLogoOverlay: LogoOverlay | null = null;
-      if (logoUrl) {
-        await checkStop();
-        await progress("Downloading channel logo…");
-        const logoPath = path.join(tmpDir, "logo");
-        try {
-          await downloadFile(logoUrl, logoPath, signal);
-          // Bake into Stage F (one full-video pass) only when the
-          // LOCAL final-burn will run anyway — i.e. captions are
-          // enabled AND Coconut isn't taking over. In every other
-          // case (Coconut, or no captions), bake per-beat in Stage B.
-          // The per-beat overlay rides along on an encode that's
-          // happening anyway, so it's effectively free CPU. Coconut's
-          // spec becomes simpler too — fewer params, fewer failure
-          // modes.
-          if (useFinalBurn && !useCoconut) {
-            finalLogoPath = logoPath;
-          } else {
-            stageBLogoOverlay = {
-              logoPath,
-              sizePct: typeof logoSize === "number" ? logoSize : 0.1,
-              xPct:    typeof logoX === "number"    ? logoX    : 0.85,
-              yPct:    typeof logoY === "number"    ? logoY    : 0.05,
-            };
-          }
-        } catch (e) {
-          console.warn(`[assemble] logo download failed, encoding clips without overlay:`, e);
-        }
-      }
+      // Logo handling is now done entirely at Stage D (alongside
+      // BGM) regardless of admin flags. Stage B no longer bakes
+      // per-beat and Stage F no longer applies overlay — they both
+      // leave the video clean and Stage D's mix pass composites the
+      // logo as part of its single full-video re-encode. Trade-off:
+      // Stage D is no longer -c:v copy (slower); benefit: one
+      // consistent place to reason about logo regardless of
+      // useCoconut / useFinalBurn / assembly_beats_at_final_res.
+      const stageBLogoOverlay: LogoOverlay | null = null;
 
       // Worker-pool over the beat list. Each worker pulls the next
       // un-claimed index, processes it independently, then loops back
@@ -1679,9 +1674,10 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
         // instead of re-encoding; on miss, the upload below writes
         // to this same key so the next run picks it up.
         const sourceKey = beat.video_url ?? beat.image_url ?? "no-src";
-        const logoKey = stageBLogoOverlay && logoUrl
-          ? `${logoUrl}@${stageBLogoOverlay.sizePct}x${stageBLogoOverlay.xPct},${stageBLogoOverlay.yPct}`
-          : "nologo";
+        // Stage B no longer bakes logo (moved to Stage D), so per-beat
+        // encode hash doesn't need logo opts. Kept as "nologo" so
+        // existing cached beats (encoded without logo) still hit.
+        const logoKey = "nologo";
         const subsKey = (!useFinalBurn && captionsEnabled && baseCaptionSegs.length > 0)
           ? hashString(JSON.stringify(sliceSegmentsForBeat(baseCaptionSegs, cumulativeStarts[i], durations[i])) + `|${captionsStyle}|${captionsSize}|${captionsPosition}|${h}`)
           : "nosubs";
@@ -1835,12 +1831,9 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
       await flushPersist();
       if (firstError) throw firstError;
       metrics.record("stage-b-encode");
-
-      // Logo was baked into each clip; the source file isn't needed
-      // for any later stage.
-      if (stageBLogoOverlay) {
-        try { fs.unlinkSync(stageBLogoOverlay.logoPath); } catch { /* ignore */ }
-      }
+      // Logo file stays on disk through Stage D — that's where the
+      // overlay actually gets composited now. Stage D cleans it up
+      // after the mix completes.
 
       await checkStop();
       await progress("Joining clips…");
@@ -2025,6 +2018,29 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
         }
       }
 
+      // Logo download — sibling of BGM, both fetched here so the mix
+      // step has everything it needs. Failure isn't fatal; we just
+      // continue without the overlay so the user still gets a
+      // finished video.
+      let stageDLogoOverlay: LogoOverlay | null = null;
+      if (logoUrl) {
+        await checkStop();
+        await progress("Downloading channel logo…");
+        const logoPath = path.join(tmpDir, "logo");
+        try {
+          await downloadFile(logoUrl, logoPath, signal);
+          stageDLogoOverlay = {
+            logoPath,
+            sizePct: typeof logoSize === "number" ? logoSize : 0.1,
+            xPct:    typeof logoX === "number"    ? logoX    : 0.85,
+            yPct:    typeof logoY === "number"    ? logoY    : 0.05,
+          };
+        } catch (e) {
+          if (signal.aborted) throw e;
+          console.warn(`[assemble] logo download failed, continuing without overlay:`, e instanceof Error ? e.message : e);
+        }
+      }
+
       // Drop large in-memory arrays before the mix step to give Node
       // a chance to GC before ffmpeg spawns. The transcription word
       // list (used by alignBeats and buildSrtSegments — both done by
@@ -2045,16 +2061,18 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
       // significant trailing silence; the cap also trims any tiny
       // encoding-rounding overshoot.
       try {
-        await mixAudio(mixSrc, voiceoverPath, outputPath, totalDuration, signal, bgmConfig);
+        await mixAudio(mixSrc, voiceoverPath, outputPath, totalDuration, w, h, signal, bgmConfig, stageDLogoOverlay);
       } catch (e) {
         if (signal.aborted) throw e;
         // If the mix failed with bgm enabled, retry once without it
         // — same fault-tolerance as the old "download failed → no
         // music" branch, just shifted to the mix step. The user
-        // still gets a finished video with voiceover only.
+        // still gets a finished video with voiceover only. Logo
+        // stays in the retry — if logo overlay was the cause, the
+        // outer try/catch fails normally and surfaces the error.
         if (bgmConfig) {
           console.warn(`[assemble] mix with bgm failed, retrying without music:`, e instanceof Error ? e.message : e);
-          await mixAudio(mixSrc, voiceoverPath, outputPath, totalDuration, signal, null);
+          await mixAudio(mixSrc, voiceoverPath, outputPath, totalDuration, w, h, signal, null, stageDLogoOverlay);
         } else {
           throw e;
         }
