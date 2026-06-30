@@ -90,7 +90,13 @@ function buildJobSpec(opts: CoconutFinalizeOptions) {
   const storage = {
     service: "s3other",
     bucket: process.env.R2_BUCKET_NAME,
-    region: "us-east-1",
+    // R2 expects "auto" — not a real AWS region name. Reads (GET via
+    // public URL) ignore region entirely, but PutObject SigV4 signing
+    // includes the region in the canonical request, so a wrong value
+    // like "us-east-1" produces a signature mismatch that R2 returns
+    // as a generic upload failure (no helpful detail surfaces back
+    // through Coconut).
+    region: "auto",
     endpoint: r2Endpoint,
     credentials: {
       access_key_id: process.env.R2_ACCESS_KEY_ID,

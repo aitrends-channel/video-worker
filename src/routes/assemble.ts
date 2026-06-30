@@ -108,6 +108,43 @@ function getMediaDuration(filePath: string): Promise<number> {
   });
 }
 
+// Content-addressed lookup against the R2 public URL. Used by the
+// per-beat encode cache to skip re-encoding when the same input set
+// has already produced an output. Returns true when the object
+// exists, false otherwise — never throws, so a cache miss falls
+// through to a fresh encode instead of failing the whole assembly.
+async function r2ObjectExists(publicUrl: string): Promise<boolean> {
+  try {
+    const res = await fetch(publicUrl, { method: "HEAD", signal: AbortSignal.timeout(10_000) });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+// Quick stream-layout check on a downloaded beat source. Catches the
+// AI-video-with-cover-art-thumbnail class of input that has multiple
+// video streams or an attached_pic, which the mp4 muxer would later
+// choke on if `-map 0:v` matched all of them. Returns null when the
+// probe itself fails so the caller doesn't hard-fail on a transient
+// ffprobe error — better to attempt the encode and let normalizeClip
+// (which uses an explicit [0:v:0] selector) handle it.
+interface SourceProbe { videoStreams: number; hasAttachedPic: boolean; }
+function probeSource(filePath: string): Promise<SourceProbe | null> {
+  return new Promise((resolve) => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    ffmpeg.ffprobe(filePath, (err: Error, meta: any) => {
+      if (err) { resolve(null); return; }
+      const streams = Array.isArray(meta?.streams) ? meta.streams : [];
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const videos = streams.filter((s: any) => s?.codec_type === "video");
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const hasAttachedPic = videos.some((s: any) => s?.disposition?.attached_pic === 1);
+      resolve({ videoStreams: videos.length, hasAttachedPic });
+    });
+  });
+}
+
 // ── Memory + stage metrics ────────────────────────────────────────────────────
 //
 // Track RSS (resident set size — what Render's OOM killer actually
@@ -268,8 +305,12 @@ function normalizeClip(
       const x = Math.round(w * logoOverlay.xPct);
       const y = Math.round(h * logoOverlay.yPct);
       const overlayLabel = assFilter ? "[premix]" : "[v]";
+      // [0:v:0] explicitly picks the FIRST video stream — AI-generated
+      // sources sometimes carry an attached_pic / cover-art stream that
+      // [0:v] would also match, causing the mp4 muxer to fail late in
+      // the encode after several minutes of CPU.
       const graph: string[] = [
-        `[0:v]${baseFilter}[base]`,
+        `[0:v:0]${baseFilter}[base]`,
         `[1:v]scale=w=${logoW}:h=-2[logo]`,
         `[base][logo]overlay=x=${x}:y=${y}:format=auto${overlayLabel}`,
       ];
@@ -1603,6 +1644,40 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
           }
         }
         const beat = beats[i];
+        // Per-beat content-addressed cache. Build a stable hash of
+        // every input that affects the encoded output: source URL,
+        // duration, intermediate dimensions, encoder preset/crf,
+        // logo overlay params, and the exact caption segments for
+        // this beat (so a script edit invalidates only the changed
+        // beats — not the whole batch). The cache key lives under
+        // the user folder (no cross-tenant sharing) at a stable
+        // path that survives checkpoint clears. On hit, downloads
+        // instead of re-encoding; on miss, the upload below writes
+        // to this same key so the next run picks it up.
+        const sourceKey = beat.video_url ?? beat.image_url ?? "no-src";
+        const logoKey = stageBLogoOverlay && logoUrl
+          ? `${logoUrl}@${stageBLogoOverlay.sizePct}x${stageBLogoOverlay.xPct},${stageBLogoOverlay.yPct}`
+          : "nologo";
+        const subsKey = (!useFinalBurn && captionsEnabled && baseCaptionSegs.length > 0)
+          ? hashString(JSON.stringify(sliceSegmentsForBeat(baseCaptionSegs, cumulativeStarts[i], durations[i])) + `|${captionsStyle}|${captionsSize}|${captionsPosition}|${h}`)
+          : "nosubs";
+        const encPreset = (!useFinalBurn && captionsEnabled && baseCaptionSegs.length > 0) ? "veryfast-23" : "ultrafast-28";
+        const beatCacheHash = hashString(`${sourceKey}|${durations[i].toFixed(3)}|${w}x${h}|${encPreset}|${logoKey}|${subsKey}`);
+        const beatCacheKey = `${userFolder}/_beat_cache/${beatCacheHash}.mp4`;
+        const beatCacheUrl = `${(process.env.R2_PUBLIC_URL ?? "").replace(/\/$/, "")}/${beatCacheKey}`;
+        if (await r2ObjectExists(beatCacheUrl)) {
+          try {
+            await downloadFile(beatCacheUrl, clipPath, signal);
+            clipPaths[i] = clipPath;
+            checkpoint.clip_urls![i] = beatCacheUrl;
+            persistDirty = true;
+            console.log(`[assemble] beat ${beat.beat_number}: cache hit (${beatCacheHash})`);
+            return;
+          } catch (e) {
+            console.warn(`[assemble] beat ${beat.beat_number}: cache download failed, re-encoding:`, e);
+            // fall through
+          }
+        }
         // Captions bake-in: slice the master segment list to this
         // beat's [beatStart, beatStart + duration) window, shift to
         // beat-relative timings, and write a per-beat ASS file.
@@ -1625,6 +1700,15 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
             const src = path.join(tmpDir, `src_${i}.${ext}`);
             console.log(`[assemble] beat ${beat.beat_number}: downloading video…`);
             await downloadFile(beat.video_url, src, signal);
+            // Probe layout before encoding. Multi-video-stream sources
+            // (including the AI-video-with-cover-art-thumbnail case)
+            // are handled by the [0:v:0] pin in normalizeClip; we log
+            // the anomaly so a future codec regression surfaces in
+            // the assembly log instead of as a silent 10-min waste.
+            const probe = await probeSource(src);
+            if (probe && (probe.videoStreams > 1 || probe.hasAttachedPic)) {
+              console.warn(`[assemble] beat ${beat.beat_number}: source has ${probe.videoStreams} video stream(s)${probe.hasAttachedPic ? " incl. attached_pic" : ""} — encoding first stream only`);
+            }
             console.log(`[assemble] beat ${beat.beat_number}: encoding clip…`);
             await normalizeClip(src, false, durations[i], clipPath, w, h, stageBLogoOverlay, beatSubtitles, signal);
             try { fs.unlinkSync(src); } catch { /* ignore */ }
@@ -1647,7 +1731,13 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
           // files.
           const uploadPromise = (async () => {
             try {
-              const clipUrl = await uploadFile(ckptPathFor(`clip_${String(i).padStart(3, "0")}.mp4`), clipPath, "video/mp4");
+              // Upload to the content-addressed cache key (computed at
+              // the top of processOne). Survives checkpoint clears and
+              // is reused by future assemblies whose beats hash to the
+              // same value — only the inputs that affect the encode
+              // are in the hash, so re-renders that don't change a
+              // given beat skip its work entirely.
+              const clipUrl = await uploadFile(beatCacheKey, clipPath, "video/mp4");
               checkpoint.clip_urls![i] = clipUrl;
               // Mark the checkpoint dirty instead of persisting now.
               // A debounced flush within PERSIST_DEBOUNCE_MS will
@@ -2002,6 +2092,12 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
     // user's chosen output resolution, not the intermediate.
     let finalPath = outputPath;
     const useCoconut = !!process.env.COCONUT_API_KEY && useFinalBurn && (captionsEnabled || finalLogoPath);
+    // When Coconut fails partway, we still want the assembly to
+    // complete via the local burn path rather than aborting the
+    // whole run. Track the failure here so the else-if below picks
+    // it up (we can't just throw — the user's already paid for the
+    // earlier stages and the local fallback works fine, just slower).
+    let coconutFailed = false;
     if (useCoconut) {
       // ── Stage F: offload the final burn to Coconut ──────────────────
       //
@@ -2020,42 +2116,58 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
       // the same _assembly/ prefix. We then download it locally for
       // the existing remux+upload tail to consume — keeps the moov
       // faststart + upload-failure-retry logic intact.
-      await checkStop();
-      await progress("Submitting final-burn to Coconut…");
-      const { submitJob, pollJob } = await import("../lib/coconut.js");
-      const hasCaptions = captionsEnabled && baseCaptionSegs.length > 0;
-      let captionsAssUrl: string | null = null;
-      if (hasCaptions) {
-        // Upload the ASS file to R2 so Coconut can fetch it via HTTPS.
-        // Path mirrors the other _assembly/ artifacts.
-        const assLocal = path.join(tmpDir, "final_captions.ass");
-        writeAss(baseCaptionSegs, buildAssStyle(captionsStyle, captionsSize, captionsPosition, finalH), finalW, finalH, assLocal);
-        captionsAssUrl = await uploadFile(ckptPathFor("final_captions.ass"), assLocal, "text/x-ssa");
+      try {
+        await checkStop();
+        await progress("Submitting final-burn to Coconut…");
+        const { submitJob, pollJob } = await import("../lib/coconut.js");
+        const hasCaptions = captionsEnabled && baseCaptionSegs.length > 0;
+        let captionsAssUrl: string | null = null;
+        if (hasCaptions) {
+          // Upload the ASS file to R2 so Coconut can fetch it via HTTPS.
+          // Path mirrors the other _assembly/ artifacts.
+          const assLocal = path.join(tmpDir, "final_captions.ass");
+          writeAss(baseCaptionSegs, buildAssStyle(captionsStyle, captionsSize, captionsPosition, finalH), finalW, finalH, assLocal);
+          captionsAssUrl = await uploadFile(ckptPathFor("final_captions.ass"), assLocal, "text/x-ssa");
+        }
+        const outputKey = ckptPathFor("final_burned.mp4");
+        const job = await submitJob({
+          inputUrl: checkpoint.mixed_url!,
+          outputBucketKey: outputKey,
+          outputWidth: finalW,
+          outputHeight: finalH,
+          captionsAssUrl,
+          logoUrl: logoUrl ?? null,
+        });
+        console.log(`[assemble] ${projectId}: coconut job ${job.id} submitted`);
+        await progress("Finalizing on Coconut…");
+        await pollJob(job.id, signal, (status) => {
+          // Throttle progress writes — pollJob may emit multiple
+          // updates as status flips queued → processing → completed.
+          void progress(`Coconut: ${status}…`);
+        });
+        console.log(`[assemble] ${projectId}: coconut job ${job.id} completed`);
+        // Coconut wrote directly to R2. Download to a local path so
+        // the remux + final-upload tail below works unchanged.
+        const burnedPath = path.join(tmpDir, "final_burned.mp4");
+        const burnedUrl = `${process.env.R2_PUBLIC_URL?.replace(/\/$/, "")}/${outputKey}`;
+        await downloadFile(burnedUrl, burnedPath, signal);
+        finalPath = burnedPath;
+      } catch (e) {
+        // User-requested stop / finalize-preview propagate unchanged.
+        const msg = e instanceof Error ? e.message : String(e);
+        if (msg === STOPPED_MARKER || msg === FINALIZE_PREVIEW_MARKER || signal.aborted) throw e;
+        // Coconut failed (config issue, upload failure, etc). Don't
+        // burn the run — fall through to the local ffmpeg burn block
+        // below. The user gets a working video; we get a clear log
+        // line pointing at Coconut so we can fix it without blocking
+        // assemblies.
+        console.warn(`[assemble] ${projectId}: Coconut failed (${msg}) — falling back to local final burn`);
+        await progress("Coconut unavailable — finishing locally…");
+        coconutFailed = true;
       }
-      const outputKey = ckptPathFor("final_burned.mp4");
-      const job = await submitJob({
-        inputUrl: checkpoint.mixed_url!,
-        outputBucketKey: outputKey,
-        outputWidth: finalW,
-        outputHeight: finalH,
-        captionsAssUrl,
-        logoUrl: logoUrl ?? null,
-      });
-      console.log(`[assemble] ${projectId}: coconut job ${job.id} submitted`);
-      await progress("Finalizing on Coconut…");
-      await pollJob(job.id, signal, (status) => {
-        // Throttle progress writes — pollJob may emit multiple
-        // updates as status flips queued → processing → completed.
-        void progress(`Coconut: ${status}…`);
-      });
-      console.log(`[assemble] ${projectId}: coconut job ${job.id} completed`);
-      // Coconut wrote directly to R2. Download to a local path so
-      // the remux + final-upload tail below works unchanged.
-      const burnedPath = path.join(tmpDir, "final_burned.mp4");
-      const burnedUrl = `${process.env.R2_PUBLIC_URL?.replace(/\/$/, "")}/${outputKey}`;
-      await downloadFile(burnedUrl, burnedPath, signal);
-      finalPath = burnedPath;
-    } else if (useFinalBurn && (captionsEnabled || finalLogoPath)) {
+    }
+    if (!useCoconut || coconutFailed) {
+      if (useFinalBurn && (captionsEnabled || finalLogoPath)) {
       // Coconut not configured — fall back to local ffmpeg burn.
       // This is the same code path as before; unchanged logic, just
       // gated behind the "COCONUT_API_KEY missing" check above.
@@ -2079,17 +2191,19 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
 
       if (finalLogoPath) {
         // Logo present → use complex_filter so we can chain video
-        // ops with the overlay input. [0:v] runs scale/subtitles,
-        // [1:v] sizes the logo, the final overlay composites them.
-        // When there are no preceding video steps the [0:v] chain
-        // is a null filter (just labels through) so the graph
-        // structure stays consistent.
+        // ops with the overlay input. [0:v:0] runs scale/subtitles
+        // on the FIRST video stream only (some sources carry an
+        // attached_pic that [0:v] would also pick up and break the
+        // mp4 muxer), [1:v] sizes the logo, the final overlay
+        // composites them. When there are no preceding video steps
+        // the chain is a null filter (just labels through) so the
+        // graph structure stays consistent.
         const posX = Math.round(finalW * (logoX ?? 0.85));
         const posY = Math.round(finalH * (logoY ?? 0.05));
         const logoPx = Math.max(8, Math.min(finalW, Math.round((finalW * (logoSize ?? 0.1)) / 2) * 2));
         const videoChain = videoSteps.length > 0
-          ? `[0:v]${videoSteps.join(",")}[base]`
-          : `[0:v]null[base]`;
+          ? `[0:v:0]${videoSteps.join(",")}[base]`
+          : `[0:v:0]null[base]`;
         await ffmpegWithTimeout((cmd) =>
           cmd
             .input(outputPath)
@@ -2140,6 +2254,7 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
         signal,
       );
       finalPath = scaled;
+    }
     }
     metrics.record("final-burn");
     const finalStat = fs.statSync(finalPath);
