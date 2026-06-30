@@ -214,12 +214,6 @@ const STOPPED_MARKER = "ASSEMBLY_STOPPED_BY_USER";
 // status=done, rather than the usual stopped/failed transitions.
 const FINALIZE_PREVIEW_MARKER = "ASSEMBLY_FINALIZE_WITH_PREVIEW";
 
-// When a project has many beats, prefer a single final-stage burn
-// of captions/logo instead of baking them into every per-beat clip.
-// This reduces the number of concurrent ffmpeg re-encodes at the
-// cost of one sequential full-video re-encode.
-const FINAL_BURN_THRESHOLD = 80;
-
 function ffmpegWithTimeout(
   build: (cmd: ReturnType<typeof ffmpeg>) => ReturnType<typeof ffmpeg>,
   label: string,
@@ -1003,22 +997,6 @@ function dimsFor(aspect: string, preset: ResolutionPreset | undefined): [number,
 // resolutions (≤720p) pass through unchanged. Captions/logo bake into
 // the final-burn pass at the user's chosen resolution, so the intermediate
 // downscale doesn't blur text.
-function intermediateDimsFor(
-  aspect: string,
-  preset: ResolutionPreset | undefined,
-  useFinalBurn: boolean,
-): [number, number] {
-  // Admin override: when assembly_beats_at_final_res is on, the
-  // per-beat encode runs at the user's chosen output resolution
-  // regardless of whether Stage F will run. Lets the admin trade
-  // Stage B encode time for a simpler/no Stage F upscale.
-  if (getAssemblyBeatsAtFinalRes()) return dimsFor(aspect, preset);
-  if (!useFinalBurn) return dimsFor(aspect, preset);
-  const cap: ResolutionPreset = "720p";
-  const rank: Record<ResolutionPreset, number> = { "720p": 0, "1080p": 1, "1440p": 2, "2160p": 3 };
-  const effective = preset && rank[preset] > rank[cap] ? cap : (preset ?? cap);
-  return dimsFor(aspect, effective);
-}
 
 function getAssemblyConcurrency(): number {
   if (ASSEMBLY_SAFE_MODE) return 1;
@@ -1230,8 +1208,14 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
     // we know a final-burn upscale will happen anyway — saves ~2.25× per
     // 1080p clip on the >80 beat path. For the per-beat-bake path
     // (default), intermediate dims === final dims so quality is unchanged.
-    const preferFinalBurn = beats.length > FINAL_BURN_THRESHOLD || ASSEMBLY_SAFE_MODE;
-    const useFinalBurn = preferFinalBurn && (captionsEnabled || !!logoUrl);
+    // Per-beat encodes run at the user's final resolution directly.
+    // The intermediate-720p-plus-final-burn-upscale pattern existed
+    // to offload the upscale step to Coconut; Coconut was removed
+    // (it never accepted our captioned spec — see git log around
+    // 2026-06-30). With Coconut gone there's no reason to encode
+    // small and upscale later. Captions bake per-beat (Stage B),
+    // logo composites at the audio mix (Stage D), Stage F is just
+    // remux + upload.
     // Decided here (not at Stage F) because the Stage B logo gate
     // below needs to know whether the final-burn pass will be
     // outsourced. When Coconut handles Stage F, we bake the logo
@@ -1242,11 +1226,7 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
     // handles it. Logo in Stage F is now only used when Coconut
     // is unavailable AND captions are enabled (single-pass final
     // burn covers both).
-    const useCoconut = !!process.env.COCONUT_API_KEY && useFinalBurn && (captionsEnabled || !!logoUrl);
-    const [w, h] = intermediateDimsFor(aspectRatio, resolution, useFinalBurn);
-    if (w !== finalW || h !== finalH) {
-      console.log(`[assemble] ${projectId}: intermediate dims=${w}x${h} (final ${finalW}x${finalH}); final-burn pass will upscale`);
-    }
+    const [w, h] = [finalW, finalH];
 
     metrics.record("load-project");
 
@@ -1556,11 +1536,6 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
       cumulativeStarts[i] = cumulativeStarts[i - 1] + durations[i - 1];
     }
 
-    // useFinalBurn was decided up front (right after beats were loaded)
-    // so the per-beat encode pool could pick intermediate dims. The
-    // logo download path below still depends on the same flag.
-    let finalLogoPath: string | null = null;
-
     // ── Stage B: per-clip normalization → concat → joined.mp4 ───────────
     //
     // Each clip is uploaded to R2 after encoding (checkpoint.clip_urls[i])
@@ -1575,7 +1550,10 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
       // first one's checkpoint write isn't guaranteed to land before
       // a Stop arrives. This explicit upfront persist closes that
       // window and only costs one DB write.
-      checkpoint.clips_baked_captions = captionsEnabled && !useFinalBurn;
+      // Captions are always baked per-beat now (Stage B). Persist
+      // the flag so Resume runs that find an existing clip_url know
+      // whether to honor it or re-encode.
+      checkpoint.clips_baked_captions = captionsEnabled;
       await persistCheckpoint();
       const clipPaths: string[] = new Array(beats.length).fill("");
       await progress("Processing video clips…");
@@ -1678,10 +1656,10 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
         // encode hash doesn't need logo opts. Kept as "nologo" so
         // existing cached beats (encoded without logo) still hit.
         const logoKey = "nologo";
-        const subsKey = (!useFinalBurn && captionsEnabled && baseCaptionSegs.length > 0)
+        const subsKey = (captionsEnabled && baseCaptionSegs.length > 0)
           ? hashString(JSON.stringify(sliceSegmentsForBeat(baseCaptionSegs, cumulativeStarts[i], durations[i])) + `|${captionsStyle}|${captionsSize}|${captionsPosition}|${h}`)
           : "nosubs";
-        const encPreset = (!useFinalBurn && captionsEnabled && baseCaptionSegs.length > 0) ? "veryfast-23" : "ultrafast-28";
+        const encPreset = (captionsEnabled && baseCaptionSegs.length > 0) ? "veryfast-23" : "ultrafast-28";
         const beatCacheHash = hashString(`${sourceKey}|${durations[i].toFixed(3)}|${w}x${h}|${encPreset}|${logoKey}|${subsKey}`);
         const beatCacheKey = `${userFolder}/_beat_cache/${beatCacheHash}.mp4`;
         const beatCacheUrl = `${(process.env.R2_PUBLIC_URL ?? "").replace(/\/$/, "")}/${beatCacheKey}`;
@@ -1708,7 +1686,7 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
         // events-less ASS file — ffmpeg renders no overlay text but
         // the filter is still invoked harmlessly.
         let beatSubtitles: { assPath: string } | null = null;
-        if (!useFinalBurn && captionsEnabled && baseCaptionSegs.length > 0) {
+        if (captionsEnabled && baseCaptionSegs.length > 0) {
           const beatSegs = sliceSegmentsForBeat(baseCaptionSegs, cumulativeStarts[i], durations[i]);
           const assPath = path.join(tmpDir, `captions_${String(i).padStart(3, "0")}.ass`);
           writeAss(beatSegs, buildAssStyle(captionsStyle, captionsSize, captionsPosition, h), w, h, assPath);
@@ -1911,7 +1889,11 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
           // Mismatch here would cross CABAC/CAVLC boundaries inside one
           // concatenated stream, which is technically valid H.264 but
           // upsets stricter players.
-          const subsBaked = captionsEnabled && !useFinalBurn;
+          // Captions are always baked per-beat now (Stage B), so the
+          // per-beat encoder is veryfast/crf 23 whenever captions are
+          // enabled, ultrafast/crf 28 otherwise. Match here so the
+          // freeze-tail concat stays bitstream-safe.
+          const subsBaked = captionsEnabled;
           const tailEnc = subsBaked
             ? { preset: "veryfast", crf: "23" }
             : { preset: "ultrafast", crf: "28" };
@@ -2045,12 +2027,12 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
       // a chance to GC before ffmpeg spawns. The transcription word
       // list (used by alignBeats and buildSrtSegments — both done by
       // now) and per-beat duration array (consumed by Stage B which
-      // has completed) are safe to release. baseCaptionSegs is held
-      // back when useFinalBurn=true because the final-burn pass
-      // still needs it; in the per-beat-bake path it can also drop.
+      // has completed) are safe to release. baseCaptionSegs already
+      // sliced into the per-beat ASS files; the master list is no
+      // longer referenced by any downstream stage.
       transcriptionWords = [];
       durations = [];
-      if (!useFinalBurn) baseCaptionSegs = [];
+      baseCaptionSegs = [];
       if (global.gc) {
         try { global.gc(); } catch { /* ignore — only available with --expose-gc */ }
       }
@@ -2083,18 +2065,12 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
         const mixedUrl = await uploadFile(ckptPathFor("mixed.mp4"), outputPath, "video/mp4");
         checkpoint.mixed_url = mixedUrl;
         await persistCheckpoint();
-        // Surface mixed.mp4 as an in-progress preview WHEN the
-        // final-burn pass is still ahead of us — the user gets a
-        // playable video while the multi-minute captions/logo/
-        // upscale re-encode runs in the background. On the
-        // non-final-burn path, mix is the last encode and the
-        // upload completes seconds later, so a preview URL would
+        // mixed.mp4 IS the final video now (no Stage F re-encode).
+        // The in-progress preview row is no longer useful: by the
+        // time mixed.mp4 is uploaded, the assembly is essentially
+        // done — the upload-as-assembled step right below replaces
+        // assembled_url within seconds, so a preview row would
         // flash on and off.
-        if (useFinalBurn) {
-          await supabase.from("projects")
-            .update({ assembly_preview_url: mixedUrl })
-            .eq("id", projectId);
-        }
       } catch (e) {
         console.warn(`[assemble] mixed.mp4 checkpoint upload failed:`, e);
       }
@@ -2114,212 +2090,20 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
     // and the translation step were moved upstream too — see the
     // baseCaptionSegs block above Stage B.
 
-    // ── Stage F: validate + remux + upload final ────────────────────────
+    // ── Stage F: nothing. Mixed.mp4 IS the final video ─────────────────
     //
-    // SINGLE-PASS final burn: any combination of upscale, subtitles,
-    // and logo overlay now runs in ONE ffmpeg invocation instead of
-    // two. Earlier versions did pass 1 = scale + subtitles, pass 2 =
-    // logo overlay — two full-video re-encodes at final resolution
-    // that doubled the finalize wall-clock on long projects. Fused
-    // into a single complex_filter, the encoder runs once and every
-    // frame goes through the whole chain: scale → subtitles → logo.
-    //
-    // Scale algorithm: bicubic instead of lanczos. Lanczos is best
-    // for true-source upscaling where preserving detail matters; on
-    // AI-generated footage (already softer than camera-shot video)
-    // the perceptual difference is negligible and bicubic encodes
-    // 2-3x faster.
-    //
-    // Captions are written at finalH so font sizing matches the
-    // user's chosen output resolution, not the intermediate.
-    let finalPath = outputPath;
-    // useCoconut was decided up at the mode-selection block so the
-    // Stage B logo gate could read it. Re-evaluating here would
-    // produce a different result (finalLogoPath was nulled out when
-    // useCoconut was true), so we just reuse the earlier value.
-    // When Coconut fails partway, we still want the assembly to
-    // complete via the local burn path rather than aborting the
-    // whole run. Track the failure here so the else-if below picks
-    // it up (we can't just throw — the user's already paid for the
-    // earlier stages and the local fallback works fine, just slower).
-    let coconutFailed = false;
-    if (useCoconut) {
-      // ── Stage F: offload the final burn to Coconut ──────────────────
-      //
-      // Skip the local ffmpeg re-encode entirely. Coconut runs the
-      // scale/subtitles/logo on their hardware while THIS worker
-      // returns to processing the next user. Cuts ~5-25 min of CPU
-      // off the worker's wall-clock for this assembly.
-      //
-      // Pre-requisites:
-      //   - mixed.mp4 already in R2 (checkpoint.mixed_url is set
-      //     above; we re-use that URL as Coconut's input).
-      //   - ASS captions file uploaded to R2 too so Coconut can fetch
-      //     it. Logo is already at logoUrl (the user uploaded it).
-      //
-      // Output: Coconut writes the finalized mp4 directly to R2 at
-      // the same _assembly/ prefix. We then download it locally for
-      // the existing remux+upload tail to consume — keeps the moov
-      // faststart + upload-failure-retry logic intact.
-      try {
-        await checkStop();
-        await progress("Burn captions - Coconut: submitting…");
-        const { submitJob, pollJob } = await import("../lib/coconut.js");
-        const hasCaptions = captionsEnabled && baseCaptionSegs.length > 0;
-        let captionsAssUrl: string | null = null;
-        if (hasCaptions) {
-          // Upload the ASS file to R2 so Coconut can fetch it via HTTPS.
-          // Path mirrors the other _assembly/ artifacts.
-          const assLocal = path.join(tmpDir, "final_captions.ass");
-          writeAss(baseCaptionSegs, buildAssStyle(captionsStyle, captionsSize, captionsPosition, finalH), finalW, finalH, assLocal);
-          captionsAssUrl = await uploadFile(ckptPathFor("final_captions.ass"), assLocal, "text/x-ssa");
-        }
-        // Coconut's output path can't go through the userFolder
-        // (which is the user's email) because their path parser
-        // mangles paths containing "@" and "." chars (we hit
-        // output_filename_not_valid even with the @ URL-encoded —
-        // gmail.com's dot is what their parser is reading as a
-        // filename extension). Use a flat coconut-out/<projectId>/
-        // prefix in the same R2 bucket, scoped per-project. The
-        // worker downloads the result from the same path right
-        // after Coconut completes, so this prefix never appears
-        // in the final assembled_url stored on the project row —
-        // that comes from the worker's own re-upload below.
-        const outputKey = `coconut-out/${projectId}/final_burned.mp4`;
-        const job = await submitJob({
-          inputUrl: checkpoint.mixed_url!,
-          outputBucketKey: outputKey,
-          outputWidth: finalW,
-          outputHeight: finalH,
-          captionsAssUrl,
-          // Logo is already baked into the per-beat Stage B encodes
-          // when useCoconut=true (see the Stage B logo gate). Sending
-          // null here keeps the Coconut spec simpler — Coconut just
-          // scales + burns captions, no watermark step that could
-          // fail upstream.
-          logoUrl: null,
-        });
-        console.log(`[assemble] ${projectId}: coconut job ${job.id} submitted`);
-        await progress("Burn captions - Coconut: finalizing…");
-        await pollJob(job.id, signal, (status) => {
-          // Throttle progress writes — pollJob may emit multiple
-          // updates as status flips queued → processing → completed.
-          // Status comes back like "job.processing"; strip the prefix
-          // so the user sees "processing" not "job.processing".
-          const cleaned = String(status).replace(/^job\./, "");
-          void progress(`Burn captions - Coconut: ${cleaned}…`);
-        });
-        console.log(`[assemble] ${projectId}: coconut job ${job.id} completed`);
-        // Coconut wrote directly to R2. Download to a local path so
-        // the remux + final-upload tail below works unchanged.
-        const burnedPath = path.join(tmpDir, "final_burned.mp4");
-        const burnedUrl = `${process.env.R2_PUBLIC_URL?.replace(/\/$/, "")}/${outputKey}`;
-        await downloadFile(burnedUrl, burnedPath, signal);
-        finalPath = burnedPath;
-      } catch (e) {
-        // User-requested stop / finalize-preview propagate unchanged.
-        const msg = e instanceof Error ? e.message : String(e);
-        if (msg === STOPPED_MARKER || msg === FINALIZE_PREVIEW_MARKER || signal.aborted) throw e;
-        // Coconut failed (config issue, upload failure, etc). Don't
-        // burn the run — fall through to the local ffmpeg burn block
-        // below. The user gets a working video; we get a clear log
-        // line pointing at Coconut so we can fix it without blocking
-        // assemblies.
-        console.warn(`[assemble] ${projectId}: Coconut failed (${msg}) — falling back to local final burn`);
-        await progress("Burn captions - VW (Coconut unavailable)…");
-        coconutFailed = true;
-      }
-    }
-    if (!useCoconut || coconutFailed) {
-      if (useFinalBurn && (captionsEnabled || finalLogoPath)) {
-      // Coconut not configured — fall back to local ffmpeg burn.
-      // This is the same code path as before; unchanged logic, just
-      // gated behind the "COCONUT_API_KEY missing" check above.
-      await checkStop();
-      const needsUpscale = w !== finalW || h !== finalH;
-      await progress("Burn captions - VW…");
-      const assPath = path.join(tmpDir, "final_captions.ass");
-      const hasCaptions = captionsEnabled && baseCaptionSegs.length > 0;
-      if (hasCaptions) {
-        writeAss(baseCaptionSegs, buildAssStyle(captionsStyle, captionsSize, captionsPosition, finalH), finalW, finalH, assPath);
-      }
-      const burnedPath = path.join(tmpDir, "final_burned.mp4");
-
-      // Build the video filter chain step list. Order matters:
-      // scale FIRST so the subtitles+logo render at output dims,
-      // subtitles BEFORE logo so the logo composites on top of the
-      // captioned frame (matches the per-beat-bake ordering).
-      const videoSteps: string[] = [];
-      if (needsUpscale) videoSteps.push(`scale=${finalW}:${finalH}:flags=bicubic`);
-      if (hasCaptions) videoSteps.push(`subtitles=${escapeAssPath(assPath)}`);
-
-      if (finalLogoPath) {
-        // Logo present → use complex_filter so we can chain video
-        // ops with the overlay input. [0:v:0] runs scale/subtitles
-        // on the FIRST video stream only (some sources carry an
-        // attached_pic that [0:v] would also pick up and break the
-        // mp4 muxer), [1:v] sizes the logo, the final overlay
-        // composites them. When there are no preceding video steps
-        // the chain is a null filter (just labels through) so the
-        // graph structure stays consistent.
-        const posX = Math.round(finalW * (logoX ?? 0.85));
-        const posY = Math.round(finalH * (logoY ?? 0.05));
-        const logoPx = Math.max(8, Math.min(finalW, Math.round((finalW * (logoSize ?? 0.1)) / 2) * 2));
-        const videoChain = videoSteps.length > 0
-          ? `[0:v:0]${videoSteps.join(",")}[base]`
-          : `[0:v:0]null[base]`;
-        await ffmpegWithTimeout((cmd) =>
-          cmd
-            .input(outputPath)
-            .input(finalLogoPath)
-            .complexFilter([
-              videoChain,
-              `[1:v]scale=w=${logoPx}:h=-2[logo]`,
-              `[base][logo]overlay=${posX}:${posY}:format=auto[v]`,
-            ])
-            .outputOptions(["-map", "[v]", "-map", "0:a?", "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "copy"])
-            .output(burnedPath),
-          "finalBurnFused",
-          signal,
-        );
-        finalPath = burnedPath;
-      } else if (videoSteps.length > 0) {
-        // No logo — single-input -vf chain is simpler and lighter
-        // than complex_filter. Covers scale-only, subtitles-only,
-        // and scale+subtitles cases.
-        await ffmpegWithTimeout((cmd) =>
-          cmd
-            .input(outputPath)
-            .outputOptions(["-vf", videoSteps.join(","), "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "copy"])
-            .output(burnedPath),
-          "finalBurnSimple",
-          signal,
-        );
-        finalPath = burnedPath;
-      }
-      // Else: no video changes needed (no captions, no logo, no
-      // upscale). Shouldn't happen given the outer condition but
-      // fall through with finalPath = outputPath for safety.
-    } else if (w !== finalW || h !== finalH) {
-      // useFinalBurn was off (no captions, no logo) but we still
-      // produced intermediate clips at a smaller resolution and the
-      // user wants something larger. Single upscale pass before
-      // remux. Same encode params as the burn passes above so output
-      // quality is consistent across modes.
-      await checkStop();
-      await progress(`Upscaling to ${finalW}x${finalH}…`);
-      const scaled = path.join(tmpDir, "scaled.mp4");
-      await ffmpegWithTimeout((cmd) =>
-        cmd
-          .input(outputPath)
-          .outputOptions(["-vf", `scale=${finalW}:${finalH}:flags=bicubic`, "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "copy"])
-          .output(scaled),
-        "intermediateUpscale",
-        signal,
-      );
-      finalPath = scaled;
-    }
-    }
+    // Stage F used to run a full-video re-encode pass that combined
+    // upscale, captions, and logo. Each of those moved upstream:
+    //   - Captions  → baked per-beat in Stage B (normalizeClip's
+    //                 subtitles=ass filter, with a per-beat segment
+    //                 slice)
+    //   - Logo      → composited at Stage D's audio mix (mixAudio's
+    //                 overlay branch when stageDLogoOverlay is set)
+    //   - Upscale   → no longer needed; Stage B encodes at the user's
+    //                 chosen final resolution directly
+    // So mixed.mp4 emerging from Stage D is the finished video. We
+    // just remux for faststart and upload.
+    const finalPath = outputPath;
     metrics.record("final-burn");
     const finalStat = fs.statSync(finalPath);
     console.log(`[assemble] ${projectId}: final file size = ${finalStat.size} bytes`);
@@ -2480,19 +2264,9 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
 //                           consumed inside runAssembly via getAssemblyBeatLimit()
 let assemblyProjectLimit = 1;
 let assemblyBeatLimit = 1;
-// Admin-tunable Assemble flag. Sourced from
-// product_config.batched_processes alongside the numeric knobs.
-// When true, Stage B encodes at the user's final resolution and
-// Coconut only burns captions; when false (default), Stage B uses
-// 720p intermediate and Coconut handles the upscale.
-let assemblyBeatsAtFinalRes = false;
 
 export function getAssemblyBeatLimit(): number {
   return assemblyBeatLimit;
-}
-
-export function getAssemblyBeatsAtFinalRes(): boolean {
-  return assemblyBeatsAtFinalRes;
 }
 
 async function refreshAssemblyConcurrency(): Promise<void> {
@@ -2502,7 +2276,7 @@ async function refreshAssemblyConcurrency(): Promise<void> {
       .select("batched_processes")
       .eq("service", "_global")
       .single();
-    const cfg = (data as { batched_processes?: { assembly_projects?: unknown; assembly_beats?: unknown; assembly_beats_at_final_res?: unknown } } | null)?.batched_processes;
+    const cfg = (data as { batched_processes?: { assembly_projects?: unknown; assembly_beats?: unknown } } | null)?.batched_processes;
     const projRaw = cfg?.assembly_projects;
     const beatRaw = cfg?.assembly_beats;
     const proj = typeof projRaw === "number" ? projRaw : Number(projRaw);
@@ -2514,11 +2288,6 @@ async function refreshAssemblyConcurrency(): Promise<void> {
     if (Number.isInteger(beat) && beat >= 1 && beat <= 10 && beat !== assemblyBeatLimit) {
       console.log(`[assembly-queue] beat limit changed: ${assemblyBeatLimit} → ${beat}`);
       assemblyBeatLimit = beat;
-    }
-    const finalResRaw = cfg?.assembly_beats_at_final_res;
-    if (typeof finalResRaw === "boolean" && finalResRaw !== assemblyBeatsAtFinalRes) {
-      console.log(`[assembly-queue] beats-at-final-res changed: ${assemblyBeatsAtFinalRes} → ${finalResRaw}`);
-      assemblyBeatsAtFinalRes = finalResRaw;
     }
   } catch (err) {
     console.warn("[assembly-queue] Failed to refresh concurrency from product_config:", err instanceof Error ? err.message : err);
