@@ -136,20 +136,18 @@ function buildJobSpec(opts: CoconutFinalizeOptions) {
   const output: Record<string, unknown> = {
     path: sanitizedPath,
     key: "mp4:final",
-    format: {
-      // Explicit container hint. When subtitles are present in the
-      // job, Coconut's path validator gets stricter and started
-      // rejecting our paths with output_filename_not_valid ("extension
-      // '' doesn't match with format 'mp4'") even though the path
-      // ends in .mp4. The outer outputs.mp4 wrapper already implies
-      // mp4 — but with subtitles in the mix, Coconut seems to want
-      // it in format too. The captions-less path that previously
-      // worked never tripped this code branch.
-      container: "mp4",
-      resolution,
-      // 1=low, 5=highest. 4 maps roughly to veryfast/crf 23.
-      quality: 4,
-    },
+    // String-form format. Coconut v2 documents both an object form
+    // ({ resolution, quality }) and a colon-separated string form
+    // (`mp4:1080p:quality=4`). Object form fails our captioned jobs
+    // with output_filename_not_valid — the path-validator can't
+    // extract the filename extension even from a clean
+    // "/coconut-out/<id>/final_burned.mp4" path. Adding a `container`
+    // key to the object form returns output_format_not_valid. The
+    // string form encodes container, resolution, and quality
+    // explicitly in one token — different code path in Coconut's
+    // validator, with a chance of dodging the subtitle-induced
+    // strict-mode bug.
+    format: `mp4:${resolution}:quality=4`,
   };
 
   // Notification URL is required by Coconut's schema. We previously
