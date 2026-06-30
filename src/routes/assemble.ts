@@ -260,17 +260,18 @@ function normalizeClip(
   const baseFilter = `scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2:black,fps=24`;
   const assFilter = subtitles ? `ass=${escapeAssPath(subtitles.assPath)}` : null;
   // Preset/CRF depends on whether this is now the FINAL encoder pass.
-  //   - subtitles=null: the clip is intermediate — concatClips uses
-  //     `-c copy` and the mix step also stream-copies the video, so
-  //     the current ultrafast/crf 28 stands as the output the user
-  //     sees. Keep it fast.
-  //   - subtitles=set: captions are baked in here instead of in a
-  //     downstream full-video burn pass. That burn pass used
-  //     veryfast/crf 23 — match it so captioned final-quality is
-  //     identical to the old pipeline. The +CPU cost per beat is
-  //     dwarfed by the eliminated whole-video re-encode.
-  const preset = subtitles ? "veryfast" : "ultrafast";
-  const crf = subtitles ? "23" : "28";
+  // Captions OR logo baked in here means Stage D will -c:v copy this
+  // output straight into the final mp4 — match the old burn-pass
+  // quality (veryfast/crf 23). With neither, the clip is intermediate
+  // and ultrafast/crf 28 is fine.
+  const isFinalQualityPass = !!subtitles || !!logoOverlay;
+  const preset = isFinalQualityPass ? "veryfast" : "ultrafast";
+  const crf = isFinalQualityPass ? "23" : "28";
+  // libx264 stillimage tune skips motion-search and inter-frame
+  // adaptive logic the encoder would otherwise spend cycles on for a
+  // static (image) source. Pure speedup, no quality loss for the
+  // single-frame-looped path.
+  const tuneOpts: string[] = isImage ? ["-tune", "stillimage"] : [];
 
   return ffmpegWithTimeout((cmd) => {
     if (isImage) cmd.input(src).inputOptions(["-loop", "1"]);
@@ -304,6 +305,7 @@ function normalizeClip(
           "-map", "[v]",
           "-t", String(duration),
           "-c:v", "libx264", "-preset", preset, "-crf", crf,
+          ...tuneOpts,
           // x264 memory tuning: default rc-lookahead is 40 frames held
           // resident in the encoder's reference pool — at 1080p that's
           // ~50-100 MB per ffmpeg process. Cutting to 5 still gives the
@@ -322,6 +324,7 @@ function normalizeClip(
         "-t", String(duration),
         "-vf", vf,
         "-c:v", "libx264", "-preset", preset, "-crf", crf,
+        ...tuneOpts,
         "-x264-params", "rc-lookahead=5:scenecut=0",
         "-bufsize", "1M",
         "-an", "-pix_fmt", "yuv420p",
@@ -866,6 +869,13 @@ interface AssemblyCheckpoint {
   // → falsy, which is the right default for projects that pre-date
   // the bake-in path.
   clips_baked_captions?: boolean;
+  // True when Stage B's per-beat normalizeClip pass composited the
+  // channel logo. Mirrors clips_baked_captions but for the logo overlay
+  // layer. When true, Stage D drops the logo work and stays on -c:v
+  // copy. Old checkpoints (pre-bake-logo migration) have this undefined
+  // → falsy → Stage D applies the logo overlay as before so resumed
+  // legacy projects still get a logo.
+  clips_baked_logo?: boolean;
   transcription_words?: TranscriptionWord[];
   clip_urls?: (string | null)[];
   joined_url?: string;
@@ -1003,19 +1013,19 @@ function dimsFor(aspect: string, preset: ResolutionPreset | undefined): [number,
 // the final-burn pass at the user's chosen resolution, so the intermediate
 // downscale doesn't blur text.
 
-function getAssemblyConcurrency(resolution: ResolutionPreset | undefined): number {
+function getAssemblyConcurrency(resolution: ResolutionPreset | undefined, allImages: boolean): number {
   if (ASSEMBLY_SAFE_MODE) return 1;
   // Admin's slider is a soft max — capped per resolution because each
   // libx264 process holds roughly resolution-proportional frame buffers
-  // resident, and our 4 GB Render box was OOM-killing on long projects
-  // where the slider value was higher than the host could sustain.
-  // Caps below are empirical for the current filter graph (scale+pad+
-  // overlay+ass): 1080p ≈ 400-600 MB per ffmpeg, 1440p ≈ 800 MB,
-  // 2160p ≈ 1.2-1.5 GB. Slider stays the ceiling; resolution sets the
-  // ground.
+  // resident. Image-only beats skip the input decoder pipeline and
+  // run with a much smaller working set (~half the RSS of a video
+  // transcode at the same resolution), so we double the cap for those
+  // projects.
   const slider = Math.max(1, getAssemblyBeatLimit());
   const res = resolution ?? "1080p";
-  const memCap = res === "2160p" ? 1 : res === "1440p" ? 1 : res === "1080p" ? 2 : slider;
+  const videoCap = res === "2160p" ? 1 : res === "1440p" ? 1 : res === "1080p" ? 2 : slider;
+  const imageCap = res === "2160p" ? 1 : res === "1440p" ? 2 : res === "1080p" ? 4 : slider;
+  const memCap = allImages ? imageCap : videoCap;
   return Math.min(slider, memCap);
 }
 
@@ -1696,15 +1706,35 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
         cachedBeatKeys = new Set();
       }
 
-      // Logo handling is now done entirely at Stage D (alongside
-      // BGM) regardless of admin flags. Stage B no longer bakes
-      // per-beat and Stage F no longer applies overlay — they both
-      // leave the video clean and Stage D's mix pass composites the
-      // logo as part of its single full-video re-encode. Trade-off:
-      // Stage D is no longer -c:v copy (slower); benefit: one
-      // consistent place to reason about logo regardless of
-      // useCoconut / useFinalBurn / assembly_beats_at_final_res.
-      const stageBLogoOverlay: LogoOverlay | null = null;
+      // Logo overlay: download here and composite per-beat in normalizeClip
+      // so Stage D can stay on -c:v copy (no full-video re-encode just
+      // to add a watermark). Download failure is non-fatal — Stage B
+      // continues without the overlay and Stage D's existing logo-
+      // download path runs as a fallback.
+      let stageBLogoOverlay: LogoOverlay | null = null;
+      if (logoUrl) {
+        try {
+          await progress("Downloading channel logo…");
+          const logoPath = path.join(tmpDir, "logo");
+          await downloadFile(logoUrl, logoPath, signal);
+          stageBLogoOverlay = {
+            logoPath,
+            sizePct: typeof logoSize === "number" ? logoSize : 0.1,
+            xPct:    typeof logoX === "number"    ? logoX    : 0.85,
+            yPct:    typeof logoY === "number"    ? logoY    : 0.05,
+          };
+          console.log(`[assemble] ${projectId}: Stage B logo overlay configured (size=${stageBLogoOverlay.sizePct}, pos=${stageBLogoOverlay.xPct},${stageBLogoOverlay.yPct})`);
+        } catch (e) {
+          if (signal.aborted) throw e;
+          console.warn(`[assemble] ${projectId}: logo download failed in Stage B, deferring to Stage D fallback:`, e instanceof Error ? e.message : e);
+        }
+      }
+      // Persist clips_baked_logo alongside captions before the worker
+      // pool launches, mirroring the crash-safety reasoning around the
+      // earlier persistCheckpoint() — if a Stop arrives during the
+      // first encodes, the checkpoint already reflects what was baked.
+      checkpoint.clips_baked_logo = !!stageBLogoOverlay;
+      await persistCheckpoint();
 
       // Worker-pool over the beat list. Each worker pulls the next
       // un-claimed index, processes it independently, then loops back
@@ -1712,10 +1742,9 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
       // beat position so there are no inter-worker write conflicts.
       // STOPPED_MARKER propagates via firstError so all in-flight
       // workers bail at the next iteration.
-      // Keep this conservative so long-form projects don't overload the
-      // worker with too many simultaneous ffmpeg encodes and temp-file writes.
-      const beatLimit = getAssemblyConcurrency(resolution);
-      console.log(`[assemble] ${projectId}: beat concurrency=${beatLimit} (requested=${getAssemblyBeatLimit()}, beats=${beats.length}, resolution=${resolution ?? "1080p"})`);
+      const allImages = beats.every((b) => !b.video_url && !!b.image_url);
+      const beatLimit = getAssemblyConcurrency(resolution, allImages);
+      console.log(`[assemble] ${projectId}: beat concurrency=${beatLimit} (requested=${getAssemblyBeatLimit()}, beats=${beats.length}, resolution=${resolution ?? "1080p"}, allImages=${allImages})`);
       let nextIdx = 0;
       let completed = 0;
       let firstError: Error | null = null;
@@ -1745,10 +1774,13 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
         // instead of re-encoding; on miss, the upload below writes
         // to this same key so the next run picks it up.
         const sourceKey = beat.video_url ?? beat.image_url ?? "no-src";
-        // Stage B no longer bakes logo (moved to Stage D), so per-beat
-        // encode hash doesn't need logo opts. Kept as "nologo" so
-        // existing cached beats (encoded without logo) still hit.
-        const logoKey = "nologo";
+        // Logo is baked per-beat in Stage B again — beats with vs
+        // without an overlay produce different output and must hash to
+        // different cache slots. Existing "nologo" cached beats stay
+        // valid for projects without a logo.
+        const logoKey = stageBLogoOverlay
+          ? `${stageBLogoOverlay.sizePct}@${stageBLogoOverlay.xPct},${stageBLogoOverlay.yPct}`
+          : "nologo";
         const subsKey = (captionsEnabled && baseCaptionSegs.length > 0)
           ? hashString(JSON.stringify(sliceSegmentsForBeat(baseCaptionSegs, cumulativeStarts[i], durations[i])) + `|${captionsStyle}|${captionsSize}|${captionsPosition}|${h}`)
           : "nosubs";
@@ -1826,26 +1858,48 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
           // latency outpaces encode throughput.
           await awaitUploadSlot();
           const uploadPromise = (async () => {
-            try {
-              // Upload to the content-addressed cache key (computed at
-              // the top of processOne). Survives checkpoint clears and
-              // is reused by future assemblies whose beats hash to the
-              // same value — only the inputs that affect the encode
-              // are in the hash, so re-renders that don't change a
-              // given beat skip its work entirely.
-              const clipUrl = await uploadFile(beatCacheKey, clipPath, "video/mp4");
-              checkpoint.clip_urls![i] = clipUrl;
-              // Mark the checkpoint dirty instead of persisting now.
-              // A debounced flush within PERSIST_DEBOUNCE_MS will
-              // coalesce this with other clip-completion writes into
-              // one DB round-trip. See the persist machinery above
-              // Stage B for design notes.
-              markPersistDirty();
-            } catch (uploadErr) {
-              console.warn(`[assemble] beat ${beat.beat_number}: clip checkpoint upload failed:`, uploadErr);
-              // Not fatal — we just lose the resume guarantee for
-              // this clip. Worker has already returned by this point.
+            // Upload to the content-addressed cache key (computed at
+            // the top of processOne). Survives checkpoint clears and
+            // is reused by future assemblies whose beats hash to the
+            // same value — only the inputs that affect the encode
+            // are in the hash, so re-renders that don't change a
+            // given beat skip its work entirely.
+            //
+            // Retry up to 2 extra times on transient network errors
+            // (Cloudflare TLS read timeouts are the common one). A
+            // failed upload only costs us the resume-cache entry —
+            // the local mp4 is still concat-included — so the worst
+            // case is one beat re-encoded on a future Resume. But
+            // when 700+ beats run, 1-2 transient blips per run are
+            // normal, and recovering them keeps the cache complete.
+            const MAX_UPLOAD_ATTEMPTS = 3;
+            let lastErr: unknown = null;
+            for (let attempt = 1; attempt <= MAX_UPLOAD_ATTEMPTS; attempt++) {
+              try {
+                const clipUrl = await uploadFile(beatCacheKey, clipPath, "video/mp4");
+                checkpoint.clip_urls![i] = clipUrl;
+                // Mark the checkpoint dirty instead of persisting now.
+                // A debounced flush within PERSIST_DEBOUNCE_MS will
+                // coalesce this with other clip-completion writes into
+                // one DB round-trip. See the persist machinery above
+                // Stage B for design notes.
+                markPersistDirty();
+                if (attempt > 1) {
+                  console.log(`[assemble] beat ${beat.beat_number}: upload succeeded on attempt ${attempt}`);
+                }
+                return;
+              } catch (uploadErr) {
+                lastErr = uploadErr;
+                if (attempt < MAX_UPLOAD_ATTEMPTS) {
+                  const backoffMs = 500 * attempt;
+                  console.warn(`[assemble] beat ${beat.beat_number}: upload attempt ${attempt} failed (${uploadErr instanceof Error ? uploadErr.message : uploadErr}); retrying in ${backoffMs}ms`);
+                  await new Promise((r) => setTimeout(r, backoffMs));
+                }
+              }
             }
+            console.warn(`[assemble] beat ${beat.beat_number}: clip checkpoint upload failed after ${MAX_UPLOAD_ATTEMPTS} attempts:`, lastErr);
+            // Not fatal — we just lose the resume guarantee for
+            // this clip. Worker has already returned by this point.
           })();
           pendingClipUploads.add(uploadPromise);
           void uploadPromise.finally(() => { pendingClipUploads.delete(uploadPromise); });
@@ -2113,12 +2167,13 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
         }
       }
 
-      // Logo download — sibling of BGM, both fetched here so the mix
-      // step has everything it needs. Failure isn't fatal; we just
-      // continue without the overlay so the user still gets a
-      // finished video.
+      // Logo download — fallback path. When Stage B already baked
+      // the overlay per-beat (clips_baked_logo=true on this checkpoint),
+      // skip the download AND skip handing an overlay to mixAudio so it
+      // stays on -c:v copy. Old checkpoints (no flag) or failed Stage B
+      // logo downloads still get the overlay applied here.
       let stageDLogoOverlay: LogoOverlay | null = null;
-      if (logoUrl) {
+      if (logoUrl && !checkpoint.clips_baked_logo) {
         await checkStop();
         await progress("Downloading channel logo…");
         const logoPath = path.join(tmpDir, "logo");
