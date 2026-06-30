@@ -2200,7 +2200,7 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
       // gated behind the "COCONUT_API_KEY missing" check above.
       await checkStop();
       const needsUpscale = w !== finalW || h !== finalH;
-      await progress(needsUpscale ? "Applying final burn (upscale + captions/logo)…" : "Applying final burn (captions/logo)…");
+      await progress("Burning captions…");
       const assPath = path.join(tmpDir, "final_captions.ass");
       const hasCaptions = captionsEnabled && baseCaptionSegs.length > 0;
       if (hasCaptions) {
