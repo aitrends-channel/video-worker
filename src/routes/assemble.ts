@@ -1207,6 +1207,17 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
     // (default), intermediate dims === final dims so quality is unchanged.
     const preferFinalBurn = beats.length > FINAL_BURN_THRESHOLD || ASSEMBLY_SAFE_MODE;
     const useFinalBurn = preferFinalBurn && (captionsEnabled || !!logoUrl);
+    // Decided here (not at Stage F) because the Stage B logo gate
+    // below needs to know whether the final-burn pass will be
+    // outsourced. When Coconut handles Stage F, we bake the logo
+    // per-beat in Stage B instead of deferring it to Coconut —
+    // simpler Coconut spec (no watermark) + one less thing that
+    // can break upstream. When the local fallback runs Stage F or
+    // useFinalBurn is false, the existing per-beat-bake path
+    // handles it. Logo in Stage F is now only used when Coconut
+    // is unavailable AND captions are enabled (single-pass final
+    // burn covers both).
+    const useCoconut = !!process.env.COCONUT_API_KEY && useFinalBurn && (captionsEnabled || !!logoUrl);
     const [w, h] = intermediateDimsFor(aspectRatio, resolution, useFinalBurn);
     if (w !== finalW || h !== finalH) {
       console.log(`[assemble] ${projectId}: intermediate dims=${w}x${h} (final ${finalW}x${finalH}); final-burn pass will upscale`);
@@ -1601,7 +1612,15 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
         const logoPath = path.join(tmpDir, "logo");
         try {
           await downloadFile(logoUrl, logoPath, signal);
-          if (useFinalBurn) {
+          // Bake into Stage F (one full-video pass) only when the
+          // LOCAL final-burn will run anyway — i.e. captions are
+          // enabled AND Coconut isn't taking over. In every other
+          // case (Coconut, or no captions), bake per-beat in Stage B.
+          // The per-beat overlay rides along on an encode that's
+          // happening anyway, so it's effectively free CPU. Coconut's
+          // spec becomes simpler too — fewer params, fewer failure
+          // modes.
+          if (useFinalBurn && !useCoconut) {
             finalLogoPath = logoPath;
           } else {
             stageBLogoOverlay = {
@@ -2091,7 +2110,10 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
     // Captions are written at finalH so font sizing matches the
     // user's chosen output resolution, not the intermediate.
     let finalPath = outputPath;
-    const useCoconut = !!process.env.COCONUT_API_KEY && useFinalBurn && (captionsEnabled || finalLogoPath);
+    // useCoconut was decided up at the mode-selection block so the
+    // Stage B logo gate could read it. Re-evaluating here would
+    // produce a different result (finalLogoPath was nulled out when
+    // useCoconut was true), so we just reuse the earlier value.
     // When Coconut fails partway, we still want the assembly to
     // complete via the local burn path rather than aborting the
     // whole run. Track the failure here so the else-if below picks
@@ -2136,7 +2158,12 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
           outputWidth: finalW,
           outputHeight: finalH,
           captionsAssUrl,
-          logoUrl: logoUrl ?? null,
+          // Logo is already baked into the per-beat Stage B encodes
+          // when useCoconut=true (see the Stage B logo gate). Sending
+          // null here keeps the Coconut spec simpler — Coconut just
+          // scales + burns captions, no watermark step that could
+          // fail upstream.
+          logoUrl: null,
         });
         console.log(`[assemble] ${projectId}: coconut job ${job.id} submitted`);
         await progress("Finalizing on Coconut…");
