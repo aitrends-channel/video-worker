@@ -988,6 +988,11 @@ function intermediateDimsFor(
   preset: ResolutionPreset | undefined,
   useFinalBurn: boolean,
 ): [number, number] {
+  // Admin override: when assembly_beats_at_final_res is on, the
+  // per-beat encode runs at the user's chosen output resolution
+  // regardless of whether Stage F will run. Lets the admin trade
+  // Stage B encode time for a simpler/no Stage F upscale.
+  if (getAssemblyBeatsAtFinalRes()) return dimsFor(aspect, preset);
   if (!useFinalBurn) return dimsFor(aspect, preset);
   const cap: ResolutionPreset = "720p";
   const rank: Record<ResolutionPreset, number> = { "720p": 0, "1080p": 1, "1440p": 2, "2160p": 3 };
@@ -2443,9 +2448,19 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
 //                           consumed inside runAssembly via getAssemblyBeatLimit()
 let assemblyProjectLimit = 1;
 let assemblyBeatLimit = 1;
+// Admin-tunable Assemble flag. Sourced from
+// product_config.batched_processes alongside the numeric knobs.
+// When true, Stage B encodes at the user's final resolution and
+// Coconut only burns captions; when false (default), Stage B uses
+// 720p intermediate and Coconut handles the upscale.
+let assemblyBeatsAtFinalRes = false;
 
 export function getAssemblyBeatLimit(): number {
   return assemblyBeatLimit;
+}
+
+export function getAssemblyBeatsAtFinalRes(): boolean {
+  return assemblyBeatsAtFinalRes;
 }
 
 async function refreshAssemblyConcurrency(): Promise<void> {
@@ -2455,7 +2470,7 @@ async function refreshAssemblyConcurrency(): Promise<void> {
       .select("batched_processes")
       .eq("service", "_global")
       .single();
-    const cfg = (data as { batched_processes?: { assembly_projects?: unknown; assembly_beats?: unknown } } | null)?.batched_processes;
+    const cfg = (data as { batched_processes?: { assembly_projects?: unknown; assembly_beats?: unknown; assembly_beats_at_final_res?: unknown } } | null)?.batched_processes;
     const projRaw = cfg?.assembly_projects;
     const beatRaw = cfg?.assembly_beats;
     const proj = typeof projRaw === "number" ? projRaw : Number(projRaw);
@@ -2467,6 +2482,11 @@ async function refreshAssemblyConcurrency(): Promise<void> {
     if (Number.isInteger(beat) && beat >= 1 && beat <= 10 && beat !== assemblyBeatLimit) {
       console.log(`[assembly-queue] beat limit changed: ${assemblyBeatLimit} → ${beat}`);
       assemblyBeatLimit = beat;
+    }
+    const finalResRaw = cfg?.assembly_beats_at_final_res;
+    if (typeof finalResRaw === "boolean" && finalResRaw !== assemblyBeatsAtFinalRes) {
+      console.log(`[assembly-queue] beats-at-final-res changed: ${assemblyBeatsAtFinalRes} → ${finalResRaw}`);
+      assemblyBeatsAtFinalRes = finalResRaw;
     }
   } catch (err) {
     console.warn("[assembly-queue] Failed to refresh concurrency from product_config:", err instanceof Error ? err.message : err);
