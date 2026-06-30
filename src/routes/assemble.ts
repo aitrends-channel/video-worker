@@ -954,20 +954,15 @@ function intermediateDimsFor(
   return dimsFor(aspect, effective);
 }
 
-function getAssemblyConcurrency(beatCount: number): number {
+function getAssemblyConcurrency(): number {
   if (ASSEMBLY_SAFE_MODE) return 1;
-  const requested = Math.max(1, getAssemblyBeatLimit());
-  // For very long projects (>80 beats) keep the strict cap of 2 —
-  // file-descriptor and disk-IO pressure compounds over hundreds of
-  // beats and a runaway concurrency choice can hard-fail late in
-  // the run. Still respects requested when admin dials it lower.
-  if (beatCount > 80) return Math.min(2, requested);
-  // Shorter projects can safely use up to 4 parallel. Each Stage B
-  // encode at intermediate 720p holds ~150-200 MB; 4 in flight on
-  // Render Standard (2 GB) leaves comfortable headroom. The cap
-  // here is now meaningful — admin can dial 1..4 and feel the
-  // difference. Above 4 returns 4 (the safety ceiling stays).
-  return Math.min(4, requested);
+  // Admin's slider value is honored exactly (validated 1..10 at the
+  // refresh layer). No hidden ceiling here — if the operator
+  // explicitly dialed 8, they want 8. The previous beat-count-aware
+  // caps (2 for >80 beats, 4 otherwise) over-protected for
+  // Render-Standard memory limits and ignored local/larger-tier
+  // deploys where higher fan-out is safe.
+  return Math.max(1, getAssemblyBeatLimit());
 }
 
 async function runAssembly(opts: AssembleOptions): Promise<void> {
@@ -1588,7 +1583,7 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
       // workers bail at the next iteration.
       // Keep this conservative so long-form projects don't overload the
       // worker with too many simultaneous ffmpeg encodes and temp-file writes.
-      const beatLimit = getAssemblyConcurrency(beats.length);
+      const beatLimit = getAssemblyConcurrency();
       console.log(`[assemble] ${projectId}: beat concurrency=${beatLimit} (requested=${getAssemblyBeatLimit()}, beats=${beats.length})`);
       let nextIdx = 0;
       let completed = 0;
