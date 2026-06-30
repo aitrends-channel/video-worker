@@ -1020,8 +1020,12 @@ function getAssemblyConcurrency(resolution: ResolutionPreset | undefined, allIma
   // projects.
   const slider = Math.max(1, getAssemblyBeatLimit());
   const res = resolution ?? "1080p";
-  const videoCap = res === "2160p" ? 1 : res === "1440p" ? 1 : res === "1080p" ? 2 : slider;
-  const imageCap = res === "2160p" ? 1 : res === "1440p" ? 2 : res === "1080p" ? 4 : slider;
+  // Floor at 2 for every resolution including 2160p so even 4 K
+  // projects keep some parallelism. Risk: 2x 4K libx264 ≈ 2-3 GB
+  // RSS, close to the 4 GB Render ceiling. Accept the tighter
+  // headroom in exchange for ~halving wall-clock on 4K runs.
+  const videoCap = res === "2160p" ? 2 : res === "1440p" ? 1 : res === "1080p" ? 2 : slider;
+  const imageCap = res === "2160p" ? 2 : res === "1440p" ? 2 : res === "1080p" ? 4 : slider;
   const memCap = allImages ? imageCap : videoCap;
   return Math.min(slider, memCap);
 }
