@@ -1,5 +1,10 @@
 import fs from "fs";
-import { S3Client, PutObjectCommand, DeleteObjectsCommand } from "@aws-sdk/client-s3";
+import os from "os";
+import path from "path";
+import { Readable } from "stream";
+import { pipeline } from "stream/promises";
+import { randomUUID } from "crypto";
+import { S3Client, PutObjectCommand, DeleteObjectsCommand, ListObjectsV2Command } from "@aws-sdk/client-s3";
 import { supabase } from "./supabase.js";
 
 // user_id → folder-name cache. The worker uploads on behalf of users
@@ -92,11 +97,24 @@ export async function uploadFile(storagePath: string, filePath: string, contentT
   return `${PUBLIC_URL}/${storagePath}`;
 }
 
-export async function uploadFromUrl(path: string, url: string, contentType: string): Promise<string> {
+export async function uploadFromUrl(storagePath: string, url: string, contentType: string): Promise<string> {
+  // Stream the source URL straight to a temp file, then stream-upload to
+  // R2 via uploadFile. The previous implementation buffered the entire
+  // response into an ArrayBuffer and then copied it into a Node Buffer —
+  // a 50-500 MB KIE video sat in process RSS twice, and with concurrent
+  // KIE beats finishing in parallel that was the dominant memory spike
+  // on the Render box. Streaming caps the in-flight footprint at the
+  // chunk size that pipeline carries through (≈64 KB).
   const res = await fetch(url);
-  if (!res.ok) throw new Error(`Failed to download ${url}`);
-  const buffer = await res.arrayBuffer();
-  return uploadBuffer(path, buffer, contentType);
+  if (!res.ok) throw new Error(`Failed to download ${url}: ${res.status}`);
+  if (!res.body) throw new Error(`No response body for ${url}`);
+  const tmpPath = path.join(os.tmpdir(), `r2-upload-${randomUUID()}.bin`);
+  try {
+    await pipeline(Readable.fromWeb(res.body), fs.createWriteStream(tmpPath));
+    return await uploadFile(storagePath, tmpPath, contentType);
+  } finally {
+    try { fs.unlinkSync(tmpPath); } catch { /* ignore */ }
+  }
 }
 
 // Best-effort delete of a single object by R2 key. Mirrors the engine's
@@ -109,6 +127,28 @@ export async function deleteObject(key: string): Promise<void> {
     Bucket: BUCKET,
     Delete: { Objects: [{ Key: key }], Quiet: true },
   }));
+}
+
+// List all object keys under a prefix. Used by the assembly worker to
+// pre-fetch the set of cached beat-encodes in one paginated bucket scan
+// instead of HEAD-ing the public URL per beat (293 round-trips on a
+// long project, vs ~1-3 list calls).
+export async function listKeysWithPrefix(prefix: string): Promise<Set<string>> {
+  if (!BUCKET) return new Set();
+  const keys = new Set<string>();
+  let continuationToken: string | undefined;
+  do {
+    const res = await r2.send(new ListObjectsV2Command({
+      Bucket: BUCKET,
+      Prefix: prefix,
+      ContinuationToken: continuationToken,
+    }));
+    for (const obj of res.Contents ?? []) {
+      if (obj.Key) keys.add(obj.Key);
+    }
+    continuationToken = res.IsTruncated ? res.NextContinuationToken : undefined;
+  } while (continuationToken);
+  return keys;
 }
 
 // Convert a R2 public URL back to its bucket key. Returns null when the

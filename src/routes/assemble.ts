@@ -3,12 +3,13 @@ import { Readable } from "stream";
 import { pipeline } from "stream/promises";
 import { type Express, type Request, type Response } from "express";
 import { supabase } from "../lib/supabase.js";
-import { uploadFile, userFolderForId } from "../lib/storage.js";
+import { uploadFile, userFolderForId, listKeysWithPrefix } from "../lib/storage.js";
 import { redis } from "../lib/queue.js";
 import { logProjectCost } from "../lib/costs.js";
 import Anthropic from "@anthropic-ai/sdk";
 import { getAnthropicClient } from "../lib/anthropic.js";
 import fs from "fs";
+import { openAsBlob } from "node:fs";
 import path from "path";
 import os from "os";
 import { createHash } from "crypto";
@@ -122,29 +123,6 @@ async function r2ObjectExists(publicUrl: string): Promise<boolean> {
   }
 }
 
-// Quick stream-layout check on a downloaded beat source. Catches the
-// AI-video-with-cover-art-thumbnail class of input that has multiple
-// video streams or an attached_pic, which the mp4 muxer would later
-// choke on if `-map 0:v` matched all of them. Returns null when the
-// probe itself fails so the caller doesn't hard-fail on a transient
-// ffprobe error — better to attempt the encode and let normalizeClip
-// (which uses an explicit [0:v:0] selector) handle it.
-interface SourceProbe { videoStreams: number; hasAttachedPic: boolean; }
-function probeSource(filePath: string): Promise<SourceProbe | null> {
-  return new Promise((resolve) => {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    ffmpeg.ffprobe(filePath, (err: Error, meta: any) => {
-      if (err) { resolve(null); return; }
-      const streams = Array.isArray(meta?.streams) ? meta.streams : [];
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const videos = streams.filter((s: any) => s?.codec_type === "video");
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const hasAttachedPic = videos.some((s: any) => s?.disposition?.attached_pic === 1);
-      resolve({ videoStreams: videos.length, hasAttachedPic });
-    });
-  });
-}
-
 // ── Memory + stage metrics ────────────────────────────────────────────────────
 //
 // Track RSS (resident set size — what Render's OOM killer actually
@@ -225,7 +203,18 @@ function ffmpegWithTimeout(
       reject(new Error(STOPPED_MARKER));
       return;
     }
-    const cmd = build(ffmpeg().addOption("-threads", String(threadCount)).addOption("-filter_threads", String(threadCount)));
+    // -loglevel error: ffmpeg buffers all stderr/stdout until the
+    // subprocess exits. Default 'info' emits ~1 progress line per
+    // second per encode — small per beat, but cumulative across a
+    // 138+ beat run. 'error' silences progress while still surfacing
+    // genuine failures via the .on('error') callback below.
+    const cmd = build(
+      ffmpeg()
+        .addOption("-hide_banner")
+        .addOption("-loglevel", "error")
+        .addOption("-threads", String(threadCount))
+        .addOption("-filter_threads", String(threadCount)),
+    );
     let settled = false;
     const settle = (fn: () => void) => {
       if (!settled) { settled = true; clearTimeout(timer); signal?.removeEventListener("abort", onAbort); fn(); }
@@ -315,6 +304,16 @@ function normalizeClip(
           "-map", "[v]",
           "-t", String(duration),
           "-c:v", "libx264", "-preset", preset, "-crf", crf,
+          // x264 memory tuning: default rc-lookahead is 40 frames held
+          // resident in the encoder's reference pool — at 1080p that's
+          // ~50-100 MB per ffmpeg process. Cutting to 5 still gives the
+          // rate controller enough lookahead for the short per-beat
+          // segments we encode here. scenecut=0 disables I-frame
+          // insertion-on-scene-change (we re-encode anyway, so the
+          // adaptive logic just adds buffer pressure). -bufsize caps
+          // the rate-control buffer at 1 MB.
+          "-x264-params", "rc-lookahead=5:scenecut=0",
+          "-bufsize", "1M",
           "-an", "-pix_fmt", "yuv420p",
         ]);
     } else {
@@ -323,6 +322,8 @@ function normalizeClip(
         "-t", String(duration),
         "-vf", vf,
         "-c:v", "libx264", "-preset", preset, "-crf", crf,
+        "-x264-params", "rc-lookahead=5:scenecut=0",
+        "-bufsize", "1M",
         "-an", "-pix_fmt", "yuv420p",
       ]);
     }
@@ -524,14 +525,18 @@ interface TranscriptionWord {
 }
 
 async function transcribeAudio(audioPath: string, apiKey: string, signal?: AbortSignal): Promise<TranscriptionWord[]> {
-  const audioBytes = fs.readFileSync(audioPath);
+  // openAsBlob returns a Blob whose .stream() reads from disk on demand —
+  // the bytes never sit in JS heap. Previously fs.readFileSync loaded the
+  // entire voiceover (~30 MB for long projects) into memory and a Blob
+  // copy retained it across all 4 retry attempts.
+  const audioBlob = await openAsBlob(audioPath, { type: "audio/mpeg" });
   const MAX_ATTEMPTS = 4;
   let lastError = "";
   try {
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       if (signal?.aborted) throw new Error(STOPPED_MARKER);
       const formData = new FormData();
-      formData.append("file", new Blob([audioBytes], { type: "audio/mpeg" }), "voiceover.mp3");
+      formData.append("file", audioBlob, "voiceover.mp3");
       formData.append("model_id", "scribe_v1");
       formData.append("timestamps_granularity", "word");
       formData.append("tag_audio_events", "false");
@@ -998,15 +1003,20 @@ function dimsFor(aspect: string, preset: ResolutionPreset | undefined): [number,
 // the final-burn pass at the user's chosen resolution, so the intermediate
 // downscale doesn't blur text.
 
-function getAssemblyConcurrency(): number {
+function getAssemblyConcurrency(resolution: ResolutionPreset | undefined): number {
   if (ASSEMBLY_SAFE_MODE) return 1;
-  // Admin's slider value is honored exactly (validated 1..10 at the
-  // refresh layer). No hidden ceiling here — if the operator
-  // explicitly dialed 8, they want 8. The previous beat-count-aware
-  // caps (2 for >80 beats, 4 otherwise) over-protected for
-  // Render-Standard memory limits and ignored local/larger-tier
-  // deploys where higher fan-out is safe.
-  return Math.max(1, getAssemblyBeatLimit());
+  // Admin's slider is a soft max — capped per resolution because each
+  // libx264 process holds roughly resolution-proportional frame buffers
+  // resident, and our 4 GB Render box was OOM-killing on long projects
+  // where the slider value was higher than the host could sustain.
+  // Caps below are empirical for the current filter graph (scale+pad+
+  // overlay+ass): 1080p ≈ 400-600 MB per ffmpeg, 1440p ≈ 800 MB,
+  // 2160p ≈ 1.2-1.5 GB. Slider stays the ceiling; resolution sets the
+  // ground.
+  const slider = Math.max(1, getAssemblyBeatLimit());
+  const res = resolution ?? "1080p";
+  const memCap = res === "2160p" ? 1 : res === "1440p" ? 1 : res === "1080p" ? 2 : slider;
+  return Math.min(slider, memCap);
 }
 
 async function runAssembly(opts: AssembleOptions): Promise<void> {
@@ -1234,6 +1244,14 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
     let totalDuration = 0;
     let durations: number[] = [];
     let transcriptionWords: TranscriptionWord[] = [];
+    // Background audio assembly promise. Used by the canUseRemoteAudioConcat
+    // path when captions are off — durations are known immediately from
+    // voiceover_duration_ms, so we kick off the audio concat ffmpeg in
+    // the background and let Stage B's video encodes begin in parallel.
+    // For captions-on or non-fast paths this stays resolved synchronously
+    // (no behavior change). Awaited before Stage D's mix step.
+    let audioReadyPromise: Promise<void> = Promise.resolve();
+    let audioRunsInBackground = false;
 
     if (perBeatMode) {
       // ── PER-BEAT PATH ────────────────────────────────────────────────
@@ -1279,15 +1297,54 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
         totalDuration = durations.reduce((sum, d) => sum + d, 0);
         console.log(`[assemble] ${projectId}: using remote beat URLs for audio concat (sum=${totalDuration.toFixed(2)}s, trim=off)`);
 
-        await checkStop();
-        await progress("Joining per-beat audio…");
         const audioListPath = path.join(tmpDir, "audio_concat.txt");
         fs.writeFileSync(audioListPath, beats.map((beat) => escapeConcatListEntry(beat.voiceover_url!)).join("\n"));
-        try {
-          await concatClips(audioListPath, voiceoverPath, signal);
+
+        if (!captionsEnabled) {
+          // Captions OFF: durations are already set from voiceover_duration_ms
+          // and Stage B doesn't need voiceoverPath. Launch the audio concat
+          // ffmpeg in the background so Stage B's video encodes can begin in
+          // parallel with the (often 30-90s) concat job. Awaited just before
+          // Stage D's mix.
+          await checkStop();
+          await progress("Joining per-beat audio in background…");
+          audioRunsInBackground = true;
           didRemoteAudioConcat = true;
-        } catch (e) {
-          console.warn(`[assemble] ${projectId}: remote audio concat failed, falling back to local download/concat:`, e instanceof Error ? e.message : e);
+          audioReadyPromise = (async () => {
+            try {
+              await concatClips(audioListPath, voiceoverPath, signal);
+            } catch (e) {
+              if (signal.aborted) throw e;
+              console.warn(`[assemble] ${projectId}: background remote audio concat failed, falling back to local download/concat:`, e instanceof Error ? e.message : e);
+              // Inline minimal local fallback — durations are already
+              // correct (from voiceover_duration_ms); we just need to
+              // produce voiceoverPath from a serially-downloaded copy.
+              const localPaths: string[] = [];
+              for (let i = 0; i < beats.length; i++) {
+                if (signal.aborted) throw new Error(STOPPED_MARKER);
+                const localPath = path.join(tmpDir, `audio_raw_${String(i).padStart(3, "0")}.mp3`);
+                await downloadFile(beats[i].voiceover_url!, localPath, signal);
+                localPaths.push(localPath);
+              }
+              const localListPath = path.join(tmpDir, "audio_local_concat.txt");
+              fs.writeFileSync(localListPath, localPaths.map((p) => escapeConcatListEntry(p)).join("\n"));
+              await concatClips(localListPath, voiceoverPath, signal);
+              for (const p of localPaths) { try { fs.unlinkSync(p); } catch { /* ignore */ } }
+            }
+          })();
+        } else {
+          // Captions ON: keep serial behavior. STT runs on voiceoverPath
+          // right after this, and Stage B's per-beat caption slice depends
+          // on its result — parallelizing here would force a Stage B await
+          // anyway, eliminating the win and complicating the code.
+          await checkStop();
+          await progress("Joining per-beat audio…");
+          try {
+            await concatClips(audioListPath, voiceoverPath, signal);
+            didRemoteAudioConcat = true;
+          } catch (e) {
+            console.warn(`[assemble] ${projectId}: remote audio concat failed, falling back to local download/concat:`, e instanceof Error ? e.message : e);
+          }
         }
       }
       if (!didRemoteAudioConcat) {
@@ -1526,6 +1583,14 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
       }
       console.log(`[assemble] ${projectId}: prepared ${baseCaptionSegs.length} caption segments to bake into per-beat clips`);
     }
+    // transcriptionWords is no longer referenced past this point — the
+    // captions block above consumed it, alignBeats already ran (legacy
+    // path), and Stage B's per-beat slice operates on baseCaptionSegs.
+    // Release now instead of waiting until Stage D so V8 can reclaim the
+    // word array (can be ~1 MB for a 30-minute project) during the long
+    // Stage B encode loop. The checkpoint copy stays in the DB-persisted
+    // object for Resume.
+    transcriptionWords = [];
 
     // Cumulative start time of each beat in the master timeline,
     // computed once from durations[] so the per-beat slicer doesn't
@@ -1574,6 +1639,18 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
       // 100-clip project's persist count from ~100 round-trips down
       // to ~3-5. Stage B's end calls flushPersist() to drain.
       const pendingClipUploads = new Set<Promise<void>>();
+      // R2 uploads can fall behind the encoder pool on long projects —
+      // each in-flight S3 PutObject holds a file stream + SDK chunk
+      // buffers (~5 MB each). Letting 50+ accumulate stacks hundreds of
+      // MB on top of the ffmpeg pool's residence, contributing to OOM.
+      // Cap in-flight uploads; the worker awaits one to drain before
+      // queueing the next.
+      const MAX_PENDING_CLIP_UPLOADS = 4;
+      const awaitUploadSlot = async (): Promise<void> => {
+        while (pendingClipUploads.size >= MAX_PENDING_CLIP_UPLOADS) {
+          await Promise.race(pendingClipUploads);
+        }
+      };
       let persistDirty = false;
       let persistInFlight: Promise<void> = Promise.resolve();
       let persistDebounceTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1603,6 +1680,22 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
       };
       persistHeartbeatTimer = setInterval(() => { void flushPersist(); }, PERSIST_HEARTBEAT_MS);
 
+      // Pre-fetch the user's beat-cache index in one paginated bucket
+      // scan. Previously each beat fired its own HEAD against the public
+      // R2 URL — 293 round-trips on a fresh long project, almost all of
+      // them misses on cold-cache runs. One ListObjectsV2 (with cursor
+      // pagination) returns every cached beat key for this user; the
+      // per-beat check then becomes an in-memory Set lookup.
+      const beatCachePrefix = `${userFolder}/_beat_cache/`;
+      let cachedBeatKeys: Set<string>;
+      try {
+        cachedBeatKeys = await listKeysWithPrefix(beatCachePrefix);
+        console.log(`[assemble] ${projectId}: prefetched ${cachedBeatKeys.size} cached beat keys under ${beatCachePrefix}`);
+      } catch (e) {
+        console.warn(`[assemble] ${projectId}: beat-cache prefetch failed, falling back to per-beat HEAD checks:`, e instanceof Error ? e.message : e);
+        cachedBeatKeys = new Set();
+      }
+
       // Logo handling is now done entirely at Stage D (alongside
       // BGM) regardless of admin flags. Stage B no longer bakes
       // per-beat and Stage F no longer applies overlay — they both
@@ -1621,8 +1714,8 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
       // workers bail at the next iteration.
       // Keep this conservative so long-form projects don't overload the
       // worker with too many simultaneous ffmpeg encodes and temp-file writes.
-      const beatLimit = getAssemblyConcurrency();
-      console.log(`[assemble] ${projectId}: beat concurrency=${beatLimit} (requested=${getAssemblyBeatLimit()}, beats=${beats.length})`);
+      const beatLimit = getAssemblyConcurrency(resolution);
+      console.log(`[assemble] ${projectId}: beat concurrency=${beatLimit} (requested=${getAssemblyBeatLimit()}, beats=${beats.length}, resolution=${resolution ?? "1080p"})`);
       let nextIdx = 0;
       let completed = 0;
       let firstError: Error | null = null;
@@ -1663,7 +1756,14 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
         const beatCacheHash = hashString(`${sourceKey}|${durations[i].toFixed(3)}|${w}x${h}|${encPreset}|${logoKey}|${subsKey}`);
         const beatCacheKey = `${userFolder}/_beat_cache/${beatCacheHash}.mp4`;
         const beatCacheUrl = `${(process.env.R2_PUBLIC_URL ?? "").replace(/\/$/, "")}/${beatCacheKey}`;
-        if (await r2ObjectExists(beatCacheUrl)) {
+        // Cache lookup: prefer the prefetched Set (one bucket-list at
+        // Stage B start) over a per-beat HEAD. The Set might be empty
+        // if the prefetch failed; in that case fall back to a HEAD so
+        // we still get cache hits, just slower.
+        const cacheHit = cachedBeatKeys.size > 0
+          ? cachedBeatKeys.has(beatCacheKey)
+          : await r2ObjectExists(beatCacheUrl);
+        if (cacheHit) {
           try {
             await downloadFile(beatCacheUrl, clipPath, signal);
             clipPaths[i] = clipPath;
@@ -1698,15 +1798,10 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
             const src = path.join(tmpDir, `src_${i}.${ext}`);
             console.log(`[assemble] beat ${beat.beat_number}: downloading video…`);
             await downloadFile(beat.video_url, src, signal);
-            // Probe layout before encoding. Multi-video-stream sources
-            // (including the AI-video-with-cover-art-thumbnail case)
-            // are handled by the [0:v:0] pin in normalizeClip; we log
-            // the anomaly so a future codec regression surfaces in
-            // the assembly log instead of as a silent 10-min waste.
-            const probe = await probeSource(src);
-            if (probe && (probe.videoStreams > 1 || probe.hasAttachedPic)) {
-              console.warn(`[assemble] beat ${beat.beat_number}: source has ${probe.videoStreams} video stream(s)${probe.hasAttachedPic ? " incl. attached_pic" : ""} — encoding first stream only`);
-            }
+            // No per-beat probe: the [0:v:0] selector in normalizeClip
+            // already handles multi-stream sources (incl. attached_pic
+            // cover art). Probing 293 beats just to log a warning cost
+            // ~200ms each in ffprobe spawn latency.
             console.log(`[assemble] beat ${beat.beat_number}: encoding clip…`);
             await normalizeClip(src, false, durations[i], clipPath, w, h, stageBLogoOverlay, beatSubtitles, signal);
             try { fs.unlinkSync(src); } catch { /* ignore */ }
@@ -1726,7 +1821,10 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
           // R2 latency. See pendingClipUploads block above for the
           // design notes. The drain at the end of Stage B awaits any
           // still-pending uploads before concat unlinks the local
-          // files.
+          // files. Bounded by MAX_PENDING_CLIP_UPLOADS so the upload
+          // queue can't grow unbounded on long projects where R2
+          // latency outpaces encode throughput.
+          await awaitUploadSlot();
           const uploadPromise = (async () => {
             try {
               // Upload to the content-addressed cache key (computed at
@@ -1779,6 +1877,21 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
             return;
           }
           completed++;
+          // Force a V8 GC every 20 completed beats. Stage B's beat
+          // loop allocates many short-lived objects (ASS strings, hash
+          // inputs, S3 PutObject parameter blocks) that fragment the
+          // old generation over a 138+ beat run. The pre-mix gc() at
+          // Stage D runs too late to help Stage B's own peak. Cheap
+          // and only active when --expose-gc is on (already set in
+          // package.json's start script).
+          if (global.gc && completed % 20 === 0) {
+            try {
+              const beforeMb = Math.round(process.memoryUsage().rss / 1024 / 1024);
+              global.gc();
+              const afterMb = Math.round(process.memoryUsage().rss / 1024 / 1024);
+              console.log(`[assemble] ${projectId}: gc at beat ${completed} — rss ${beforeMb}MB → ${afterMb}MB`);
+            } catch { /* ignore */ }
+          }
           if (beats.length > 0) {
             await progressThrottled(`Processed ${completed} of ${beats.length} clips…`);
           }
@@ -2035,6 +2148,15 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
       baseCaptionSegs = [];
       if (global.gc) {
         try { global.gc(); } catch { /* ignore — only available with --expose-gc */ }
+      }
+
+      // Drain the background audio concat (kicked off at the top of
+      // per-beat audio prep when captions were off) before the mix. By
+      // the time Stage B finishes encoding 293 beats, the concat is
+      // almost always done — this await is usually a no-op.
+      if (audioRunsInBackground) {
+        await progress("Finalizing voiceover…");
+        await audioReadyPromise;
       }
 
       await progress(bgmConfig ? "Mixing voiceover + music…" : "Mixing voiceover…");
