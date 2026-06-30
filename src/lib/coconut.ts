@@ -137,6 +137,15 @@ function buildJobSpec(opts: CoconutFinalizeOptions) {
     path: sanitizedPath,
     key: "mp4:final",
     format: {
+      // Explicit container hint. When subtitles are present in the
+      // job, Coconut's path validator gets stricter and started
+      // rejecting our paths with output_filename_not_valid ("extension
+      // '' doesn't match with format 'mp4'") even though the path
+      // ends in .mp4. The outer outputs.mp4 wrapper already implies
+      // mp4 — but with subtitles in the mix, Coconut seems to want
+      // it in format too. The captions-less path that previously
+      // worked never tripped this code branch.
+      container: "mp4",
       resolution,
       // 1=low, 5=highest. 4 maps roughly to veryfast/crf 23.
       quality: 4,
