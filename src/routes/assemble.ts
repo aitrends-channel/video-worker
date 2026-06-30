@@ -1010,20 +1010,29 @@ function dimsFor(aspect: string, preset: ResolutionPreset | undefined): [number,
 // the final-burn pass at the user's chosen resolution, so the intermediate
 // downscale doesn't blur text.
 
-function getAssemblyConcurrency(resolution: ResolutionPreset | undefined, allImages: boolean): number {
+function getAssemblyConcurrency(
+  resolution: ResolutionPreset | undefined,
+  allImages: boolean,
+  beats: number,
+  captionsEnabled: boolean,
+): number {
   if (ASSEMBLY_SAFE_MODE) return 1;
-  // Admin's slider is a soft max — capped per resolution because each
-  // libx264 process holds roughly resolution-proportional frame buffers
-  // resident. Image-only beats skip the input decoder pipeline and
-  // run with a much smaller working set (~half the RSS of a video
-  // transcode at the same resolution), so we double the cap for those
-  // projects.
   const slider = Math.max(1, getAssemblyBeatLimit());
-  const res = resolution ?? "1080p";
-  // Floor at 2 for every resolution including 2160p so even 4 K
-  // projects keep some parallelism. Risk: 2x 4K libx264 ≈ 2-3 GB
-  // RSS, close to the 4 GB Render ceiling. Accept the tighter
-  // headroom in exchange for ~halving wall-clock on 4K runs.
+  const res = (resolution ?? "1080p") as AssemblyResolution;
+
+  // Admin's per-scenario rule wins if one matches. Rule is still
+  // bounded by the global slider — `assembly_beats` is the absolute
+  // ceiling. No resolution safety cap when a rule matches: the admin
+  // explicitly chose this value for this scenario.
+  const matched = matchAssemblyBeatRule({ resolution: res, beats, allImages, captionsEnabled });
+  if (matched) {
+    return Math.min(slider, matched.value);
+  }
+
+  // No rule matched — fall back to slider capped by resolution-aware
+  // safety floor. Image-only beats use ~half the RSS of a video
+  // transcode at the same resolution, so we allow more parallelism.
+  // 4K is floored at 2 so even 2160p runs keep some parallelism.
   const videoCap = res === "2160p" ? 2 : res === "1440p" ? 1 : res === "1080p" ? 2 : slider;
   const imageCap = res === "2160p" ? 2 : res === "1440p" ? 2 : res === "1080p" ? 4 : slider;
   const memCap = allImages ? imageCap : videoCap;
@@ -1744,8 +1753,14 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
       // STOPPED_MARKER propagates via firstError so all in-flight
       // workers bail at the next iteration.
       const allImages = beats.every((b) => !b.video_url && !!b.image_url);
-      const beatLimit = getAssemblyConcurrency(resolution, allImages);
-      console.log(`[assemble] ${projectId}: beat concurrency=${beatLimit} (requested=${getAssemblyBeatLimit()}, beats=${beats.length}, resolution=${resolution ?? "1080p"}, allImages=${allImages})`);
+      const beatLimit = getAssemblyConcurrency(resolution, allImages, beats.length, captionsEnabled);
+      const matchedRule = matchAssemblyBeatRule({
+        resolution: (resolution ?? "1080p") as AssemblyResolution,
+        beats: beats.length,
+        allImages,
+        captionsEnabled,
+      });
+      console.log(`[assemble] ${projectId}: beat concurrency=${beatLimit} (slider=${getAssemblyBeatLimit()}, beats=${beats.length}, resolution=${resolution ?? "1080p"}, allImages=${allImages}, captions=${captionsEnabled}, matchedRule=${matchedRule ? `"${matchedRule.name}"=${matchedRule.value}` : "none"})`);
       let nextIdx = 0;
       let completed = 0;
       let firstError: Error | null = null;
@@ -2443,8 +2458,51 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
 let assemblyProjectLimit = 1;
 let assemblyBeatLimit = 1;
 
+// Mirrors lib/concurrency-config.ts (engine repo). Kept in sync by hand
+// — both sides validate the shape on read so a malformed rule from the
+// DB silently drops instead of crashing.
+type AssemblyResolution = "720p" | "1080p" | "1440p" | "2160p";
+const ASSEMBLY_RESOLUTIONS: readonly AssemblyResolution[] = ["720p", "1080p", "1440p", "2160p"];
+interface AssemblyBeatRule {
+  name: string;
+  when: {
+    resolution?: AssemblyResolution;
+    maxBeats?: number;
+    minBeats?: number;
+    allImages?: boolean;
+    captionsEnabled?: boolean;
+  };
+  value: number;
+}
+let assemblyBeatRules: AssemblyBeatRule[] = [];
+
 export function getAssemblyBeatLimit(): number {
   return assemblyBeatLimit;
+}
+
+export function getAssemblyBeatRules(): AssemblyBeatRule[] {
+  return assemblyBeatRules;
+}
+
+// Pure helper: pick the first rule whose conditions all match the
+// in-flight project's parameters. Returns null when no rule matches —
+// callers should fall back to the global slider in that case.
+function matchAssemblyBeatRule(ctx: {
+  resolution: AssemblyResolution;
+  beats: number;
+  allImages: boolean;
+  captionsEnabled: boolean;
+}): AssemblyBeatRule | null {
+  for (const rule of assemblyBeatRules) {
+    const w = rule.when;
+    if (w.resolution !== undefined && w.resolution !== ctx.resolution) continue;
+    if (w.maxBeats !== undefined && ctx.beats > w.maxBeats) continue;
+    if (w.minBeats !== undefined && ctx.beats < w.minBeats) continue;
+    if (w.allImages !== undefined && w.allImages !== ctx.allImages) continue;
+    if (w.captionsEnabled !== undefined && w.captionsEnabled !== ctx.captionsEnabled) continue;
+    return rule;
+  }
+  return null;
 }
 
 async function refreshAssemblyConcurrency(): Promise<void> {
@@ -2454,7 +2512,7 @@ async function refreshAssemblyConcurrency(): Promise<void> {
       .select("batched_processes")
       .eq("service", "_global")
       .single();
-    const cfg = (data as { batched_processes?: { assembly_projects?: unknown; assembly_beats?: unknown } } | null)?.batched_processes;
+    const cfg = (data as { batched_processes?: { assembly_projects?: unknown; assembly_beats?: unknown; assembly_beats_rules?: unknown } } | null)?.batched_processes;
     const projRaw = cfg?.assembly_projects;
     const beatRaw = cfg?.assembly_beats;
     const proj = typeof projRaw === "number" ? projRaw : Number(projRaw);
@@ -2466,6 +2524,40 @@ async function refreshAssemblyConcurrency(): Promise<void> {
     if (Number.isInteger(beat) && beat >= 1 && beat <= 10 && beat !== assemblyBeatLimit) {
       console.log(`[assembly-queue] beat limit changed: ${assemblyBeatLimit} → ${beat}`);
       assemblyBeatLimit = beat;
+    }
+    // Validate-on-read so a malformed rule (e.g. typo'd resolution
+    // string) silently drops instead of poisoning getAssemblyConcurrency.
+    const rulesRaw = cfg?.assembly_beats_rules;
+    if (Array.isArray(rulesRaw)) {
+      const cleaned: AssemblyBeatRule[] = [];
+      for (const r of rulesRaw) {
+        if (!r || typeof r !== "object") continue;
+        const obj = r as Record<string, unknown>;
+        const v = typeof obj.value === "number" ? obj.value : Number(obj.value);
+        if (!Number.isInteger(v) || v < 1 || v > 10) continue;
+        const name = typeof obj.name === "string" ? obj.name : "Unnamed";
+        const whenObj = (obj.when && typeof obj.when === "object") ? obj.when as Record<string, unknown> : {};
+        const when: AssemblyBeatRule["when"] = {};
+        if (typeof whenObj.resolution === "string" && (ASSEMBLY_RESOLUTIONS as readonly string[]).includes(whenObj.resolution)) {
+          when.resolution = whenObj.resolution as AssemblyResolution;
+        }
+        const mb = typeof whenObj.maxBeats === "number" ? whenObj.maxBeats : Number(whenObj.maxBeats);
+        if (Number.isInteger(mb) && mb > 0) when.maxBeats = mb;
+        const nb = typeof whenObj.minBeats === "number" ? whenObj.minBeats : Number(whenObj.minBeats);
+        if (Number.isInteger(nb) && nb > 0) when.minBeats = nb;
+        if (typeof whenObj.allImages === "boolean") when.allImages = whenObj.allImages;
+        if (typeof whenObj.captionsEnabled === "boolean") when.captionsEnabled = whenObj.captionsEnabled;
+        cleaned.push({ name, when, value: v });
+      }
+      const prevSig = JSON.stringify(assemblyBeatRules);
+      const nextSig = JSON.stringify(cleaned);
+      if (prevSig !== nextSig) {
+        console.log(`[assembly-queue] rules changed: ${assemblyBeatRules.length} → ${cleaned.length} rule(s)`);
+        assemblyBeatRules = cleaned;
+      }
+    } else if (assemblyBeatRules.length > 0) {
+      console.log(`[assembly-queue] rules cleared`);
+      assemblyBeatRules = [];
     }
   } catch (err) {
     console.warn("[assembly-queue] Failed to refresh concurrency from product_config:", err instanceof Error ? err.message : err);
