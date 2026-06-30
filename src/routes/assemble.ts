@@ -2163,7 +2163,7 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
       // faststart + upload-failure-retry logic intact.
       try {
         await checkStop();
-        await progress("Submitting final-burn to Coconut…");
+        await progress("Burn captions - Coconut: submitting…");
         const { submitJob, pollJob } = await import("../lib/coconut.js");
         const hasCaptions = captionsEnabled && baseCaptionSegs.length > 0;
         let captionsAssUrl: string | null = null;
@@ -2200,11 +2200,14 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
           logoUrl: null,
         });
         console.log(`[assemble] ${projectId}: coconut job ${job.id} submitted`);
-        await progress("Finalizing on Coconut…");
+        await progress("Burn captions - Coconut: finalizing…");
         await pollJob(job.id, signal, (status) => {
           // Throttle progress writes — pollJob may emit multiple
           // updates as status flips queued → processing → completed.
-          void progress(`Coconut: ${status}…`);
+          // Status comes back like "job.processing"; strip the prefix
+          // so the user sees "processing" not "job.processing".
+          const cleaned = String(status).replace(/^job\./, "");
+          void progress(`Burn captions - Coconut: ${cleaned}…`);
         });
         console.log(`[assemble] ${projectId}: coconut job ${job.id} completed`);
         // Coconut wrote directly to R2. Download to a local path so
@@ -2223,7 +2226,7 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
         // line pointing at Coconut so we can fix it without blocking
         // assemblies.
         console.warn(`[assemble] ${projectId}: Coconut failed (${msg}) — falling back to local final burn`);
-        await progress("Coconut unavailable — finishing locally…");
+        await progress("Burn captions - VW (Coconut unavailable)…");
         coconutFailed = true;
       }
     }
@@ -2234,7 +2237,7 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
       // gated behind the "COCONUT_API_KEY missing" check above.
       await checkStop();
       const needsUpscale = w !== finalW || h !== finalH;
-      await progress("Burning captions…");
+      await progress("Burn captions - VW…");
       const assPath = path.join(tmpDir, "final_captions.ass");
       const hasCaptions = captionsEnabled && baseCaptionSegs.length > 0;
       if (hasCaptions) {
