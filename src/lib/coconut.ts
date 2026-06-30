@@ -79,31 +79,24 @@ export interface CoconutJob {
 //   - R2 storage is passed under `storage` using Coconut's s3other
 //     service — they support any S3-compatible target.
 function buildJobSpec(opts: CoconutFinalizeOptions) {
-  // Confirmed by Coconut error: credential field names are
-  // `access_key_id` and `secret_access_key` (no s3_ prefix). The
-  // earlier `s3_access_key_id_not_found` error was actually AWS's
-  // error (the request was reaching AWS S3, not R2) — not a hint
-  // about Coconut's schema.
-  const r2Endpoint = process.env.R2_ACCOUNT_ID
-    ? `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`
-    : undefined;
-  const storage = {
-    service: "s3other",
-    bucket: process.env.R2_BUCKET_NAME,
-    // R2 expects "auto" — not a real AWS region name. Reads (GET via
-    // public URL) ignore region entirely, but PutObject SigV4 signing
-    // includes the region in the canonical request, so a wrong value
-    // like "us-east-1" produces a signature mismatch that R2 returns
-    // as a generic upload failure (no helpful detail surfaces back
-    // through Coconut).
-    region: "auto",
-    endpoint: r2Endpoint,
-    credentials: {
-      access_key_id: process.env.R2_ACCESS_KEY_ID,
-      secret_access_key: process.env.R2_SECRET_ACCESS_KEY,
-    },
-    force_path_style: true,
-  };
+  // URL-format storage config. The "object" form with
+  // service:"s3other" + endpoint field appears in our submitted
+  // spec, but Coconut's job-detail dashboard confirms the endpoint
+  // is NOT being applied to the upload — every PUT hits AWS S3
+  // default and AWS rejects the R2 credentials with the
+  // `s3_access_key_id_not_found` error. The URL form encodes
+  // endpoint, region, and path-style addressing into a single
+  // connection string that Coconut can't drop.
+  //
+  // Pattern: s3://ACCESS:SECRET@bucket?endpoint=URL&region=auto&force_path_style=true
+  // Both access_key and secret are URL-encoded so chars like '/'
+  // or '+' in R2 secrets don't break URL parsing.
+  if (!process.env.R2_ACCOUNT_ID || !process.env.R2_ACCESS_KEY_ID || !process.env.R2_SECRET_ACCESS_KEY || !process.env.R2_BUCKET_NAME) {
+    throw new Error("R2 storage not fully configured — R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, and R2_BUCKET_NAME are all required for Coconut.");
+  }
+  const r2Endpoint = `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`;
+  const storageUrl = `s3://${encodeURIComponent(process.env.R2_ACCESS_KEY_ID)}:${encodeURIComponent(process.env.R2_SECRET_ACCESS_KEY)}@${process.env.R2_BUCKET_NAME}?endpoint=${encodeURIComponent(r2Endpoint)}&region=auto&force_path_style=true`;
+  const storage = { url: storageUrl };
 
   // Coconut's format block takes a `resolution` PRESET string,
   // not raw width/height. Map our dimensions to the closest preset
