@@ -2382,28 +2382,59 @@ async function assemblyPollLoop() {
 
           if (!claimed) continue;
 
+          // Read options with three-tier fallback:
+          //   1. Redis (set by /api/generate/assemble) — the most
+          //      recent user submission via the UI
+          //   2. project row's persisted columns — survives Redis
+          //      eviction, manual SQL re-queues, and worker restarts
+          //   3. Hard-coded defaults — used only when neither
+          //      Redis nor the row has a value
+          // Previously the worker read only from Redis and fell to
+          // defaults when Redis was empty, which meant a SQL
+          // re-queue silently dropped the user's bgm/logo/captions
+          // configuration.
           const opts = (await redis.get(`assembly:${projectId}`) as Record<string, unknown> | null) ?? {};
-          console.log(`[assembly-queue] ${projectId}: opts from redis = bgm=${JSON.stringify(opts.backgroundMusicUrl)} vol=${JSON.stringify(opts.backgroundMusicVolume)} logo=${JSON.stringify(opts.logoUrl)} logoXY=${JSON.stringify(opts.logoX)},${JSON.stringify(opts.logoY)} logoSize=${JSON.stringify(opts.logoSize)} keys=[${Object.keys(opts).join(",")}]`);
+          const { data: rowOpts } = await supabase
+            .from("projects")
+            .select("background_music_url, background_music_volume, logo_url, logo_x, logo_y, logo_size, captions_enabled, captions_language, captions_style, captions_size, captions_position, trim_silence_enabled, aspect_ratio, resolution")
+            .eq("id", projectId)
+            .maybeSingle();
+          const projectRow = (rowOpts as Record<string, unknown> | null) ?? {};
+          // Pick: prefer Redis, fall back to projectRow column,
+          // fall back to hard default. Explicit null/undefined check
+          // (not `??`) is intentional — a stored false / 0 / "" is
+          // a valid user choice that must beat the hard default.
+          const pick = <T>(redisKey: string, rowKey: string, fallback: T): T => {
+            const r = opts[redisKey];
+            if (r !== undefined && r !== null) return r as T;
+            const rv = projectRow[rowKey];
+            if (rv !== undefined && rv !== null) return rv as T;
+            return fallback;
+          };
+          const finalBgmUrl = pick<string | null>("backgroundMusicUrl", "background_music_url", null);
+          const finalLogoUrl = pick<string | null>("logoUrl", "logo_url", null);
+          const finalCaptions = pick<boolean>("captionsEnabled", "captions_enabled", false);
+          console.log(`[assembly-queue] ${projectId}: opts resolved bgm=${JSON.stringify(finalBgmUrl)} logo=${JSON.stringify(finalLogoUrl)} captions=${finalCaptions} (redisKeys=[${Object.keys(opts).join(",")}], rowKeys=[${Object.keys(projectRow).join(",")}])`);
 
           assemblingProjects.add(projectId);
           runAssembly({
             projectId,
             userId,
-            aspectRatio: (opts.aspectRatio as string | undefined) ?? "16:9",
-            voiceoverType: ((opts.voiceoverType as string | undefined) ?? "cleaned") as "cleaned" | "original",
-            captionsEnabled: (opts.captionsEnabled as boolean | undefined) ?? false,
-            captionsLanguage: (opts.captionsLanguage as string | undefined) ?? "source",
-            captionsStyle: (opts.captionsStyle as string | undefined) ?? "default",
-            captionsSize: (opts.captionsSize as string | undefined) ?? "medium",
-            captionsPosition: (opts.captionsPosition as string | undefined) ?? "bottom",
-            trimSilenceEnabled: (opts.trimSilenceEnabled as boolean | undefined) ?? false,
-            backgroundMusicUrl: (opts.backgroundMusicUrl as string | undefined) ?? null,
-            backgroundMusicVolume: (opts.backgroundMusicVolume as number | undefined) ?? 0.15,
-            resolution: (opts.resolution as ResolutionPreset | undefined) ?? "1080p",
-            logoUrl: (opts.logoUrl as string | undefined) ?? null,
-            logoX: (opts.logoX as number | undefined) ?? 0.85,
-            logoY: (opts.logoY as number | undefined) ?? 0.05,
-            logoSize: (opts.logoSize as number | undefined) ?? 0.1,
+            aspectRatio: pick<string>("aspectRatio", "aspect_ratio", "16:9"),
+            voiceoverType: (pick<string>("voiceoverType", "voiceover_type", "cleaned")) as "cleaned" | "original",
+            captionsEnabled: finalCaptions,
+            captionsLanguage: pick<string>("captionsLanguage", "captions_language", "source"),
+            captionsStyle: pick<string>("captionsStyle", "captions_style", "default"),
+            captionsSize: pick<string>("captionsSize", "captions_size", "medium"),
+            captionsPosition: pick<string>("captionsPosition", "captions_position", "bottom"),
+            trimSilenceEnabled: pick<boolean>("trimSilenceEnabled", "trim_silence_enabled", false),
+            backgroundMusicUrl: finalBgmUrl,
+            backgroundMusicVolume: pick<number>("backgroundMusicVolume", "background_music_volume", 0.15),
+            resolution: pick<ResolutionPreset>("resolution", "resolution", "1080p"),
+            logoUrl: finalLogoUrl,
+            logoX: pick<number>("logoX", "logo_x", 0.85),
+            logoY: pick<number>("logoY", "logo_y", 0.05),
+            logoSize: pick<number>("logoSize", "logo_size", 0.1),
           }).finally(() => {
             assemblingProjects.delete(projectId);
             redis.del(`assembly:${projectId}`).catch(() => {});
