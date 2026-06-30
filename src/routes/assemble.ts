@@ -2730,10 +2730,21 @@ export function setupAssembleRoute(app: Express): void {
       return;
     }
 
-    // Mark as processing immediately so the client sees state change on next poll.
-    // assembly_started_at / _finished_at maintained the same way as the
-    // queue claim site for consistent analytics across both entry paths.
-    await supabase.from("projects")
+    // Atomic claim — same guard the poll loop uses at the other entry
+    // path. The previous unconditional UPDATE would overwrite a row
+    // that was already mid-assembly on a different worker (Render
+    // replica, retry from engine, double-click), producing 2-3
+    // parallel runs of the same project that each fight for CPU/RAM
+    // and submit duplicate Coconut jobs. The .in() filter accepts the
+    // restart-eligible statuses (queued, stopped, failed, preview)
+    // and rejects in-flight ones (processing, uploading), so a
+    // legitimate Resume still works while a duplicate trigger
+    // bounces with started=false.
+    //
+    // Note: the assemblingProjects.has() check above catches the
+    // SAME-worker race. This DB claim catches the CROSS-worker one.
+    const RESTARTABLE_STATUSES = ["queued", "stopped", "failed", "preview"];
+    const { data: claimed } = await supabase.from("projects")
       .update({
         assembly_status: "processing",
         assembly_progress: "Starting…",
@@ -2741,7 +2752,15 @@ export function setupAssembleRoute(app: Express): void {
         assembly_started_at: new Date().toISOString(),
         assembly_finished_at: null,
       })
-      .eq("id", projectId).eq("user_id", user.id);
+      .eq("id", projectId)
+      .eq("user_id", user.id)
+      .or(`assembly_status.in.(${RESTARTABLE_STATUSES.join(",")}),assembly_status.is.null`)
+      .select("id")
+      .maybeSingle();
+    if (!claimed) {
+      res.json({ started: false, reason: "Assembly already in progress for this project" });
+      return;
+    }
 
     assemblingProjects.add(projectId);
 
