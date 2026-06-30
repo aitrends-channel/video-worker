@@ -171,10 +171,7 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
-// 30 min cap. Burning subtitles re-encodes the full assembled video, which
-// on Render's shared CPU can run 15-20+ min for longer scripts. Other
-// ffmpeg steps (normalizeClip, concat, mixAudio) finish in seconds-minutes
-// so a higher ceiling here doesn't add real latency on the fast path.
+
 const FFMPEG_TIMEOUT_MS = 30 * 60_000;
 const ASSEMBLY_SAFE_MODE = process.env.ASSEMBLY_SAFE_MODE === "1";
 const DEFAULT_FFMPEG_THREADS = 1;
