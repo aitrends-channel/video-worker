@@ -120,13 +120,18 @@ function buildJobSpec(opts: CoconutFinalizeOptions) {
   // "Output param key not valid" error pattern that "transformation"
   // hit. Move them up to the job root.
   // Coconut's canonical examples all show paths starting with "/".
-  // Without the leading slash their path parser fell over on our
-  // email-style folder names ("user@gmail.com/...") — extracting
-  // an empty extension and erroring on "format mp4 doesn't match".
-  // Adding the leading slash should anchor the parser correctly
-  // without us having to URL-encode the '@' (which would change
-  // the R2 storage key and break our own download URL).
-  const sanitizedPath = "/" + opts.outputBucketKey.replace(/^\/+/, "");
+  // The leading slash + URL-encoded "@" together work around a
+  // Coconut path-parser bug: email-style folder names like
+  // "nyefene1@gmail.com/..." make their parser read the "@" as a
+  // userinfo delimiter, then it can't extract the filename
+  // extension from what's left — fails the spec validation with
+  // "output_filename_not_valid". Encoding only the "@" (not the
+  // whole path) keeps the URL readable and Coconut URL-decodes the
+  // path back to its literal form when constructing the actual S3
+  // PUT key — so the R2 storage key stays "nyefene1@gmail.com/..."
+  // and our download URL reconstruction (which uses the un-encoded
+  // outputBucketKey) still finds the file.
+  const sanitizedPath = ("/" + opts.outputBucketKey.replace(/^\/+/, "")).replace(/@/g, "%40");
 
   const output: Record<string, unknown> = {
     path: sanitizedPath,
