@@ -152,7 +152,10 @@ async function processBeat(beat: QueuedBeat) {
     // commit guard prevents zombie completion.
     if (!promotedToRendering && status.status === "processing") {
       const { data: promoted } = await supabase.from("project_beats")
-        .update({ video_status: "rendering" })
+        // Refresh video_started_at so the sweeper's stuck-beat
+        // detection restarts its clock from the render phase, not
+        // the (much shorter) submit phase.
+        .update({ video_status: "rendering", video_started_at: new Date().toISOString() })
         .eq("project_id", projectId)
         .eq("beat_number", beatNumber)
         .eq("video_status", "submitting")
@@ -284,9 +287,13 @@ async function tryClaimBeat(beat: QueuedBeat): Promise<boolean> {
   // yet, and a worker crash before submission leaves the row
   // in a recoverable "submitting" state instead of a stuck
   // "rendering" state with no job behind it.
+  //
+  // Stamp video_started_at at the same time so the sweepStuckBeats
+  // loop can detect claims that never completed (worker crashed
+  // between claim and KIE submit).
   const { data, error } = await supabase
     .from("project_beats")
-    .update({ video_status: "submitting" })
+    .update({ video_status: "submitting", video_started_at: new Date().toISOString() })
     .eq("project_id", beat.project_id)
     .eq("beat_number", beat.beat_number)
     .eq("video_status", "queued")
@@ -294,6 +301,53 @@ async function tryClaimBeat(beat: QueuedBeat): Promise<boolean> {
     .single();
 
   return !error && !!data;
+}
+
+// Return any beat stuck in submitting/rendering longer than we'd ever
+// legitimately keep it there back to "queued". Two cutoffs because the
+// two states have very different expected durations:
+//   - submitting: only long enough to POST to KIE and get a job_id back
+//     (a few seconds). Anything older than 2 minutes is orphaned — the
+//     worker crashed before the KIE call landed.
+//   - rendering: bounded by the poll loop's own MAX_POLL_ATTEMPTS ×
+//     10s = 20 min. Add a small buffer so we don't race the loop's
+//     legitimate final polls, then anything older than 30 min is
+//     definitely stuck.
+//
+// NULL video_started_at is treated as "old enough to reset" so beats
+// created before this migration also get swept eventually.
+const SWEEP_SUBMITTING_TIMEOUT_MS = 2 * 60_000;
+const SWEEP_RENDERING_TIMEOUT_MS  = 30 * 60_000;
+async function sweepStuckBeats(): Promise<void> {
+  try {
+    const submittingCutoff = new Date(Date.now() - SWEEP_SUBMITTING_TIMEOUT_MS).toISOString();
+    const renderingCutoff  = new Date(Date.now() - SWEEP_RENDERING_TIMEOUT_MS).toISOString();
+
+    // One sweep per state so each can use its own cutoff. `.or()` on
+    // video_started_at picks up rows with NULL too (they predate
+    // migration 079).
+    const runSweep = async (state: "submitting" | "rendering", cutoffIso: string) => {
+      const { data, error } = await supabase
+        .from("project_beats")
+        .update({ video_status: "queued", video_job_id: null })
+        .eq("video_status", state)
+        .or(`video_started_at.is.null,video_started_at.lt.${cutoffIso}`)
+        .select("project_id, beat_number");
+      if (error) {
+        console.warn(`[worker] Sweep ${state} failed:`, error.message);
+        return 0;
+      }
+      return data?.length ?? 0;
+    };
+
+    const swept = await runSweep("submitting", submittingCutoff);
+    const swept2 = await runSweep("rendering", renderingCutoff);
+    if (swept > 0 || swept2 > 0) {
+      console.log(`[worker] Sweeper reset stuck beats: submitting=${swept}, rendering=${swept2}`);
+    }
+  } catch (err) {
+    console.warn("[worker] Sweep loop error:", err instanceof Error ? err.message : err);
+  }
 }
 
 async function pollLoop() {
@@ -304,7 +358,13 @@ async function pollLoop() {
     try {
       // Re-read the admin-tunable concurrency every ~30s (6 ticks at
       // 5s/tick) so the worker picks up changes without a restart.
-      if (ticks++ % 6 === 0) await refreshConcurrency();
+      // Same interval also runs the stuck-beat sweeper so orphaned
+      // submits get returned to the queue without needing a full
+      // worker restart.
+      if (ticks++ % 6 === 0) {
+        await refreshConcurrency();
+        await sweepStuckBeats();
+      }
       const slots = concurrency - activeJobs;
       if (creditsExhaustedAt !== null) {
         if (Date.now() - creditsExhaustedAt < CREDITS_RETRY_MS) {
