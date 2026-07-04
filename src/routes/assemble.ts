@@ -1552,13 +1552,13 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
             beat_number: b.beat_number,
             duration_ms: Math.round(durations[i] * 1000),
           }));
-          await Promise.all(updates.map((u) =>
-            supabase
-              .from("project_beats")
-              .update({ duration_ms: u.duration_ms })
-              .eq("project_id", projectId)
-              .eq("beat_number", u.beat_number)
-          ));
+          // Batched UPDATE via RPC — one server round-trip instead of
+          // one per beat. Migration 082 in youtube-engine.
+          const { error: batchErr } = await supabase.rpc("batch_update_beat_durations", {
+            p_project_id: projectId,
+            p_updates: updates,
+          });
+          if (batchErr) throw batchErr;
           await supabase
             .from("projects")
             .update({ beat_timings_voiceover_hash: voiceoverHash })

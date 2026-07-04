@@ -264,15 +264,24 @@ async function processBeat(beat: QueuedBeat) {
     }
   }
 
-  const { data: doneBeats } = await supabase
-    .from("project_beats")
-    .select("beat_number")
-    .eq("project_id", projectId)
-    .eq("video_status", "done");
-
-  await supabase.from("projects")
-    .update({ videos_progress: doneBeats?.length ?? 0 })
-    .eq("id", projectId);
+  // Atomic +1 via RPC. Gated on the guarded UPDATE above having landed
+  // (updated.length > 0) so we only increment on a real
+  // submitting/rendering → done transition — a re-committed beat or a
+  // second worker firing on the same row skips this block via the early
+  // return above and never double-increments. Migration 082 in
+  // youtube-engine defines increment_videos_progress.
+  //
+  // Trade-off vs the previous SELECT-count-then-UPDATE pattern: this is
+  // O(1) per beat instead of O(done-so-far) — no quadratic growth across
+  // a long assembly. The stuck-beat sweeper can flip a beat from
+  // rendering → queued, which today's self-healing count would notice
+  // and this counter won't — the drift is display-only (progress bar)
+  // and self-corrects when the recovered beat completes and increments
+  // again, so we accept it as the cost of the write reduction.
+  const { error: incErr } = await supabase.rpc("increment_videos_progress", {
+    p_project_id: projectId,
+  });
+  if (incErr) console.warn(`[worker] Beat ${beatNumber} videos_progress increment failed:`, incErr.message);
 
   console.log(`[worker] Beat ${beatNumber} complete`);
 }
