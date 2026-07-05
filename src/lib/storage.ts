@@ -97,14 +97,40 @@ export async function uploadFile(storagePath: string, filePath: string, contentT
   return `${PUBLIC_URL}/${storagePath}`;
 }
 
+// Optional Cloudflare Worker transfer proxy (cf-transfer-worker,
+// deployed separately via wrangler — lives outside this repo). When
+// configured, source→R2 transfers happen inside Cloudflare's network and
+// Render's egress for each transfer drops from the full file size to a
+// ~200-byte JSON request. Unset either var to disable entirely.
+const CF_TRANSFER_URL = (process.env.CF_TRANSFER_URL ?? "").replace(/\/$/, "");
+const CF_TRANSFER_SECRET = process.env.CF_TRANSFER_SECRET ?? "";
+
 export async function uploadFromUrl(storagePath: string, url: string, contentType: string): Promise<string> {
-  // Stream the source URL straight to a temp file, then stream-upload to
-  // R2 via uploadFile. The previous implementation buffered the entire
-  // response into an ArrayBuffer and then copied it into a Node Buffer —
-  // a 50-500 MB KIE video sat in process RSS twice, and with concurrent
-  // KIE beats finishing in parallel that was the dominant memory spike
-  // on the Render box. Streaming caps the in-flight footprint at the
-  // chunk size that pipeline carries through (≈64 KB).
+  assertConfigured();
+  if (CF_TRANSFER_URL && CF_TRANSFER_SECRET) {
+    try {
+      const cfRes = await fetch(CF_TRANSFER_URL, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${CF_TRANSFER_SECRET}`,
+        },
+        body: JSON.stringify({ url, key: storagePath, contentType }),
+      });
+      if (cfRes.ok) return `${PUBLIC_URL}/${storagePath}`;
+      const errText = await cfRes.text().catch(() => "");
+      console.warn(`[storage] CF transfer failed (${cfRes.status}) for ${storagePath}: ${errText} — falling back to direct transfer`);
+    } catch (e) {
+      console.warn(`[storage] CF transfer error for ${storagePath} — falling back to direct transfer:`, e instanceof Error ? e.message : e);
+    }
+  }
+  // Direct fallback: stream the source URL to a temp file, then
+  // stream-upload to R2 via uploadFile. The previous implementation
+  // buffered the entire response into an ArrayBuffer and then copied it
+  // into a Node Buffer — a 50-500 MB KIE video sat in process RSS twice,
+  // and with concurrent KIE beats finishing in parallel that was the
+  // dominant memory spike on the Render box. Streaming caps the
+  // in-flight footprint at the chunk size pipeline carries through (≈64 KB).
   const res = await fetch(url);
   if (!res.ok) throw new Error(`Failed to download ${url}: ${res.status}`);
   if (!res.body) throw new Error(`No response body for ${url}`);
