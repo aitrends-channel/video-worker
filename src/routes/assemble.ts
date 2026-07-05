@@ -1164,7 +1164,6 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
   }
   const persistCheckpoint = async (): Promise<void> => { await saveCheckpoint(projectId, checkpoint); };
   const userFolder = await userFolderForId(userId);
-  const ckptPathFor = (name: string): string => `${userFolder}/${projectId}/_assembly/${name}`;
 
   // Ping our own health endpoint every 4 min so Render free tier doesn't
   // spin the service down during a long background assembly
@@ -2015,13 +2014,13 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
       await concatClips(listPath, joinedLocal, signal);
       for (const p of validClipPaths) { try { fs.unlinkSync(p); } catch { /* ignore */ } }
       metrics.record("stage-b-concat");
-      try {
-        const joinedUrl = await uploadFile(ckptPathFor("joined.mp4"), joinedLocal, "video/mp4");
-        checkpoint.joined_url = joinedUrl;
-        await persistCheckpoint();
-      } catch (e) {
-        console.warn(`[assemble] joined.mp4 checkpoint upload failed:`, e);
-      }
+      // joined.mp4 is no longer uploaded as a checkpoint: it's a
+      // -c copy concat of the per-clip cache, so a resume rebuilds it
+      // in seconds from _beat_cache/ (via the `!checkpoint.joined_url`
+      // guard above — the same path every fresh run takes). Uploading
+      // it cost a full video of Render egress per assembly for
+      // insurance the clip cache already provides. joined_url is
+      // still READ below so old checkpoints resume fine.
     }
 
     // ── Stage C: freeze-pad → padded.mp4 (only when needed) ─────────────
@@ -2102,13 +2101,10 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
           );
         }
         try { fs.unlinkSync(joinedDisk); } catch { /* ignore */ }
-        try {
-          const paddedUrl = await uploadFile(ckptPathFor("padded.mp4"), paddedPath, "video/mp4");
-          checkpoint.padded_url = paddedUrl;
-          await persistCheckpoint();
-        } catch (e) {
-          console.warn(`[assemble] padded.mp4 checkpoint upload failed:`, e);
-        }
+        // padded.mp4 checkpoint upload removed — same egress reasoning
+        // as joined.mp4: the freeze-tail build is sub-second and a
+        // resume rebuilds it from the re-concatenated joined video.
+        // padded_url is still READ in Stage D for old checkpoints.
         metrics.record("freeze-pad");
       }
     }
@@ -2120,23 +2116,37 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
       await progress("Restoring mixed video…");
       await downloadFile(checkpoint.mixed_url, outputPath, signal);
     } else {
-      // Decide which source to mix from: padded.mp4 if we made one,
-      // else joined.mp4.
+      // Decide which source to mix from — LOCAL-FIRST, since the
+      // padded/joined checkpoints are no longer uploaded for new runs.
+      // Order matters: padded supersedes joined (Stage C deletes
+      // joined.mp4 after padding), and the checkpoint-URL branches
+      // only exist so checkpoints written by the previous worker
+      // version still resume.
       let mixSrc: string;
-      if (checkpoint.padded_url) {
-        mixSrc = path.join(tmpDir, "padded.mp4");
-        if (!fs.existsSync(mixSrc)) {
-          await checkStop();
-          await progress("Restoring padded video…");
-          await downloadFile(checkpoint.padded_url, mixSrc, signal);
-        }
+      const paddedLocal = path.join(tmpDir, "padded.mp4");
+      const joinedLocalPath = path.join(tmpDir, "joined.mp4");
+      if (fs.existsSync(paddedLocal)) {
+        mixSrc = paddedLocal;
+      } else if (checkpoint.padded_url) {
+        // Checked BEFORE local joined.mp4: on a legacy resume Stage C
+        // re-downloads joined to measure durations but skips padding
+        // (padded_url set), so a local joined here is the UNPADDED
+        // video — padded must win over it.
+        await checkStop();
+        await progress("Restoring padded video…");
+        await downloadFile(checkpoint.padded_url, paddedLocal, signal);
+        mixSrc = paddedLocal;
+      } else if (fs.existsSync(joinedLocalPath)) {
+        mixSrc = joinedLocalPath;
+      } else if (checkpoint.joined_url) {
+        await checkStop();
+        await progress("Restoring joined video…");
+        await downloadFile(checkpoint.joined_url, joinedLocalPath, signal);
+        mixSrc = joinedLocalPath;
       } else {
-        mixSrc = path.join(tmpDir, "joined.mp4");
-        if (!fs.existsSync(mixSrc)) {
-          await checkStop();
-          await progress("Restoring joined video…");
-          await downloadFile(checkpoint.joined_url!, mixSrc, signal);
-        }
+        // Unreachable: Stage B always leaves joined.mp4 on disk when
+        // no checkpoint URLs exist. Fail loud rather than mix nothing.
+        throw new Error("No mix source available — joined/padded missing from disk and checkpoint");
       }
       await checkStop();
       let bgmVolume = backgroundMusicVolume ?? 0.15;
@@ -2254,19 +2264,12 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
       }
       try { fs.unlinkSync(mixSrc); } catch { /* ignore */ }
       if (bgmConfig) { try { fs.unlinkSync(bgmConfig.path); } catch { /* ignore */ } }
-      try {
-        const mixedUrl = await uploadFile(ckptPathFor("mixed.mp4"), outputPath, "video/mp4");
-        checkpoint.mixed_url = mixedUrl;
-        await persistCheckpoint();
-        // mixed.mp4 IS the final video now (no Stage F re-encode).
-        // The in-progress preview row is no longer useful: by the
-        // time mixed.mp4 is uploaded, the assembly is essentially
-        // done — the upload-as-assembled step right below replaces
-        // assembled_url within seconds, so a preview row would
-        // flash on and off.
-      } catch (e) {
-        console.warn(`[assemble] mixed.mp4 checkpoint upload failed:`, e);
-      }
+      // The mixed.mp4 checkpoint upload used to live here. It was a
+      // full-video egress (Render bills outbound) duplicated by the
+      // assembled_*.mp4 upload seconds later, and its only consumer
+      // was the resume skip-ahead for a crash in that narrow window.
+      // checkpoint.mixed_url is still READ above so old checkpoints
+      // resume fine — it's just never written anymore.
       metrics.record("mix");
     }
 
