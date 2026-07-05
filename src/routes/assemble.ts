@@ -2322,6 +2322,10 @@ async function runAssembly(opts: AssembleOptions): Promise<void> {
     const remuxedDuration = await getMediaDuration(persistentPath).catch(() => 0);
     console.log(`[assemble] ${projectId}: remuxed duration = ${remuxedDuration.toFixed(2)}s`);
     if (remuxedDuration <= 0) throw new Error("Remuxed video has 0 duration — please reassemble");
+    // The remux is a full-size copy — drop the source immediately so the
+    // endgame holds ONE copy of the final video on disk, not two. Render's
+    // /tmp volume is capped at 2GB and long 1080p videos run 1GB+ each.
+    try { fs.unlinkSync(finalPath); } catch { /* ignore */ }
 
     await progress("Uploading to cloud…");
     previewFiles.set(projectId, persistentPath);
@@ -2684,10 +2688,31 @@ const previewFiles = new Map<string, string>(); // projectId → persistent prev
 export function setupAssembleRoute(app: Express): void {
   assemblyPollLoop().catch(console.error);
 
+  // On startup: sweep orphaned assemble-* run dirs. The per-run finally
+  // rmSync never fires when the process is SIGKILLed (OOM, deploy), and
+  // Render keeps /tmp across process restarts within an instance — so
+  // dead run dirs pile up until the 2GB volume cap kills the instance.
+  // No assembly is live at boot, so every assemble-* dir is garbage.
+  try {
+    for (const entry of fs.readdirSync(os.tmpdir())) {
+      if (!entry.startsWith("assemble-")) continue;
+      const dirPath = path.join(os.tmpdir(), entry);
+      try {
+        fs.rmSync(dirPath, { recursive: true, force: true });
+        console.log(`[startup-sweep] removed orphaned run dir: ${entry}`);
+      } catch (e) {
+        console.warn(`[startup-sweep] failed to remove ${entry}:`, e);
+      }
+    }
+  } catch (e) {
+    console.warn("[startup-sweep] tmpdir scan failed:", e);
+  }
+
   // On startup: restore preview files that survived a worker restart
   (async () => {
     try {
       const { data: previews } = await supabase.from("projects").select("id").eq("assembly_status", "preview");
+      const previewIds = new Set((previews ?? []).map((p) => p.id as string));
       for (const p of previews ?? []) {
         const filePath = path.join(PREVIEW_DIR, `${p.id}.mp4`);
         if (fs.existsSync(filePath)) {
@@ -2700,10 +2725,45 @@ export function setupAssembleRoute(app: Express): void {
           console.log(`[preview] expired (file missing): ${p.id}`);
         }
       }
+      // Reverse sweep: delete preview files with no matching
+      // assembly_status="preview" row (project deleted, cancelled, or
+      // long since completed). These were never cleaned before and
+      // accumulate at ~1GB apiece on the 2GB /tmp volume.
+      for (const file of fs.readdirSync(PREVIEW_DIR)) {
+        const projectId = file.replace(/\.mp4$/, "");
+        if (file.endsWith(".mp4") && !previewIds.has(projectId)) {
+          try {
+            fs.unlinkSync(path.join(PREVIEW_DIR, file));
+            console.log(`[preview] swept orphan: ${file}`);
+          } catch { /* ignore */ }
+        }
+      }
     } catch (e) {
       console.warn("[preview] restore failed:", e);
     }
   })();
+
+  // Hourly age eviction: an upload-failed preview keeps its row in
+  // assembly_status="preview" indefinitely, so neither sweep above ever
+  // touches it. After 48h assume the user isn't coming back for the
+  // retry and reclaim the ~1GB. Mirrors the restore block's expired
+  // transition so the UI shows the same "reassemble" message.
+  const PREVIEW_MAX_AGE_MS = 48 * 60 * 60 * 1000;
+  setInterval(() => {
+    for (const [projectId, filePath] of previewFiles) {
+      let mtimeMs: number;
+      try { mtimeMs = fs.statSync(filePath).mtimeMs; } catch { previewFiles.delete(projectId); continue; }
+      if (Date.now() - mtimeMs < PREVIEW_MAX_AGE_MS) continue;
+      previewFiles.delete(projectId);
+      try { fs.unlinkSync(filePath); } catch { /* ignore */ }
+      console.log(`[preview] evicted (older than 48h): ${projectId}`);
+      supabase.from("projects")
+        .update({ assembly_status: "failed", assembly_error: "Preview expired — please reassemble", assembly_progress: null, assembled_url: null })
+        .eq("id", projectId)
+        .eq("assembly_status", "preview")
+        .then(({ error }) => { if (error) console.warn(`[preview] evict DB update failed for ${projectId}:`, error.message); });
+    }
+  }, 60 * 60 * 1000).unref();
 
   app.get("/api/preview/:projectId", (req: Request, res: Response): void => {
     const filePath = previewFiles.get(req.params.projectId);
