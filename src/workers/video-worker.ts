@@ -84,7 +84,30 @@ async function processBeat(beat: QueuedBeat) {
     `[worker] Beat ${beatNumber} submit: model=${modelId} aspect=${aspectRatio}` +
     ` duration=${duration ?? "-"} resolution=${resolution ?? "-"}`,
   );
-  const jobId = await submitVideoJob(videoPrompt, modelId, kieApiKey, imageUrl, duration, aspectRatio, resolution);
+  // Point KIE at the youtube-engine app's video webhook so we get a
+  // push-notification the moment the render lands, cutting the "done
+  // on KIE but UI still generating" window from ~10s (poll interval)
+  // down to <2s (webhook + DB write + SWR refresh). The env var
+  // must be the PUBLIC origin of the Next.js app (NOT the worker's
+  // own URL, and NOT localhost — KIE can't reach that from their
+  // servers). Prefer YOUTUBE_ENGINE_URL, fall back to APP_URL (the
+  // name the worker's .env already used before webhooks landed).
+  // Falls back to no-callback if neither is set or if it's still a
+  // localhost URL — the poll loop finishes the beat, just with the
+  // old latency, so the fallback is a graceful degradation not a
+  // failure.
+  const engineUrl = (process.env.YOUTUBE_ENGINE_URL ?? process.env.APP_URL ?? "").replace(/\/$/, "");
+  const canReceiveWebhooks = engineUrl && !engineUrl.includes("localhost") && !engineUrl.includes("127.0.0.1");
+  const callBackUrl = canReceiveWebhooks ? `${engineUrl}/api/webhooks/kie/video` : undefined;
+  if (!canReceiveWebhooks) {
+    console.warn(
+      `[worker] Beat ${beatNumber} submitting WITHOUT callBackUrl ` +
+      `(engineUrl=${engineUrl || "unset"}) — KIE won't push completion, ` +
+      `worker's poll loop will finalize it. Set YOUTUBE_ENGINE_URL (or APP_URL) ` +
+      `to a public tunnel origin to enable webhooks.`,
+    );
+  }
+  const jobId = await submitVideoJob(videoPrompt, modelId, kieApiKey, imageUrl, duration, aspectRatio, resolution, callBackUrl);
   console.log(`[worker] Submitted video job: ${jobId}`);
 
   // Persist the KIE task id on the beat immediately so a worker
@@ -158,6 +181,14 @@ async function pollAndCommit(
   // and KIE billed the same clip twice. 240 × 10s = 40 min covers
   // essentially all real-world completions; SWEEP_RENDERING_TIMEOUT_MS
   // below keeps a 20-min buffer above this so the two never race.
+  //
+  // Note: with the KIE webhook wired up (POST /api/webhooks/kie/video
+  // on the youtube-engine app), this poll loop is now the BACKSTOP,
+  // not the primary completion signal. In the common case the webhook
+  // fires within seconds of KIE finishing and the beat lands "done"
+  // via that path; the next poll tick here reads video_status="done"
+  // and exits harmlessly. The loop only actually finalizes a beat
+  // when the webhook was missed / delayed — a genuinely rare case.
   const MAX_POLL_ATTEMPTS = 240;
   // KIE intermittently returns state=failed with no extractable reason
   // mid-generation, then completes successfully on the next poll. Track

@@ -98,6 +98,7 @@ export async function submitVideoJob(
   duration?: string | number,
   aspectRatio = "16:9",
   resolution?: string,
+  callBackUrl?: string,
 ): Promise<string> {
 
   // Veo
@@ -111,6 +112,7 @@ export async function submitVideoJob(
     if (imageUrl) body.imageUrls = [imageUrl];
     if (duration !== undefined) body.duration = duration;
     if (resolution) body.resolution = resolution;
+    if (callBackUrl) body.callBackUrl = callBackUrl;
     const res = await kieRequest<KieTaskResponse>("/api/v1/veo/generate", {
       method: "POST",
       body: JSON.stringify(body),
@@ -132,6 +134,7 @@ export async function submitVideoJob(
     if (!imageUrl) body.aspectRatio = aspectRatio;
     if (duration) body.duration = duration;
     if (imageUrl) body.imageUrl = imageUrl;
+    if (callBackUrl) body.callBackUrl = callBackUrl;
     const res = await kieRequest<KieTaskResponse>("/api/v1/runway/generate", {
       method: "POST",
       body: JSON.stringify(body),
@@ -220,7 +223,7 @@ export async function submitVideoJob(
 
   const res = await kieRequest<KieTaskResponse>("/api/v1/jobs/createTask", {
     method: "POST",
-    body: JSON.stringify({ model: modelId, input }),
+    body: JSON.stringify({ model: modelId, input, ...(callBackUrl ? { callBackUrl } : {}) }),
   }, apiKey);
   if (res.code !== 200) {
     // KIE often returns "This field is required" without naming the
