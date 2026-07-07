@@ -82,10 +82,28 @@ const MODEL_DURATION_KEYS: Record<string, string> = {
 };
 
 // Some models expose their output-size knob under a name that isn't
-// "resolution": kling-3.0 uses "mode" (std/pro/4K), runway uses
-// "quality" (720p/1080p). Everything else in the generic branch
-// defaults to input.resolution. Keep in sync with resolutionKey in
-// youtube-engine/lib/kie/videoModels.ts.
+// "resolution". This map is the WORKER'S copy of the resolutionKey
+// values declared in youtube-engine/lib/kie/videoModels.ts — every
+// entry there with a non-default resolutionKey MUST be mirrored here,
+// otherwise the worker sends the picker's chosen value under the wrong
+// input field name and KIE silently defaults to the model's cheapest
+// tier (the "picked 4K, got 720p" bug class).
+//
+// Current coverage:
+//   - kling-3.0/video   → input.mode      (std / pro / 4K)
+//   - runway            → body.quality    — handled inline in Runway's
+//                                            branch above; NOT read from
+//                                            this map because Runway
+//                                            uses a different endpoint
+//                                            entirely (/api/v1/runway/
+//                                            generate) with camelCase
+//                                            top-level fields, not the
+//                                            createTask input object.
+//   - everything else   → input.resolution (default fallback below)
+//
+// When adding a new video model in videoModels.ts, either verify its
+// resolutionKey is "resolution" (default here — do nothing) or add it
+// to this map at the same time.
 const MODEL_RESOLUTION_KEYS: Record<string, string> = {
   "kling-3.0/video": "mode",
 };
@@ -130,6 +148,17 @@ export async function submitVideoJob(
     // field — "Video quality cannot be empty". The picker now sends
     // the user's chosen tier through `resolution`; default to 720p
     // when the caller didn't pick one so this branch stays valid.
+    //
+    // A null resolution at this point should be rare — the picker
+    // defaults selectedVideoResolution to the first supported value
+    // on every model change, and the resolution pill is set-only
+    // (not toggle) as of the Bug 1 fix. If we see this warn line in
+    // production it means either a legacy beat submitted before those
+    // fixes or a race in the model-change effect — worth surfacing
+    // rather than hiding as a silent 720p downgrade.
+    if (!resolution) {
+      console.warn(`[kie] runway submit with no resolution, defaulting to 720p (would have KIE-rejected without a value)`);
+    }
     const body: Record<string, unknown> = { prompt, quality: resolution ?? "720p" };
     if (!imageUrl) body.aspectRatio = aspectRatio;
     if (duration) body.duration = duration;
@@ -170,23 +199,37 @@ export async function submitVideoJob(
     // the wrong field name.
     else if (modelId === "wan/2-6-flash-image-to-video") input.first_frame_url = imageUrl;
     else if (modelId === "sora-2-image-to-video") input.image_urls = [imageUrl];
-    else if (modelId === "bytedance/seedance-2-fast") input.first_frame_url = imageUrl;
+    // Both Seedance 2 variants (non-fast and fast) take first_frame_url
+    // per KIE docs — the fast variant is the only visual difference to
+    // the user, but the payload shape is identical. Non-fast used to
+    // fall through to the default input.image_url branch below, which
+    // KIE rejected with a "Video model rejected" or a
+    // "field is required" reply, causing the Seedance 2 4K path to
+    // fail without a clear signal to the user.
+    else if (modelId === "bytedance/seedance-2" || modelId === "bytedance/seedance-2-fast") {
+      input.first_frame_url = imageUrl;
+    }
     else if (modelId === "bytedance/seedance-1.5-pro") {
       // Seedance 1.5 Pro on KIE needs input_urls + a stack of
       // required scalars (resolution, fixed_lens, generate_audio,
       // nsfw_checker, aspect_ratio) that all surface as
       // "This field is required" if missing. Confirmed via the
-      // KIE playground example body. Defaults:
-      //   resolution     = "720p" (cheaper tier; expose 1080p later if needed)
+      // KIE playground example body.
       //   fixed_lens     = false  (allow camera motion)
       //   generate_audio = false  (we add audio downstream via TTS)
       //   nsfw_checker   = false  (don't auto-block legitimate content)
+      // input.resolution was previously set here with a "720p" default;
+      // now it's covered by the generic resolution injection above,
+      // which uses the picker's selection when available. If the
+      // picker didn't pass a value (rare — only happens on legacy
+      // beats predating migration 090), KIE errors with
+      // "field is required" — that's the correct failure mode
+      // instead of silently downgrading to 720p.
       // aspect_ratio is required EVEN with input_urls present —
       // the generic if-no-image branch above misses this case for
       // Seedance, so we set it here explicitly.
       input.input_urls = [imageUrl];
       input.aspect_ratio = aspectRatio;
-      input.resolution = resolution ?? "720p";
       input.fixed_lens = false;
       input.generate_audio = false;
       input.nsfw_checker = false;
@@ -202,20 +245,24 @@ export async function submitVideoJob(
       input.image_urls = [imageUrl];
       input.sound = false;
     } else if (modelId === "kling-3.0/video") {
-      // Kling 3.0 needs everything 2.6 wants plus aspect_ratio,
-      // mode, and multi_shots. mode is "std" | "pro" — std is
-      // cheaper, pro is higher quality (defaulting std). multi_shots
-      // controls Kling's storyboard-style multi-segment feature; we
-      // pass false to use the single prompt path. KIE rejects with
-      // "multi_shots cannot be empty" if the field is missing
-      // entirely, so it's effectively required even when off.
-      // aspect_ratio is required even with image_urls present,
-      // unlike most other KIE models where it only matters for
-      // text-to-video.
+      // Kling 3.0 needs everything 2.6 wants plus aspect_ratio and
+      // multi_shots. multi_shots controls Kling's storyboard-style
+      // multi-segment feature; we pass false to use the single-prompt
+      // path. KIE rejects with "multi_shots cannot be empty" if the
+      // field is missing entirely, so it's effectively required even
+      // when off. aspect_ratio is required even with image_urls
+      // present, unlike most other KIE models where it only matters
+      // for text-to-video.
+      //
+      // input.mode was previously set here with a "std" default; now
+      // it's covered by the generic resolution injection above via
+      // MODEL_RESOLUTION_KEYS["kling-3.0/video"] = "mode". If the
+      // picker didn't pass a value, KIE errors with
+      // "field is required" — that's the correct failure mode
+      // instead of silently downgrading to std tier.
       input.image_urls = [imageUrl];
       input.sound = false;
       input.aspect_ratio = aspectRatio;
-      input.mode = resolution ?? "std";
       input.multi_shots = false;
     }
     else input.image_url = imageUrl;
