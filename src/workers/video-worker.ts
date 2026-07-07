@@ -398,47 +398,62 @@ async function tryClaimBeat(beat: QueuedBeat): Promise<boolean> {
   return !error && !!data;
 }
 
-// Return any beat stuck in submitting/rendering longer than we'd ever
-// legitimately keep it there back to "queued". Two cutoffs because the
-// two states have very different expected durations:
-//   - submitting: only long enough to POST to KIE and get a job_id back
-//     (a few seconds). Anything older than 2 minutes is orphaned — the
-//     worker crashed before the KIE call landed.
-//   - rendering: bounded by the poll loop's own MAX_POLL_ATTEMPTS ×
-//     10s = 40 min. 20-min buffer above that keeps the sweeper from
-//     racing the loop's legitimate final polls on 4K + long-duration
-//     jobs — anything older than 60 min is definitely stuck.
+// Return any beat truly stuck in submitting/rendering back to "queued".
+// The "truly stuck" definition depends on whether a KIE job_id is
+// attached to the beat:
+//   - No job_id     → the worker crashed before the KIE call landed.
+//                     Reset after the short cutoff so the pollLoop can
+//                     re-submit cleanly (~2 min for submitting;
+//                     rendering-without-jobid shouldn't happen but is
+//                     handled with the same fast cutoff to be safe).
+//   - Has job_id    → KIE has the job. The beat could be sitting in
+//                     KIE's own queue (raw_state="waiting") for many
+//                     minutes before rendering starts, which is why we
+//                     don't promote to "rendering" during that window.
+//                     Only sweep after the long cutoff (60 min) so a
+//                     legitimate KIE queue wait doesn't get restarted
+//                     under a running poll loop — that was creating a
+//                     second KIE submission for the same clip every
+//                     time a submitting beat sat waiting for > 2 min.
 //
-// NULL video_started_at is treated as "old enough to reset" so beats
-// created before this migration also get swept eventually.
-const SWEEP_SUBMITTING_TIMEOUT_MS = 2 * 60_000;
-const SWEEP_RENDERING_TIMEOUT_MS  = 60 * 60_000;
+// NULL video_started_at is treated as "old enough to reset" for the
+// no-job-id case (crashed beats predating migration 079); job_id-present
+// beats without a started_at stamp are still governed by the long cutoff.
+const SWEEP_NO_JOBID_TIMEOUT_MS  = 2 * 60_000;
+const SWEEP_ACTIVE_JOB_TIMEOUT_MS = 60 * 60_000;
 async function sweepStuckBeats(): Promise<void> {
   try {
-    const submittingCutoff = new Date(Date.now() - SWEEP_SUBMITTING_TIMEOUT_MS).toISOString();
-    const renderingCutoff  = new Date(Date.now() - SWEEP_RENDERING_TIMEOUT_MS).toISOString();
+    const shortCutoff = new Date(Date.now() - SWEEP_NO_JOBID_TIMEOUT_MS).toISOString();
+    const longCutoff  = new Date(Date.now() - SWEEP_ACTIVE_JOB_TIMEOUT_MS).toISOString();
 
-    // One sweep per state so each can use its own cutoff. `.or()` on
-    // video_started_at picks up rows with NULL too (they predate
-    // migration 079).
-    const runSweep = async (state: "submitting" | "rendering", cutoffIso: string) => {
-      const { data, error } = await supabase
-        .from("project_beats")
-        .update({ video_status: "queued", video_job_id: null })
-        .eq("video_status", state)
-        .or(`video_started_at.is.null,video_started_at.lt.${cutoffIso}`)
-        .select("project_id, beat_number");
-      if (error) {
-        console.warn(`[worker] Sweep ${state} failed:`, error.message);
-        return 0;
-      }
-      return data?.length ?? 0;
-    };
+    // Fast path: no video_job_id → worker died before submit landed.
+    // Applies to both "submitting" and "rendering" (the latter shouldn't
+    // happen in practice but if it does, no job to poll = truly stuck).
+    const { data: noJobidData, error: noJobidErr } = await supabase
+      .from("project_beats")
+      .update({ video_status: "queued", video_job_id: null })
+      .in("video_status", ["submitting", "rendering"])
+      .is("video_job_id", null)
+      .or(`video_started_at.is.null,video_started_at.lt.${shortCutoff}`)
+      .select("project_id, beat_number");
+    if (noJobidErr) console.warn(`[worker] Sweep (no job id) failed:`, noJobidErr.message);
+    const sweptNoJobid = noJobidData?.length ?? 0;
 
-    const swept = await runSweep("submitting", submittingCutoff);
-    const swept2 = await runSweep("rendering", renderingCutoff);
-    if (swept > 0 || swept2 > 0) {
-      console.log(`[worker] Sweeper reset stuck beats: submitting=${swept}, rendering=${swept2}`);
+    // Slow path: has video_job_id → KIE has the job, might just be in
+    // their queue. Only sweep if the beat has been sitting well past
+    // our own poll ceiling (240 attempts × 10s = 40 min) plus buffer.
+    const { data: activeData, error: activeErr } = await supabase
+      .from("project_beats")
+      .update({ video_status: "queued", video_job_id: null })
+      .in("video_status", ["submitting", "rendering"])
+      .not("video_job_id", "is", null)
+      .lt("video_started_at", longCutoff)
+      .select("project_id, beat_number");
+    if (activeErr) console.warn(`[worker] Sweep (active job) failed:`, activeErr.message);
+    const sweptActive = activeData?.length ?? 0;
+
+    if (sweptNoJobid > 0 || sweptActive > 0) {
+      console.log(`[worker] Sweeper reset stuck beats: noJobId=${sweptNoJobid}, activeButStale=${sweptActive}`);
     }
   } catch (err) {
     console.warn("[worker] Sweep loop error:", err instanceof Error ? err.message : err);
