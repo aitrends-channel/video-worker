@@ -2,7 +2,7 @@ import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import fs from "fs";
-import { startVideoWorker } from "./workers/video-worker.js";
+import { startVideoWorker, resumeBeatPoll, type QueuedBeat } from "./workers/video-worker.js";
 import { setupHealthRoutes } from "./routes/health.js";
 import { setupAssembleRoute } from "./routes/assemble.js";
 import { setupTranscriptRoute } from "./routes/transcript.js";
@@ -86,17 +86,78 @@ const { error: cleanupError } = await supabase.from("projects")
 if (cleanupError) console.error("[server] Failed to re-queue stale assemblies:", cleanupError.message);
 else console.log("[server] Re-queued stale processing assemblies");
 
-// Re-queue any video beats stuck in "rendering" OR "submitting" —
-// they were mid-flight when the last instance died. Both states
-// imply a worker had claimed the beat but never finished. Resetting
-// to "queued" lets the new instance pick them up cleanly. Wiping
-// video_job_id prevents any stale poll from a previous job from
-// accidentally completing this row.
-const { error: renderingError } = await supabase.from("project_beats")
-  .update({ video_status: "queued", video_job_id: null, video_error: null })
-  .in("video_status", ["rendering", "submitting"]);
-if (renderingError) console.error("[server] Failed to re-queue stale rendering beats:", renderingError.message);
-else console.log("[server] Re-queued stale rendering/submitting beats");
+// Recover any video beats that were mid-flight when the last worker
+// instance died. Two paths:
+//   • beat still has a valid video_job_id → RESUME polling the
+//     existing KIE job instead of re-submitting. Prevents the "same
+//     clip billed twice" pattern we hit whenever tsx-watch reloads
+//     the worker or a Vercel deploy rolls the process. The KIE
+//     render keeps running server-side while we were down.
+//   • beat has no video_job_id (worker died before submit landed)
+//     → reset to "queued" so the pollLoop picks it up cleanly.
+{
+  const { data: staleBeats, error: staleErr } = await supabase.from("project_beats")
+    .select(`
+      beat_number, project_id, video_prompt, image_url, video_status, video_job_id,
+      video_model_id, video_duration, video_aspect_ratio, video_resolution,
+      projects!inner(user_id, video_model_id, video_duration, video_aspect_ratio, video_resolution)
+    `)
+    .in("video_status", ["rendering", "submitting"]);
+
+  if (staleErr) console.error("[server] Failed to query stale video beats:", staleErr.message);
+
+  const rows = staleBeats ?? [];
+  const toResume = rows.filter((r) => !!r.video_job_id);
+  const toRequeue = rows.filter((r) => !r.video_job_id);
+
+  // Reset each no-job-id beat individually so the update is scoped
+  // to that (project_id, beat_number) pair — a bulk .in() couldn't
+  // combine both keys cleanly.
+  for (const r of toRequeue) {
+    const { error } = await supabase.from("project_beats")
+      .update({ video_status: "queued", video_job_id: null, video_error: null })
+      .eq("project_id", r.project_id as string)
+      .eq("beat_number", r.beat_number as number);
+    if (error) console.error(`[server] Failed to re-queue beat ${r.beat_number}:`, error.message);
+  }
+  console.log(`[server] Video-beat recovery: resume=${toResume.length}, requeue=${toRequeue.length}`);
+
+  // Kick off resume-polls in parallel. Each promise handles its own
+  // errors (marking the beat failed) via the same catch handler as
+  // the normal pollLoop path. Fire-and-forget on purpose — startup
+  // continues, and the resume-polls run alongside the pollLoop.
+  for (const r of toResume) {
+    const proj = Array.isArray(r.projects) ? r.projects[0] : r.projects as Record<string, unknown>;
+    const beatModelId = (r.video_model_id as string | null) ?? (proj?.video_model_id as string | null);
+    const beatDuration = (r.video_duration as string | number | null) ?? (proj?.video_duration as string | number | null);
+    const beatAspectRatio = (r.video_aspect_ratio as string | null) ?? (proj?.video_aspect_ratio as string | null);
+    const beatResolution = (r.video_resolution as string | null) ?? (proj?.video_resolution as string | null);
+    const userId = proj?.user_id as string | undefined;
+    if (!beatModelId || !userId) {
+      console.warn(`[server] Cannot resume beat ${r.beat_number} — missing model/user; leaving as-is`);
+      continue;
+    }
+    const beat: QueuedBeat = {
+      beat_number: r.beat_number as number,
+      project_id: r.project_id as string,
+      video_prompt: r.video_prompt as string,
+      image_url: r.image_url as string | undefined,
+      video_model_id: beatModelId,
+      video_duration: beatDuration ?? undefined,
+      video_aspect_ratio: beatAspectRatio ?? "16:9",
+      video_resolution: beatResolution ?? undefined,
+      user_id: userId,
+    };
+    void resumeBeatPoll(beat, r.video_job_id as string, r.video_status === "rendering")
+      .catch(async (err: Error) => {
+        console.error(`[server] Resume-poll failed for beat ${r.beat_number}:`, err.message);
+        await supabase.from("project_beats")
+          .update({ video_status: "failed", video_error: err.message })
+          .eq("project_id", r.project_id as string)
+          .eq("beat_number", r.beat_number as number);
+      });
+  }
+}
 
 // Start server
 const server = app.listen(PORT, () => {

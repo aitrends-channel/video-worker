@@ -7,7 +7,7 @@ function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-interface QueuedBeat {
+export interface QueuedBeat {
   beat_number: number;
   project_id: string;
   video_prompt: string;
@@ -67,16 +67,7 @@ async function processBeat(beat: QueuedBeat) {
 
   console.log(`[worker] Processing beat ${beatNumber} for project ${projectId}`);
 
-  const { data: settings, error: settingsError } = await supabase
-    .from("account_settings")
-    .select("kie_api_key")
-    .eq("user_id", userId)
-    .single();
-
-  if (settingsError) console.warn(`[worker] Could not fetch settings for ${userId}:`, settingsError.message);
-
-  const kieApiKey = settings?.kie_api_key ?? process.env.KIE_API_KEY;
-  if (!kieApiKey) throw new Error(`No KIE API key found for user ${userId}`);
+  const kieApiKey = await getKieApiKeyFor(userId);
 
   // Wall-clock from submit to terminal status — powers the engine's
   // "Fastest" tab in the video model picker. Stamped here so the
@@ -96,6 +87,56 @@ async function processBeat(beat: QueuedBeat) {
   const jobId = await submitVideoJob(videoPrompt, modelId, kieApiKey, imageUrl, duration, aspectRatio, resolution);
   console.log(`[worker] Submitted video job: ${jobId}`);
 
+  // Persist the KIE task id on the beat immediately so a worker
+  // restart after this line but before the poll finishes can resume
+  // by polling the existing job instead of re-submitting.
+  await supabase.from("project_beats")
+    .update({ video_job_id: jobId })
+    .eq("project_id", projectId)
+    .eq("beat_number", beatNumber);
+
+  await pollAndCommit(beat, jobId, kieApiKey, submitT0, false);
+}
+
+// Fetch the KIE key for a user, falling back to the process-env key.
+// Extracted so processBeat and resumeBeatPoll share the same lookup.
+async function getKieApiKeyFor(userId: string): Promise<string> {
+  const { data: settings, error: settingsError } = await supabase
+    .from("account_settings")
+    .select("kie_api_key")
+    .eq("user_id", userId)
+    .single();
+  if (settingsError) console.warn(`[worker] Could not fetch settings for ${userId}:`, settingsError.message);
+  const key = settings?.kie_api_key ?? process.env.KIE_API_KEY;
+  if (!key) throw new Error(`No KIE API key found for user ${userId}`);
+  return key;
+}
+
+// Resume watching a KIE job that a previous worker instance
+// submitted but never got to poll to completion (typically because
+// the process restarted mid-render). Skips the submit step entirely
+// so KIE doesn't get billed twice for the same clip.
+export async function resumeBeatPoll(beat: QueuedBeat, jobId: string, alreadyRendering: boolean) {
+  const { beat_number: beatNumber, project_id: projectId, user_id: userId } = beat;
+  console.log(`[worker] Resuming beat ${beatNumber} (project ${projectId}) — existing KIE job ${jobId}`);
+  const kieApiKey = await getKieApiKeyFor(userId);
+  // We don't know the original submit timestamp; pass Date.now() so
+  // the ledger's elapsedMs entry is at least monotonic. Cost/latency
+  // stats for resumed beats undercount, but the beat itself still
+  // commits correctly.
+  await pollAndCommit(beat, jobId, kieApiKey, Date.now(), alreadyRendering);
+}
+
+async function pollAndCommit(
+  beat: QueuedBeat,
+  jobId: string,
+  kieApiKey: string,
+  submitT0: number,
+  alreadyRendering: boolean,
+) {
+  const { beat_number: beatNumber, project_id: projectId,
+    video_model_id: modelId, video_duration: duration, user_id: userId } = beat;
+
   // Note: we deliberately do NOT flip the beat to "rendering" yet.
   // KIE accepting the submission only means it has the request, not
   // that it's actively producing video — the first few polls often
@@ -104,12 +145,20 @@ async function processBeat(beat: QueuedBeat) {
   // promotes to "rendering" when a poll actually returns status=
   // "processing". That way the UI badge is honest: "rendering"
   // means KIE is genuinely working on this clip right now.
-  let promotedToRendering = false;
+  //
+  // For resumed beats already in "rendering" state, skip the promote
+  // step to avoid a needless DB write.
+  let promotedToRendering = alreadyRendering;
 
   let videoUrl: string | undefined;
-  // Kling 3.0, Veo, and longer clips can legitimately run 12-18 min on KIE.
-  // 120 attempts × 10s = 20 min ceiling catches almost all stragglers.
-  const MAX_POLL_ATTEMPTS = 120;
+  // 4K + longer-duration clips (Seedance 4k, Kling 4K mode, 15s Grok
+  // Imagine, etc.) can legitimately run 30-45 min on KIE. The old
+  // 20-min ceiling was giving up mid-render, then the sweeper flipped
+  // the beat back to "queued" 10 min later, so the worker re-submitted
+  // and KIE billed the same clip twice. 240 × 10s = 40 min covers
+  // essentially all real-world completions; SWEEP_RENDERING_TIMEOUT_MS
+  // below keeps a 20-min buffer above this so the two never race.
+  const MAX_POLL_ATTEMPTS = 240;
   // KIE intermittently returns state=failed with no extractable reason
   // mid-generation, then completes successfully on the next poll. Track
   // unexplained failures (empty error string from pollVideoJob — the
@@ -329,14 +378,14 @@ async function tryClaimBeat(beat: QueuedBeat): Promise<boolean> {
 //     (a few seconds). Anything older than 2 minutes is orphaned — the
 //     worker crashed before the KIE call landed.
 //   - rendering: bounded by the poll loop's own MAX_POLL_ATTEMPTS ×
-//     10s = 20 min. Add a small buffer so we don't race the loop's
-//     legitimate final polls, then anything older than 30 min is
-//     definitely stuck.
+//     10s = 40 min. 20-min buffer above that keeps the sweeper from
+//     racing the loop's legitimate final polls on 4K + long-duration
+//     jobs — anything older than 60 min is definitely stuck.
 //
 // NULL video_started_at is treated as "old enough to reset" so beats
 // created before this migration also get swept eventually.
 const SWEEP_SUBMITTING_TIMEOUT_MS = 2 * 60_000;
-const SWEEP_RENDERING_TIMEOUT_MS  = 30 * 60_000;
+const SWEEP_RENDERING_TIMEOUT_MS  = 60 * 60_000;
 async function sweepStuckBeats(): Promise<void> {
   try {
     const submittingCutoff = new Date(Date.now() - SWEEP_SUBMITTING_TIMEOUT_MS).toISOString();
