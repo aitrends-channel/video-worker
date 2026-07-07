@@ -168,10 +168,37 @@ async function pollAndCommit(
   // immediately so legit failures don't waste the full 20-min budget.
   const SOFT_FAIL_LIMIT = 3;
   let softFailures = 0;
+  // Network hiccups on pollVideoJob (KIE 5xx, DNS blip, TCP reset, undici
+  // "fetch failed") used to propagate straight to the catch handler and
+  // mark the beat failed even though the KIE job was still running. Now
+  // we absorb the throw, log a warning, and treat it exactly like a
+  // KIE "pending" — the poll simply continues on the next tick. The
+  // beat is only marked failed if network errors keep landing for the
+  // whole NETWORK_FAIL_LIMIT window in a row, which is genuinely stuck.
+  const NETWORK_FAIL_LIMIT = 6;
+  let networkFailures = 0;
 
   for (let attempt = 0; attempt < MAX_POLL_ATTEMPTS; attempt++) {
     await sleep(10000);
-    const status = await pollVideoJob(jobId, modelId, kieApiKey);
+    let status: Awaited<ReturnType<typeof pollVideoJob>>;
+    try {
+      status = await pollVideoJob(jobId, modelId, kieApiKey);
+    } catch (err) {
+      networkFailures++;
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(
+        `[worker] Beat ${beatNumber} poll attempt ${attempt + 1} network error ` +
+        `(${networkFailures}/${NETWORK_FAIL_LIMIT}): ${msg}`,
+      );
+      if (networkFailures >= NETWORK_FAIL_LIMIT) {
+        throw new Error(`kie.ai unreachable after ${NETWORK_FAIL_LIMIT} consecutive poll attempts: ${msg}`);
+      }
+      continue;
+    }
+    // Any successful poll response — regardless of KIE's own state —
+    // resets the network counter. Only consecutive throws mean the
+    // channel is actually down.
+    networkFailures = 0;
     console.log(`[worker] Poll attempt ${attempt + 1} beat=${beatNumber} status=${status.status} hasUrl=${!!status.videoUrl}${status.error ? ` err="${status.error}"` : ""}`);
     // Log credits as soon as KIE bills us (done OR failed). The
     // ledger should reflect actual spend even on failed jobs since
