@@ -259,9 +259,25 @@ async function pollAndCommit(
     }
     if (status.status === "failed") {
       const reason = (status.error ?? "").trim();
-      if (!reason && softFailures + 1 < SOFT_FAIL_LIMIT) {
+      // Soft-fail retry gate: any reason KIE explicitly labels as
+      // transient (or gives us zero context on) is worth another few
+      // polls. A definitive reason (invalid model, credit exhausted,
+      // content rejected, etc.) short-circuits to hard fail so we
+      // don't waste the poll budget chasing an unrecoverable job.
+      const lower = reason.toLowerCase();
+      const looksTransient =
+        !reason
+        || lower.includes("internal error")
+        || lower.includes("please try again")
+        || lower.includes("try again later")
+        || lower.includes("temporarily unavailable")
+        || lower.includes("timeout")
+        || lower.includes("timed out")
+        || /\b5\d{2}\b/.test(lower); // matches 500, 502, 503, 504 style codes
+      if (looksTransient && softFailures + 1 < SOFT_FAIL_LIMIT) {
         softFailures++;
-        console.warn(`[worker] Beat ${beatNumber} soft-fail ${softFailures}/${SOFT_FAIL_LIMIT - 1} (no reason from KIE) — retrying`);
+        const label = reason ? `"${reason}"` : "(no reason from KIE)";
+        console.warn(`[worker] Beat ${beatNumber} soft-fail ${softFailures}/${SOFT_FAIL_LIMIT - 1} ${label} — retrying`);
         continue;
       }
       throw new Error(`kie.ai video job failed: ${reason || "no reason returned by KIE"}`);
