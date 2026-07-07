@@ -15,6 +15,7 @@ interface QueuedBeat {
   video_model_id: string;
   video_duration?: string | number;
   video_aspect_ratio: string;
+  video_resolution?: string;
   user_id: string;
 }
 
@@ -62,7 +63,7 @@ async function failAllQueued(errorMessage: string) {
 async function processBeat(beat: QueuedBeat) {
   const { beat_number: beatNumber, project_id: projectId, video_prompt: videoPrompt,
     image_url: imageUrl, video_model_id: modelId, video_duration: duration,
-    video_aspect_ratio: aspectRatio, user_id: userId } = beat;
+    video_aspect_ratio: aspectRatio, video_resolution: resolution, user_id: userId } = beat;
 
   console.log(`[worker] Processing beat ${beatNumber} for project ${projectId}`);
 
@@ -83,7 +84,7 @@ async function processBeat(beat: QueuedBeat) {
   // hitting Queue and the clip becoming available. Includes KIE
   // queueing + actual generation, which is what matters for ranking.
   const submitT0 = Date.now();
-  const jobId = await submitVideoJob(videoPrompt, modelId, kieApiKey, imageUrl, duration, aspectRatio);
+  const jobId = await submitVideoJob(videoPrompt, modelId, kieApiKey, imageUrl, duration, aspectRatio, resolution);
   console.log(`[worker] Submitted video job: ${jobId}`);
 
   // Note: we deliberately do NOT flip the beat to "rendering" yet.
@@ -388,7 +389,7 @@ async function pollLoop() {
           .from("project_beats")
           .select(`
             beat_number, project_id, video_prompt, image_url,
-            projects!inner(user_id, video_model_id, video_duration, video_aspect_ratio)
+            projects!inner(user_id, video_model_id, video_duration, video_aspect_ratio, video_resolution)
           `)
           .eq("video_status", "queued")
           .limit(slots);
@@ -404,6 +405,7 @@ async function pollLoop() {
             video_model_id: proj?.video_model_id as string,
             video_duration: proj?.video_duration as string | number | undefined,
             video_aspect_ratio: (proj?.video_aspect_ratio as string) ?? "16:9",
+            video_resolution: (proj?.video_resolution as string | undefined) ?? undefined,
             user_id: proj?.user_id as string,
           };
 

@@ -81,13 +81,23 @@ const MODEL_DURATION_KEYS: Record<string, string> = {
   "sora-2-image-to-video": "n_frames",
 };
 
+// Some models expose their output-size knob under a name that isn't
+// "resolution": kling-3.0 uses "mode" (std/pro/4K), runway uses
+// "quality" (720p/1080p). Everything else in the generic branch
+// defaults to input.resolution. Keep in sync with resolutionKey in
+// youtube-engine/lib/kie/videoModels.ts.
+const MODEL_RESOLUTION_KEYS: Record<string, string> = {
+  "kling-3.0/video": "mode",
+};
+
 export async function submitVideoJob(
   prompt: string,
   modelId: string,
   apiKey: string,
   imageUrl?: string,
   duration?: string | number,
-  aspectRatio = "16:9"
+  aspectRatio = "16:9",
+  resolution?: string,
 ): Promise<string> {
 
   // Veo
@@ -99,6 +109,8 @@ export async function submitVideoJob(
     const body: Record<string, unknown> = { prompt, model: modelId };
     if (!imageUrl) body.aspect_ratio = aspectRatio;
     if (imageUrl) body.imageUrls = [imageUrl];
+    if (duration !== undefined) body.duration = duration;
+    if (resolution) body.resolution = resolution;
     const res = await kieRequest<KieTaskResponse>("/api/v1/veo/generate", {
       method: "POST",
       body: JSON.stringify(body),
@@ -113,10 +125,10 @@ export async function submitVideoJob(
   // Runway
   if (modelId === "runway") {
     // KIE's Runway endpoint rejects submissions without a quality
-    // field — "Video quality cannot be empty". 720p is a safe default
-    // for Gen-3 Turbo; surface a user-selectable picker later if we
-    // want to expose 1080p / standard / high tiers.
-    const body: Record<string, unknown> = { prompt, quality: "720p" };
+    // field — "Video quality cannot be empty". The picker now sends
+    // the user's chosen tier through `resolution`; default to 720p
+    // when the caller didn't pick one so this branch stays valid.
+    const body: Record<string, unknown> = { prompt, quality: resolution ?? "720p" };
     if (!imageUrl) body.aspectRatio = aspectRatio;
     if (duration) body.duration = duration;
     if (imageUrl) body.imageUrl = imageUrl;
@@ -137,6 +149,14 @@ export async function submitVideoJob(
   if (duration !== undefined) {
     const key = MODEL_DURATION_KEYS[modelId] ?? "duration";
     input[key] = duration;
+  }
+  // Generic resolution injection: covers grok-imagine, wan/2-7, wan/2-6-flash,
+  // seedance-2, and seedance-2-fast which don't need any other tweaks. The
+  // model-specific branches below (seedance-1.5-pro, kling-3.0) also set
+  // resolution/mode inline — they will override this with the same value.
+  if (resolution) {
+    const key = MODEL_RESOLUTION_KEYS[modelId] ?? "resolution";
+    input[key] = resolution;
   }
   if (imageUrl) {
     if (modelId === "grok-imagine/image-to-video") input.image_urls = [imageUrl];
@@ -163,7 +183,7 @@ export async function submitVideoJob(
       // Seedance, so we set it here explicitly.
       input.input_urls = [imageUrl];
       input.aspect_ratio = aspectRatio;
-      input.resolution = "720p";
+      input.resolution = resolution ?? "720p";
       input.fixed_lens = false;
       input.generate_audio = false;
       input.nsfw_checker = false;
@@ -192,7 +212,7 @@ export async function submitVideoJob(
       input.image_urls = [imageUrl];
       input.sound = false;
       input.aspect_ratio = aspectRatio;
-      input.mode = "std";
+      input.mode = resolution ?? "std";
       input.multi_shots = false;
     }
     else input.image_url = imageUrl;
