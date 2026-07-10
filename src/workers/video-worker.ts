@@ -284,9 +284,15 @@ async function pollAndCommit(
     }
     if (status.status === "done") {
       if (status.videoUrl) { videoUrl = status.videoUrl; break; }
-      // Done but no URL — log full response and keep polling briefly in case URL appears
-      console.warn(`[worker] Beat ${beatNumber} done but no videoUrl yet, attempt ${attempt + 1}`);
-      if (attempt >= 3) throw new Error("Job completed on KIE but no video URL was returned");
+      // Done but no URL yet — keep polling. Some models (notably Veo at
+      // 4K) report the base render "done", then run a separate upscale
+      // pass before the final URL is populated. Hard-failing here after a
+      // few attempts (~40s) is what surfaced "completed on KIE but no url
+      // returned" while KIE was still upscaling. The overall
+      // MAX_POLL_ATTEMPTS (40 min) ceiling is the real backstop, so we
+      // just log and continue. (pollVideoJob now also maps this state to
+      // "processing", so we rarely land here at all.)
+      console.warn(`[worker] Beat ${beatNumber} done but no videoUrl yet, attempt ${attempt + 1} — continuing to poll`);
     }
     if (status.status === "failed") {
       const reason = (status.error ?? "").trim();

@@ -284,6 +284,31 @@ export async function submitVideoJob(
   return res.data.taskId;
 }
 
+// Pull a playable http(s) URL out of a KIE record-info payload, tolerating
+// the several shapes different model families use: a direct videoUrl, a
+// resultJson blob (JSON with resultUrls/url/videoUrl/video_url, or a bare
+// http string), or an output array/string. Returns undefined when no
+// usable URL is present yet — callers MUST treat that as "not ready"
+// (keep polling), never as a completed job.
+function extractVideoUrl(d: KieRecordResponse["data"] | undefined): string | undefined {
+  if (!d) return undefined;
+  if (typeof d.videoUrl === "string" && d.videoUrl.startsWith("http")) return d.videoUrl;
+  if (typeof d.video_url === "string" && d.video_url.startsWith("http")) return d.video_url;
+  if (typeof d.videoInfo?.videoUrl === "string" && d.videoInfo.videoUrl.startsWith("http")) return d.videoInfo.videoUrl;
+  if (typeof d.resultJson === "string") {
+    try {
+      const parsed = JSON.parse(d.resultJson) as { resultUrls?: string[]; url?: string; videoUrl?: string; video_url?: string };
+      const u = parsed.resultUrls?.[0] ?? parsed.videoUrl ?? parsed.video_url ?? parsed.url;
+      if (typeof u === "string" && u.startsWith("http")) return u;
+    } catch {
+      if (d.resultJson.startsWith("http")) return d.resultJson;
+    }
+  }
+  if (Array.isArray(d.output)) { const u = (d.output as string[]).find((x) => typeof x === "string" && x.startsWith("http")); if (u) return u; }
+  if (typeof d.output === "string" && d.output.startsWith("http")) return d.output;
+  return undefined;
+}
+
 export async function pollVideoJob(
   taskId: string,
   modelId: string,
@@ -295,7 +320,17 @@ export async function pollVideoJob(
     const data = await kieRequest<KieRecordResponse>(`/api/v1/veo/record-info?taskId=${taskId}`, {}, apiKey);
     const flag = data.data?.successFlag;
     const creditsConsumed = typeof data.data?.creditsConsumed === "number" ? data.data.creditsConsumed : undefined;
-    if (flag === 1) return { status: "done", videoUrl: data.data?.videoUrl ?? (typeof data.data?.resultJson === "string" ? data.data.resultJson : undefined), creditsConsumed };
+    if (flag === 1) {
+      const url = extractVideoUrl(data.data);
+      // Veo reports successFlag=1 for the base render, then runs a
+      // SEPARATE upscale pass (e.g. 720p/1080p → 4K) before the final
+      // URL is populated. Report "done" ONLY once a real URL exists;
+      // otherwise stay "processing" and keep polling through the upscale.
+      // Returning done here without a URL (and treating raw resultJson as
+      // a URL) is what surfaced "completed on KIE but no url returned".
+      if (url) return { status: "done", videoUrl: url, creditsConsumed };
+      return { status: "processing", creditsConsumed };
+    }
     if (flag === 2 || flag === 3) {
       const reason = extractFailureReason(data.data);
       console.log(`[kie] Veo failed taskId=${taskId} flag=${flag} reason=${reason ?? "(none)"} keys=${Object.keys(data.data ?? {}).join(",")}`);
@@ -354,21 +389,15 @@ export async function pollVideoJob(
 
   let videoUrl: string | undefined;
   if (jobStatus === "done") {
-    // Check top-level videoUrl first
-    if (typeof d?.videoUrl === "string" && d.videoUrl.startsWith("http")) videoUrl = d.videoUrl;
-    // Check resultJson
-    if (!videoUrl && typeof d?.resultJson === "string") {
-      try {
-        const parsed = JSON.parse(d.resultJson) as { resultUrls?: string[]; url?: string; videoUrl?: string; video_url?: string };
-        videoUrl = parsed.resultUrls?.[0] ?? parsed.videoUrl ?? parsed.video_url ?? parsed.url;
-      } catch {
-        if (d.resultJson.startsWith("http")) videoUrl = d.resultJson;
-      }
+    videoUrl = extractVideoUrl(d);
+    // A "done" state with no URL yet (a provider that flips state before
+    // the asset is written, or a follow-up upscale still running) is
+    // treated as still processing so the worker keeps polling rather than
+    // hard-failing with "completed but no url".
+    if (!videoUrl) {
+      console.warn(`[kie] Done state but no videoUrl yet — treating as processing. data=${JSON.stringify(d).slice(0, 400)}`);
+      jobStatus = "processing";
     }
-    if (!videoUrl && Array.isArray(d?.output)) videoUrl = (d.output as string[]).find((u) => u.startsWith("http"));
-    if (!videoUrl && typeof d?.output === "string" && d.output.startsWith("http")) videoUrl = d.output;
-
-    if (!videoUrl) console.warn(`[kie] Done but no videoUrl found. data=${JSON.stringify(d)}`);
   }
 
   if (jobStatus === "failed") {
