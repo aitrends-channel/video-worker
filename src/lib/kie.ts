@@ -54,6 +54,17 @@ interface KieRecordResponse {
     successFlag?: number;
     videoUrl?: string;
     video_url?: string;
+    // Veo's /veo/record-info nests the result under a `response` object:
+    //   data.response.resultUrls[0]  (base render)
+    //   data.response.fullResultUrls / full_result_urls (upscaled variants)
+    // None of the flat fields above are ever populated for Veo, so
+    // without reading this the poll never finds the URL and times out.
+    response?: {
+      resultUrls?: string[] | null;
+      fullResultUrls?: string[] | null;
+      full_result_urls?: string[] | null;
+      originUrls?: string[] | null;
+    };
     // KIE bills per task; recordInfo returns the credit count
     // for the completed task. Used by the project_costs ledger.
     creditsConsumed?: number;
@@ -295,6 +306,13 @@ function extractVideoUrl(d: KieRecordResponse["data"] | undefined): string | und
   if (typeof d.videoUrl === "string" && d.videoUrl.startsWith("http")) return d.videoUrl;
   if (typeof d.video_url === "string" && d.video_url.startsWith("http")) return d.video_url;
   if (typeof d.videoInfo?.videoUrl === "string" && d.videoInfo.videoUrl.startsWith("http")) return d.videoInfo.videoUrl;
+  // Veo shape: data.response.{resultUrls|fullResultUrls|full_result_urls}[0].
+  const resp = d.response;
+  if (resp) {
+    const fromResponse =
+      resp.resultUrls?.[0] ?? resp.fullResultUrls?.[0] ?? resp.full_result_urls?.[0];
+    if (typeof fromResponse === "string" && fromResponse.startsWith("http")) return fromResponse;
+  }
   if (typeof d.resultJson === "string") {
     try {
       const parsed = JSON.parse(d.resultJson) as { resultUrls?: string[]; url?: string; videoUrl?: string; video_url?: string };
