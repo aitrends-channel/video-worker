@@ -994,9 +994,15 @@ function dimsFor(aspect: string, preset: ResolutionPreset | undefined): [number,
   const effectivePreset = ASSEMBLY_SAFE_MODE ? "720p" : (preset ?? "1080p");
   const map = { "720p": { long: 1280, short: 720 }, "1080p": { long: 1920, short: 1080 }, "1440p": { long: 2560, short: 1440 }, "2160p": { long: 3840, short: 2160 } } as const;
   const { long, short } = map[effectivePreset];
-  if (aspect === "9:16") return [short, long];
-  if (aspect === "1:1") return [short, short];
-  return [long, short]; // 16:9 default
+  // Generic: hold the short edge at the preset's value and derive the
+  // long edge from the ratio (even-rounded for ffmpeg). Keeps 16:9,
+  // 9:16 and 1:1 identical to before while supporting any W:H ratio.
+  const [wr, hr] = aspect.split(":").map(Number);
+  const even = (n: number) => Math.max(2, Math.round(n / 2) * 2);
+  if (!wr || !hr) return [long, short];            // malformed → 16:9
+  if (wr === hr) return [short, short];            // square
+  if (wr > hr) return [even((short * wr) / hr), short];  // landscape
+  return [short, even((short * hr) / wr)];         // portrait
 }
 
 // Intermediate resolution for the per-beat encode pool when we know a
