@@ -209,8 +209,17 @@ async function pollAndCommit(
   const NETWORK_FAIL_LIMIT = 6;
   let networkFailures = 0;
 
+  // Poll cadence: the first few attempts run fast (3s) so a quick
+  // failure or a cached/fast completion surfaces in a few seconds even
+  // when the webhook fast-path isn't active (local dev, or a missing/
+  // localhost YOUTUBE_ENGINE_URL). After that, settle into the 10s
+  // steady-state so long renders don't hammer KIE. The early phase
+  // shaves ~21s off the 40-min MAX_POLL_ATTEMPTS ceiling — negligible
+  // against the SWEEP_ACTIVE_JOB_TIMEOUT_MS (60 min) buffer.
+  const FAST_POLL_ATTEMPTS = 3;
+  const FAST_POLL_INTERVAL_MS = 3000;
   for (let attempt = 0; attempt < MAX_POLL_ATTEMPTS; attempt++) {
-    await sleep(10000);
+    await sleep(attempt < FAST_POLL_ATTEMPTS ? FAST_POLL_INTERVAL_MS : 10000);
     let status: Awaited<ReturnType<typeof pollVideoJob>>;
     try {
       status = await pollVideoJob(jobId, modelId, kieApiKey);
