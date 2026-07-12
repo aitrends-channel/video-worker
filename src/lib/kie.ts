@@ -22,8 +22,19 @@ async function kieRequest<T>(endpoint: string, options: RequestInit, apiKey: str
     throw new Error(`kie.ai network error on ${endpoint}: ${cause}`);
   }
   if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`kie.ai error ${res.status}: ${body}`);
+    const body = await res.text().catch(() => "");
+    // KIE sits behind Cloudflare. A 5xx (502/503/504) comes back as a
+    // full HTML error page — kilobytes of markup. Throwing that verbatim
+    // floods the worker logs and, on the submit path, lands the whole
+    // page in the beat's video_error column. Collapse an HTML body to a
+    // short marker and hard-cap anything else so only the useful (usually
+    // small JSON) error text survives. The poll loop already treats this
+    // throw as a transient network failure and retries.
+    const looksHtml = /^\s*<(?:!doctype|html|head|body)/i.test(body);
+    const snippet = looksHtml
+      ? "(HTML error page — likely a Cloudflare/upstream outage)"
+      : body.replace(/\s+/g, " ").trim().slice(0, 300);
+    throw new Error(`kie.ai error ${res.status} on ${endpoint}${snippet ? `: ${snippet}` : ""}`);
   }
   return res.json() as Promise<T>;
 }
